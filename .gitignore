@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+
+.env
+
+images/output/
+
+runs/
+
+.idea/
+.vscode/
