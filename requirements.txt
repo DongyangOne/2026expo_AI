@@ -1,12 +1,24 @@
-annotated-types==0.7.0
-certifi==2026.2.25
-charset-normalizer==3.4.4
-idna==3.11
-pydantic==2.13.4
-pydantic-settings==2.14.1
-pydantic_core==2.46.4
-python-dotenv==1.2.2
-requests==2.32.5
-typing-inspection==0.4.2
-typing_extensions==4.15.0
-urllib3==2.6.3
+# ── 웹 프레임워크 ────────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9     # File/Form 업로드
+
+# ── AI 추론 ──────────────────────────────────────────────────────────────────────
+ultralytics>=8.3.0          # 주 9-class YOLO 감지
+onnxruntime>=1.17.0         # 상태 멀티헤드(dent/label) 추론
+# Pi5 NCNN 추론 시 추가 설치 필요:
+#   pip install ncnn
+
+# ── 이미지 처리 ──────────────────────────────────────────────────────────────────
+# 헤드리스 서버(Pi5)에서는 opencv-python-headless 사용 권장
+# (GUI 없음 — 불필요한 X11 의존성 제거)
+opencv-python-headless>=4.10.0
+numpy>=1.24.0
+
+# ── HTTP 클라이언트 (Spring 콜백) ─────────────────────────────────────────────────
+httpx>=0.27.0
+
+# ── 설정 관리 ────────────────────────────────────────────────────────────────────
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0

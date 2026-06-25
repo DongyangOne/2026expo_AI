@@ -1,0 +1,40 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+    )
+
+    # ── 인증 ────────────────────────────────────────────────────────────────────
+    API_KEY: str
+
+    # ── 모델 경로 ────────────────────────────────────────────────────────────────
+    # 메인 9-class YOLO. NCNN: 디렉터리 경로 / .pt: 파일 경로
+    MAIN_MODEL_PATH: str = "weights/yolo26m_best_ncnn_model"
+    # 상태 멀티헤드(dent/label) ONNX 경로. None = 미탑재 → conditions=null (무게만 검사)
+    STATE_MODEL_PATH: str | None = "weights/multihead.onnx"
+
+    # ── 추론 설정 ────────────────────────────────────────────────────────────────
+    # 2단계 임계값:
+    #   DETECT_CONF 미만 → 박스 없음 → NOT_DETECTED
+    #   DETECT_CONF 이상 ~ TRUST_CONF 미만 → LOW_CONFIDENCE (일반쓰레기)
+    #   TRUST_CONF 이상 → ALLOWED / REJECTED 정상 판정
+    DETECT_CONF: float = 0.25       # YOLO 박스 생성 최소 신뢰도
+    TRUST_CONF: float = 0.55        # 신뢰 판정 임계값
+    IMG_SIZE: int = 640
+    SUB_IMG_SIZE: int = 224
+    DEVICE: str = "cpu"              # Pi5 CPU, GPU 환경이면 "0"
+
+    # ── 무게 이상 감지 ────────────────────────────────────────────────────────────
+    WEIGHT_ANOMALY_ENABLED: bool = True
+
+    # ── Spring 콜백 ──────────────────────────────────────────────────────────────
+    # None 이면 콜백 비활성 (Spring URL 미설정 시)
+    SPRING_CALLBACK_URL: str | None = None
+    SPRING_TIMEOUT_SEC: float = 3.0
+
+
+settings = Settings()
