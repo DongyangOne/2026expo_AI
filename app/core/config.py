@@ -36,5 +36,10 @@ class Settings(BaseSettings):
     SPRING_CALLBACK_URL: str | None = None
     SPRING_TIMEOUT_SEC: float = 3.0
 
+    # ── 결과 로깅 ────────────────────────────────────────────────────────────────
+    # True: 판정 결과를 logs/results.jsonl 에 항상 기록 (Spring URL 없어도 동작)
+    LOG_RESULTS: bool = True
+    LOG_DIR: str = "logs"
+
 
 settings = Settings()

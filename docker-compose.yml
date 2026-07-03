@@ -7,3 +7,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./weights:/app/weights
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "3.0"

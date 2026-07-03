@@ -1,6 +1,9 @@
 """Spring 서버 결과 전송 (fire-and-forget). 실패해도 메인 응답에 영향 없음."""
 
+import json
 import logging
+import os
+from datetime import datetime, timezone
 
 import httpx
 
@@ -10,7 +13,25 @@ from app.schemas.response import DetectResponse
 logger = logging.getLogger(__name__)
 
 
+def _log_result(result: DetectResponse) -> None:
+    """판정 결과를 logs/results.jsonl 에 한 줄 JSON으로 추가."""
+    try:
+        os.makedirs(settings.LOG_DIR, exist_ok=True)
+        log_path = os.path.join(settings.LOG_DIR, "results.jsonl")
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **result.model_dump(mode="json"),
+        }
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.exception("결과 로그 기록 실패")
+
+
 async def notify(result: DetectResponse) -> None:
+    if settings.LOG_RESULTS:
+        _log_result(result)
+
     url = settings.SPRING_CALLBACK_URL
     if not url:
         return
