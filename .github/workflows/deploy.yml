@@ -1,0 +1,55 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── 1단계: 단위 테스트 ──────────────────────────────────────────────────────────
+  test:
+    name: 단위 테스트
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 의존성 설치
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest tests/ -v
+
+  # ── 2단계: Pi5 배포 (main 브랜치 push 시에만) ──────────────────────────────────
+  deploy:
+    name: Pi5 배포
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Tailscale 연결
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          # Pi5와 같은 Tailscale 네트워크에 일회용으로 참가
+
+      - name: Pi5 SSH 배포
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 100.121.110.75
+          username: one
+          password: ${{ secrets.PI_SSH_PASSWORD }}
+          timeout: 600s
+          script: |
+            set -e
+            cd /home/one/2026expo_AI
+            git pull origin main
+            docker compose up -d --build
+            docker system prune -f
+            echo "배포 완료: $(date)"
