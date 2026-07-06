@@ -25,31 +25,23 @@ jobs:
       - name: pytest
         run: pytest tests/ -v
 
-  # ── 2단계: Pi5 배포 (main 브랜치 push 시에만) ──────────────────────────────────
+  # ── 2단계: Pi5 배포 (self-hosted runner, main push 시에만) ─────────────────────
+  # Pi5에 Actions 러너 설치 방법:
+  #   GitHub → DongyangOne/2026expo_AI → Settings → Actions → Runners → New self-hosted runner
+  #   OS: Linux / Architecture: ARM64
+  #   Pi5에서 표시된 명령어 실행 후 `sudo ./svc.sh install && sudo ./svc.sh start`
   deploy:
     name: Pi5 배포
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, ARM64]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
-      - name: Tailscale 연결
-        uses: tailscale/github-action@v2
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          # Pi5와 같은 Tailscale 네트워크에 일회용으로 참가
-
-      - name: Pi5 SSH 배포
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: 100.121.110.75
-          username: one
-          password: ${{ secrets.PI_SSH_PASSWORD }}
-          timeout: 600s
-          script: |
-            set -e
-            cd /home/one/2026expo_AI
-            git pull origin main
-            docker compose up -d --build
-            docker system prune -f
-            echo "배포 완료: $(date)"
+      - name: 최신 코드 반영 및 Docker 재시작
+        run: |
+          set -e
+          cd /home/one/2026expo_AI
+          git pull origin main
+          docker compose up -d --build
+          docker system prune -f --volumes=false
+          echo "배포 완료: $(date)"
