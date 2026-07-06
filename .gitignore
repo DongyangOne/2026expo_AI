@@ -6,7 +6,10 @@ __pycache__/
 
 images/output/
 
+logs/
+
 runs/
+weights/*.pt
 
 .idea/
 .vscode/

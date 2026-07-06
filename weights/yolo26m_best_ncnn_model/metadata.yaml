@@ -1,0 +1,27 @@
+description: Ultralytics YOLO26m model trained on /app/yolo_dataset_9class_v2/dataset.yaml
+author: Ultralytics
+date: '2026-06-23T08:46:58.720623'
+version: 8.4.63
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: can
+  1: pet
+  2: paper
+  3: plastic
+  4: styrofoam
+  5: vinyl
+  6: glass
+  7: battery
+  8: fluorescent
+args:
+  batch: 1
+  half: false
+channels: 3
+end2end: false

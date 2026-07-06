@@ -1,0 +1,47 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── 1단계: 단위 테스트 ──────────────────────────────────────────────────────────
+  test:
+    name: 단위 테스트
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 의존성 설치
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest
+        run: pytest tests/ -v
+
+  # ── 2단계: Pi5 배포 (self-hosted runner, main push 시에만) ─────────────────────
+  # Pi5에 Actions 러너 설치 방법:
+  #   GitHub → DongyangOne/2026expo_AI → Settings → Actions → Runners → New self-hosted runner
+  #   OS: Linux / Architecture: ARM64
+  #   Pi5에서 표시된 명령어 실행 후 `sudo ./svc.sh install && sudo ./svc.sh start`
+  deploy:
+    name: Pi5 배포
+    needs: test
+    runs-on: [self-hosted, linux, ARM64]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: 최신 코드 반영 및 Docker 재시작
+        run: |
+          set -e
+          cd /home/one/2026expo_AI
+          git pull origin main
+          docker compose up -d --build
+          docker system prune -f --volumes=false
+          echo "배포 완료: $(date)"
