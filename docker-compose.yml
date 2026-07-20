@@ -4,6 +4,9 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    environment:
+      # 서버 .env 값이 비어 있어도 운영 Spring 콜백을 활성화한다.
+      SPRING_CALLBACK_URL: "${SPRING_CALLBACK_URL:-https://oneexpo.kro.kr/api/v1/feedbackDetail/results}"
     restart: unless-stopped
     volumes:
       - ./weights:/app/weights
