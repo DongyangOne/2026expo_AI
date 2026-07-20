@@ -3,8 +3,8 @@
 
 - 입력: extract_crops.py가 만든 crops_state_v1/manifest.csv (filepath, category, dent, label)
 - dent  : 원형=0 / 변형=1  (페트+캔 공통 학습)
-- label : 라벨없음=0 / 라벨있음=1  (페트병만; 캔·내부오염은 -1로 라벨헤드 loss에서 마스킹)
-- YOLO가 페트병/캔을 이미 구분하므로 추론 시 페트병=두 헤드, 캔=dent만 읽으면 됨 → 모델 1개로 충분.
+- label : 라벨없음=0 / 라벨있음=1  (페트+플라스틱; 캔·내부오염은 -1로 라벨헤드 loss에서 마스킹)
+- YOLO가 품목을 이미 구분하므로 추론 시 페트병=두 헤드, 캔=dent, 플라스틱=label만 읽으면 됨 → 모델 1개로 충분.
 - 클래스 불균형은 CrossEntropy class-weight로 보정.
 - 출력: best.pt + multihead.onnx (이후 onnx2ncnn으로 NCNN 변환)
 

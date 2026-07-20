@@ -1,7 +1,7 @@
 # 2026 동양미래 EXPO — 재활용 분류 AI 워크플로우
 
-> 키오스크 재활용품 자동 분류 시스템. 사진 + 무게센서 입력 → 분류·상태 판정 → Spring 서버 전송.
-> 최종 갱신: 2026-06-20
+> 키오스크 재활용품 자동 분류 시스템. 사진 + 무게센서 + `client_id` 입력 → 분류·상태 판정 → Spring 서버 전송.
+> 최종 갱신: 2026-07-20
 
 ---
 
@@ -10,9 +10,9 @@
 | 항목 | 내용 |
 |------|------|
 | 목적 | 키오스크에 투입된 재활용품을 사진+무게로 분류하고 상태(라벨/찌그러짐/내용물)를 판정 |
-| 추론 환경 | Raspberry Pi 5 (CPU, NCNN) |
-| 입력 | 카메라 사진 + 무게센서값 (**투입부/센서는 타팀 하드웨어**) |
-| 출력 | `DetectResponse` JSON → Spring 서버 POST (**자체 DB 없음**) |
+| 추론 환경 | Raspberry Pi 5 CPU (메인 NCNN + 상태 ONNX Runtime) |
+| 입력 | 카메라 사진 + 무게센서값 + 사용자/피드백 구분용 `client_id` (**투입부/센서는 타팀 하드웨어**) |
+| 출력 | 하드웨어에 `DetectResponse` 즉시 반환 + 동일 JSON을 Spring 서버로 백그라운드 POST (**자체 DB 없음**) |
 | 담당 범위 | AI 처리 + 결과 API 전송 (내가 담당) / 사진·무게 수집 (타팀) |
 
 ---
@@ -20,13 +20,17 @@
 ## 2. 시스템 아키텍처
 
 ```
-[타팀 하드웨어]                  [내 담당: FastAPI on Pi5]                [Spring]
+[타팀 하드웨어]                    [내 담당: FastAPI on Pi5]                         [Spring]
  카메라 사진  ─┐
-              ├─→ POST /detect ─→ 메인 YOLO26m (9클래스)                    
- 무게센서값   ─┘                    ├─→ 상태 멀티헤드 분류기 (페트병/캔)     
-                                    ├─→ 무게 이상 로직                       
-                                    └─→ DetectResponse ──────────→ Spring POST
+ 무게센서값   ─┼─→ POST /api/v1/detect ─→ 메인 YOLO26m (9클래스)
+ client_id    ─┘                         ├─→ 상태 멀티헤드 (라벨/압착)
+                                         ├─→ 무게 이상 로직
+                                         ├─→ DetectResponse(client_id 유지) ─→ 하드웨어 즉시 응답
+                                         └─→ 동일 JSON 백그라운드 POST ─────→ 콜백 API
 ```
+
+- `client_id`는 1~128자의 필수 문자열이며 AI 서버에서 생성하거나 변경하지 않는다.
+- Spring 콜백 URL: `https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
 
 ---
 
@@ -60,7 +64,7 @@
 `app/services/pipeline.py` 의 `run()`:
 
 ```
-1. 이미지 디코드
+1. 필수 `client_id` 수신 + 이미지 디코드
 2. 메인 YOLO 감지 (conf=DETECT_CONF 0.25)
      └ 박스 없음 → NOT_DETECTED
 3. 최고신뢰 박스 → class_id, confidence, bbox
@@ -72,7 +76,7 @@
      └ build_guidance() → 불충족 안내. 비면 ALLOWED, 있으면 REJECTED(재처리)
 6. [거부: 유리/건전지/형광등/스티로폼] → REJECTED + rejection
 7. [비닐] → GENERAL_WASTE + general / [저신뢰] → GENERAL_WASTE
-8. DetectResponse 조립 → Spring 콜백(fire-and-forget)
+8. `client_id`를 포함한 DetectResponse 조립 → 하드웨어 응답 + Spring 콜백(fire-and-forget)
 ```
 
 **2단계 신뢰도 게이트:**
@@ -85,8 +89,8 @@
 
 | # | 모델 | 입력 | 출력 | 백본 | 포맷 | 상태 |
 |---|------|------|------|------|------|------|
-| 1 | 메인 감지 | 640px | 9클래스 bbox | YOLO26m | NCNN | 변환완료, 학습 보류 |
-| 2 | 상태 멀티헤드 | 224px crop | dent(2) + label(2) | MobileNetV3-Small | NCNN INT8 | crop 추출 중 |
+| 1 | 메인 감지 | 640px | 9클래스 bbox | YOLO26m | NCNN | Pi5 배포·로드 정상 |
+| 2 | 상태 멀티헤드 | 224px crop | dent(2) + label(2) | MobileNetV3-Small | ONNX | Pi5 배포·로드 정상 |
 | (3) | 색/재질 SubClass | 224px crop | 무색/유색, 철/알루미늄 | — | — | **보류** (상태 우선) |
 
 > 모델 3은 이전 설계의 색·재질 세부분류. 이번 우선순위는 **상태(라벨/찌그러짐)**라 보류.
@@ -94,8 +98,8 @@
 
 ### 멀티헤드 설계 (모델 2)
 - **공유 백본 1개** + dent 헤드 + label 헤드. 추론 1회로 두 출력.
-- 페트병이면 두 헤드 다 읽고, 캔이면 dent만 읽음 (YOLO가 품목 이미 구분).
-- dent는 페트+캔 공통 학습(데이터↑), label은 페트병만(캔은 loss 마스킹).
+- 런타임에서는 페트병은 두 헤드, 캔은 dent, 플라스틱은 label 결과를 사용한다.
+- dent는 페트+캔 공통 학습, label은 페트+플라스틱 공통 학습하며 비대상 헤드는 loss에서 마스킹한다.
 
 ---
 
@@ -149,10 +153,36 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 
 ## 8. 배포 (Raspberry Pi 5)
 
-- 모든 모델 **NCNN** 포맷 (ARM 최적화), 상태 분류기는 **INT8 양자화**로 2배 가속
-- `app/core/config.py`: `MAIN_MODEL_PATH`, `PET_MODEL_PATH`, `CAN_MODEL_PATH`, `DEVICE="cpu"`
-- 모델 미탑재 시 graceful degradation (sub_class/conditions = null)
-- Spring 콜백: `SPRING_CALLBACK_URL` (fire-and-forget, 실패해도 응답 영향 없음)
+### 런타임 구성
+
+- 메인 모델: `MAIN_MODEL_PATH=weights/yolo26m_best_ncnn_model` (NCNN, ARM CPU 추론)
+- 상태 모델: `STATE_MODEL_PATH=weights/multihead.onnx` (ONNX Runtime)
+- 실제 환경 파일: `/home/one/2026expo_AI/.env`
+- Spring 콜백: `SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
+- 결과 로그: `LOG_RESULTS=true`이면 `logs/results.jsonl`에 항상 기록
+- 콜백은 fire-and-forget 방식이며 연결 실패·타임아웃이 AI 응답에 영향을 주지 않는다.
+
+### 배포 흐름
+
+1. 별도 기능 브랜치 없이 `main`에 직접 반영한다.
+2. GitHub Actions는 `main` 푸시 시 단위 테스트를 실행한다.
+3. Pi5의 `ai-autodeploy.timer`가 5분마다 `origin/main`의 새 커밋을 확인한다.
+4. 새 커밋이 있으면 `/home/one/auto-deploy.sh`가 `git pull --ff-only` 후 `docker compose up -d --build`를 실행한다.
+5. 시스템 nginx가 `https://ai.oneexpo.kro.kr` 요청을 FastAPI `localhost:8000`으로 프록시한다.
+
+운영 확인:
+
+```bash
+systemctl status ai-autodeploy.timer
+docker ps --filter name=ai-server
+curl http://127.0.0.1:8000/health
+```
+
+정상 헬스 응답:
+
+```json
+{"status":"ok","models":{"main":true,"state":true}}
+```
 
 ---
 
@@ -172,16 +202,18 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 
 ---
 
-## 10. 현재 진행 상황 (2026-06-20)
+## 10. 현재 운영 상태 (2026-07-20)
 
 | 단계 | 상태 |
 |------|------|
 | 데이터 변환 (convert_v2) | ✅ 완료 (train 라벨 518,728 / val 68,147) |
-| └ 변환결과물 이미지 수 이상 | ⚠️ 점검 필요 (`docs/DATA_AUDIT.md`) |
-| crop 추출 (extract_crops) | ⚙️ 진행 중 (23만, 디스크병목 ~26/초, ETA ~2.3h) |
-| 멀티헤드 학습 | ⏳ crop 완료 후 |
-| NCNN 변환 + 파이프라인 통합 | ⏳ 대기 |
-| 메인 YOLO26m 학습 | ⏸️ 보류 (데이터 점검 후 재개) |
+| 메인 YOLO26m NCNN | ✅ Pi5 배포 및 로드 정상 |
+| 상태 멀티헤드 ONNX | ✅ Pi5 배포 및 로드 정상 |
+| `/api/v1/detect` + `client_id` 계약 | ✅ 구현·테스트·배포 완료 |
+| Spring 콜백 URL | ✅ AI 서버 환경 및 컨테이너 반영 완료 |
+| Spring 콜백 수신 테스트 | ⏳ Spring 측 엔드포인트 배포 후 확인 |
+| Pi 자동 배포 배치 | ✅ `ai-autodeploy.timer` 활성, 5분 간격 |
+| 공개 헬스 체크 | ✅ `https://ai.oneexpo.kro.kr/health` 정상 |
 
 ---
 
@@ -193,8 +225,8 @@ app/
   models/registry.py      모델 보관소 (graceful degradation)
   schemas/
     enums.py              WasteClass, DetectionStatus, GuidanceCode, RejectionCode, GeneralWasteCode
-    response.py           DetectResponse DTO (status/classification/conditions/weight/guidance/rejection/general)
-    request.py
+    response.py           DetectResponse DTO (client_id/status/classification/conditions/weight/guidance/rejection/general)
+    request.py            multipart 요청 (image/client_id/weight_g)
   services/
     pipeline.py           흐름 제어만 (run)
     inference.py          모델 추론 (전처리 + YOLO·멀티헤드 세션 호출)
@@ -205,7 +237,9 @@ app/
   main.py                 앱 + 통합 에러 핸들러
 
 tests/
+  test_api_contract.py     client_id 필수 요청·응답 계약 및 콜백 전달 테스트
   test_guidance.py        도메인 규칙 단위테스트
+  test_spring_client.py    Spring 콜백 URL·client_id 전달 테스트
   test_weight_check.py    무게 판정 단위테스트
 
 scripts/
