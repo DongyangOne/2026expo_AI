@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 
 H = {"X-API-Key": "test-key"}
+CLIENT_ID = "integration-test-client"
 
 # (이미지, 무게g, 설명) — _probe 의 실제 AI Hub 이미지
 CASES = [
@@ -31,7 +32,7 @@ def brief(resp: dict) -> str:
     g = [x["code"] for x in resp.get("guidance", [])]
     rej = (resp.get("rejection") or {}).get("code")
     gen = (resp.get("general") or {}).get("code")
-    return (f"status={resp['status']} class={cls}({conf}) "
+    return (f"client_id={resp.get('client_id')} status={resp['status']} class={cls}({conf}) "
             f"dent={cond.get('is_dented')} label={cond.get('has_label')} "
             f"anomaly={w.get('anomaly')} guidance={g} rejection={rej} general={gen}")
 
@@ -47,7 +48,7 @@ with TestClient(app) as client:
             r = client.post(
                 "/api/v1/detect",
                 files={"image": (os.path.basename(path), f, "image/jpeg")},
-                data={"weight_g": str(w)},
+                data={"client_id": CLIENT_ID, "weight_g": str(w)},
                 headers=H,
             )
         print(f"[{desc}]  HTTP {r.status_code}")
@@ -57,5 +58,6 @@ with TestClient(app) as client:
     # 인증 실패 케이스
     with open(CASES[0][0], "rb") as f:
         r = client.post("/api/v1/detect", files={"image": ("a.jpg", f, "image/jpeg")},
-                        data={"weight_g": "10"}, headers={"X-API-Key": "wrong"})
+                        data={"client_id": CLIENT_ID, "weight_g": "10"},
+                        headers={"X-API-Key": "wrong"})
     print(f"[잘못된 API키]  HTTP {r.status_code}  {r.json()}")

@@ -13,6 +13,7 @@
 | 필드 | 타입 | 필수 | 설명 |
 |------|------|------|------|
 | `image` | File (jpg/png) | ✅ | 카메라 촬영 이미지 |
+| `client_id` | string | ✅ | 사용자/피드백 구분 ID. AI 응답과 Spring 콜백에 그대로 반환 |
 | `weight_g` | float | ❌ | 무게센서 값 (g). 미입력 시 무게 이상감지 생략 |
 
 **헤더**
@@ -21,12 +22,23 @@
 |------|------|
 | `X-API-Key` | 서버 인증 키 (`.env`의 `API_KEY`와 일치해야 함) |
 
+**요청 예시**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/detect \
+  -H "X-API-Key: 인증키" \
+  -F "image=@sample.jpg" \
+  -F "client_id=hardware-user-001" \
+  -F "weight_g=28.0"
+```
+
 ---
 
 ## 응답 형식 (AI 서버 → 하드웨어 / Spring)
 
 ```json
 {
+  "client_id": "hardware-user-001",
   "status": "ALLOWED",
   "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
   "conditions": {"has_label": false, "is_dented": true},
@@ -76,8 +88,10 @@
 
 ## Spring 콜백
 
-하드웨어 응답 직후 백그라운드로 Spring 서버에 동일한 JSON을 POST한다.  
+하드웨어 응답 직후 백그라운드로 Spring 서버에 `client_id`를 포함한 동일한 JSON을 POST한다.
 `.env`의 `SPRING_CALLBACK_URL` 미설정 시 전송하지 않는다.
+
+콜백 URL: `https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
 
 ---
 
@@ -85,9 +99,9 @@
 
 ```env
 API_KEY=인증키
-SPRING_CALLBACK_URL=http://spring서버주소/api/ai/result
+SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results
 # 선택
-MAIN_MODEL_PATH=weights/yolo26n_best_ncnn_model
+MAIN_MODEL_PATH=weights/yolo26m_best_ncnn_model
 STATE_MODEL_PATH=weights/multihead.onnx
 DETECT_CONF=0.25
 TRUST_CONF=0.55
@@ -103,7 +117,7 @@ LOG_DIR=logs
 `SPRING_CALLBACK_URL` 미설정 시 로그만 저장하므로 Spring 서버 없이도 결과를 확인할 수 있다.
 
 ```jsonl
-{"timestamp":"2026-07-03T10:00:00+00:00","status":"ALLOWED","classification":{"class_id":1,...},...}
+{"timestamp":"2026-07-03T10:00:00+00:00","client_id":"hardware-user-001","status":"ALLOWED","classification":{"class_id":1,...},...}
 ```
 
 ---

@@ -3,6 +3,7 @@
 
 구조:
   DetectResponse
+  ├─ client_id       : str               ← 하드웨어가 보낸 사용자/피드백 구분 ID
   ├─ status          : DetectionStatus   ← Spring 의 1차 분기 판별자
   ├─ classification  : Classification?   ← 분류 결과 (NOT_DETECTED 시 null)
   ├─ conditions      : Conditions        ← 상태 감지 (멀티헤드: is_dented/has_label)
@@ -71,6 +72,7 @@ class GeneralWaste(BaseModel):
 
 
 class DetectResponse(BaseModel):
+    client_id:       str                      = Field(..., description="요청에서 받은 사용자/피드백 구분 ID")
     status:         DetectionStatus          = Field(..., description="처리 판별자 (Spring 1차 분기)")
     classification: Optional[Classification]  = Field(None, description="분류 결과 (감지 실패 시 null)")
     conditions:     Conditions               = Field(default_factory=Conditions)
@@ -84,6 +86,7 @@ class DetectResponse(BaseModel):
         json_schema_extra={
             "examples": [
                 {
+                    "client_id": "hardware-user-001",
                     "status": "ALLOWED",
                     "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
                     "conditions": {"has_label": False, "is_dented": True},
@@ -94,6 +97,7 @@ class DetectResponse(BaseModel):
                     "bbox": [120.0, 80.0, 410.0, 560.0],
                 },
                 {
+                    "client_id": "hardware-user-001",
                     "status": "REJECTED",
                     "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.91},
                     "conditions": {"has_label": True, "is_dented": False},
@@ -108,6 +112,7 @@ class DetectResponse(BaseModel):
                     "bbox": [120.0, 80.0, 410.0, 560.0],
                 },
                 {
+                    "client_id": "hardware-user-001",
                     "status": "REJECTED",
                     "classification": {"class_id": 6, "class_name": "glass", "confidence": 0.88},
                     "weight": {"value_g": 320.0, "anomaly": False},
@@ -117,6 +122,7 @@ class DetectResponse(BaseModel):
                     "bbox": [90.0, 60.0, 500.0, 720.0],
                 },
                 {
+                    "client_id": "hardware-user-001",
                     "status": "GENERAL_WASTE",
                     "classification": {"class_id": 5, "class_name": "vinyl", "confidence": 0.90},
                     "weight": {"value_g": 12.0, "anomaly": False},
@@ -126,6 +132,7 @@ class DetectResponse(BaseModel):
                     "bbox": [100.0, 110.0, 480.0, 470.0],
                 },
                 {
+                    "client_id": "hardware-user-001",
                     "status": "NOT_DETECTED",
                     "classification": None,
                     "weight": {"value_g": None, "anomaly": False},

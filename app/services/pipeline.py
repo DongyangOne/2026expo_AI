@@ -60,7 +60,12 @@ async def _read_image(upload: UploadFile) -> np.ndarray:
     return img
 
 
-async def run(upload: UploadFile, weight_g: Optional[float], registry: ModelRegistry) -> DetectResponse:
+async def run(
+    upload: UploadFile,
+    weight_g: Optional[float],
+    client_id: str,
+    registry: ModelRegistry,
+) -> DetectResponse:
     loop = asyncio.get_running_loop()
 
     img = await _read_image(upload)
@@ -68,7 +73,11 @@ async def run(upload: UploadFile, weight_g: Optional[float], registry: ModelRegi
 
     # ── 미감지 ──────────────────────────────────────────────────────────────────
     if detection is None:
-        return DetectResponse(status=DetectionStatus.NOT_DETECTED, weight=WeightInfo(value_g=weight_g))
+        return DetectResponse(
+            client_id=client_id,
+            status=DetectionStatus.NOT_DETECTED,
+            weight=WeightInfo(value_g=weight_g),
+        )
 
     class_id, confidence, bbox = detection
     cls = _CLASS_BY_ID.get(class_id)
@@ -82,6 +91,7 @@ async def run(upload: UploadFile, weight_g: Optional[float], registry: ModelRegi
     # ── 저신뢰 → 일반쓰레기 ──────────────────────────────────────────────────────
     if cls is None or confidence < settings.TRUST_CONF:
         return DetectResponse(
+            client_id=client_id,
             status=DetectionStatus.GENERAL_WASTE,
             classification=classification,
             weight=weight_info,
@@ -92,6 +102,7 @@ async def run(upload: UploadFile, weight_g: Optional[float], registry: ModelRegi
     # ── 완전 거부 (유리/건전지/형광등/스티로폼) ──────────────────────────────────
     if guidance.is_rejected(cls):
         return DetectResponse(
+            client_id=client_id,
             status=DetectionStatus.REJECTED,
             classification=classification,
             weight=weight_info,
@@ -102,6 +113,7 @@ async def run(upload: UploadFile, weight_g: Optional[float], registry: ModelRegi
     # ── 일반쓰레기 (비닐) ────────────────────────────────────────────────────────
     if guidance.is_general(cls):
         return DetectResponse(
+            client_id=client_id,
             status=DetectionStatus.GENERAL_WASTE,
             classification=classification,
             weight=weight_info,
@@ -124,6 +136,7 @@ async def run(upload: UploadFile, weight_g: Optional[float], registry: ModelRegi
     status = DetectionStatus.REJECTED if guide else DetectionStatus.ALLOWED
 
     return DetectResponse(
+        client_id=client_id,
         status=status,
         classification=classification,
         conditions=conditions,

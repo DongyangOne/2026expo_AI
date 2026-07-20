@@ -40,6 +40,7 @@ def _get_registry(request: Request) -> ModelRegistry:
         "- `status=REJECTED`: 조건 불충족(`guidance` 재처리 안내) 또는 완전거부(`rejection`, 유리·건전지 등)\n"
         "- `status=GENERAL_WASTE`: 일반쓰레기 (`general` — 비닐/저신뢰/미분류)\n"
         "- `status=NOT_DETECTED`: 미감지\n"
+        "- `client_id`: 하드웨어가 보낸 사용자/피드백 구분 ID를 응답과 Spring 콜백에 그대로 포함\n"
         "- `conditions`: is_dented(페트·캔 압착), has_label(페트·플라스틱 라벨)"
     ),
 )
@@ -50,7 +51,7 @@ async def detect(
     registry: Annotated[ModelRegistry, Depends(_get_registry)],
 ) -> DetectResponse:
     try:
-        result = await pipeline.run(form.image, form.weight_g, registry)
+        result = await pipeline.run(form.image, form.weight_g, form.client_id, registry)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
