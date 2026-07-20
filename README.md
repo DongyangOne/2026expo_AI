@@ -130,3 +130,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 API 문서: `http://localhost:8000/docs`
+
+### 배포
+
+`main`에 푸시하면 GitHub Actions에서 테스트를 실행한다. Pi5의 `ai-autodeploy.timer`가
+5분마다 `origin/main`의 새 커밋을 확인하고 `docker compose up -d --build`로 자동 배포한다.
