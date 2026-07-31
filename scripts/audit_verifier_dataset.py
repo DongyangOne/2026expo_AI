@@ -23,6 +23,7 @@ def audit_manifest(manifest_path: Path, require_masked_status: bool = False) -> 
     source_splits: dict[str, set[str]] = defaultdict(set)
     counts = Counter()
     missing_images = 0
+    object_counts = set()
 
     for row in rows:
         split = row["split"].lower()
@@ -30,6 +31,8 @@ def audit_manifest(manifest_path: Path, require_masked_status: bool = False) -> 
         source_splits[row["source_id"]].add(split)
         counts[(split, CLASS_NAMES[material])] += 1
         missing_images += not (root / row["filepath"]).is_file()
+        if row.get("source_object_count", ""):
+            object_counts.add(int(row["source_object_count"]))
 
     label_values = sorted({int(row.get("label", -1)) for row in rows})
     foreign_values = sorted({int(row.get("foreign_material", -1)) for row in rows})
@@ -57,6 +60,7 @@ def audit_manifest(manifest_path: Path, require_masked_status: bool = False) -> 
         "split_overlap_sources": overlap,
         "label_values": label_values,
         "foreign_material_values": foreign_values,
+        "source_object_counts": sorted(object_counts),
         "counts": {
             f"{split}/{class_name}": count
             for (split, class_name), count in sorted(counts.items())
@@ -69,9 +73,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--require-masked-status", action="store_true")
+    parser.add_argument("--require-single-object", action="store_true")
     args = parser.parse_args()
 
     result = audit_manifest(Path(args.manifest), args.require_masked_status)
+    if args.require_single_object and result["source_object_counts"] != [1]:
+        result["ok"] = False
+        result["problems"].append(
+            f"single-object requirement failed: {result['source_object_counts']}"
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     if not result["ok"]:
         raise SystemExit(2)

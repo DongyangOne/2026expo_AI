@@ -49,6 +49,7 @@ def test_save_capture_writes_paired_image_and_result_json(tmp_path, monkeypatch)
     assert metadata["review"] == {
         "is_correct": None,
         "expected_class": None,
+        "is_single_object": None,
         "is_dented": None,
         "has_label": None,
         "has_foreign_material": None,

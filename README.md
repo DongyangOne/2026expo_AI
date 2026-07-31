@@ -149,6 +149,7 @@ JSON에는 요청의 `client_id`와 무게, 예측 클래스·신뢰도·bbox·�
   "review": {
     "is_correct": null,
     "expected_class": null,
+    "is_single_object": null,
     "is_dented": null,
     "has_label": null,
     "has_foreign_material": null,
@@ -160,6 +161,10 @@ JSON에는 요청의 `client_id`와 무게, 예측 클래스·신뢰도·bbox·�
 기본 보존 기간은 90일, 최대 용량은 10GB이며 초과 시 오래된 이미지/JSON 쌍부터 제거한다.
 오인식이 확인되면 검수 필드를 채운 뒤 해당 이미지를 실제 키오스크 환경의 hard sample로
 재학습 데이터에 추가한다.
+
+crop 검증기 학습에는 `review.is_single_object=true`로 확인된 캡처만 사용한다.
+`has_label`과 `has_foreign_material`은 서로 독립된 정답이며, 네 조합(둘 다 없음/라벨만/
+외부 이물질만/둘 다 있음)을 그대로 기록한다.
 
 객체 bbox를 crop한 뒤 9종 품목과 상태를 다시 확인하는 검증기의 확정 구조, 라벨 정책,
 NAS 실행 명령은 [`docs/CROP_VERIFIER_PLAN.md`](docs/CROP_VERIFIER_PLAN.md)에 정리했다.

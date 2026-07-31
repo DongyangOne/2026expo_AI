@@ -6,8 +6,14 @@ import numpy as np
 import torch
 
 from scripts.audit_verifier_dataset import audit_manifest
-from scripts.extract_verifier_crops import CLASS_NAMES, category_id, letterbox, make_source_key
-from scripts.train_verifier import CropVerifier
+from scripts.extract_verifier_crops import (
+    CLASS_NAMES,
+    category_id,
+    letterbox,
+    make_source_key,
+    should_use_annotations,
+)
+from scripts.train_verifier import CropVerifier, enabled_tasks_for
 
 
 def test_category_mapping_covers_all_verifier_materials():
@@ -43,6 +49,12 @@ def test_source_key_accepts_filesystem_surrogate_names():
     assert all(character in "0123456789abcdef" for character in key)
 
 
+def test_single_object_filter_rejects_multiple_annotations():
+    assert should_use_annotations([{"ID": "1"}]) is True
+    assert should_use_annotations([{"ID": "1"}, {"ID": "2"}]) is False
+    assert should_use_annotations([], single_object_only=False) is False
+
+
 def test_crop_verifier_exposes_material_and_three_state_heads():
     model = CropVerifier("mobilenet_v3_small", pretrained=False).eval()
 
@@ -58,7 +70,7 @@ def test_crop_verifier_exposes_material_and_three_state_heads():
 def test_audit_manifest_accepts_complete_masked_dataset(tmp_path):
     manifest = tmp_path / "manifest.csv"
     lines = [
-        "filepath,split,source_id,material,category,dent,label,foreign_material,label_proxy,raw_dirtiness"
+        "filepath,split,source_id,material,category,dent,label,foreign_material,label_proxy,raw_dirtiness,source_object_count"
     ]
     for split in ("training", "validation"):
         for material, class_name in enumerate(CLASS_NAMES):
@@ -67,7 +79,7 @@ def test_audit_manifest_accepts_complete_masked_dataset(tmp_path):
             image.parent.mkdir(parents=True, exist_ok=True)
             image.write_bytes(b"image")
             lines.append(
-                f"{relative},{split},{split}-{material},{material},{class_name},-1,-1,-1,-1,"
+                f"{relative},{split},{split}-{material},{material},{class_name},-1,-1,-1,-1,,1"
             )
     manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -76,3 +88,35 @@ def test_audit_manifest_accepts_complete_masked_dataset(tmp_path):
     assert result["ok"] is True
     assert result["rows"] == 18
     assert result["split_overlap_sources"] == 0
+    assert result["source_object_counts"] == [1]
+
+
+def test_status_heads_require_both_classes_in_train_and_validation():
+    base = []
+    for split in ("training", "validation"):
+        for material in range(9):
+            base.append(
+                {
+                    "split": split,
+                    "material": material,
+                    "dent": material % 2 if material in (0, 1) else -1,
+                    "label": -1,
+                    "foreign_material": -1,
+                }
+            )
+
+    assert enabled_tasks_for(base) == ["material", "dent"]
+
+    for split in ("training", "validation"):
+        for value in (0, 1):
+            base.append(
+                {
+                    "split": split,
+                    "material": 1,
+                    "dent": value,
+                    "label": value,
+                    "foreign_material": value,
+                }
+            )
+
+    assert enabled_tasks_for(base) == ["material", "dent", "label", "foreign_material"]

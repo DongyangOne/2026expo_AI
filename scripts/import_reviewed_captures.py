@@ -41,6 +41,9 @@ def main():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             review = metadata.get("review", {})
+            if review.get("is_single_object") is not True:
+                skipped += 1
+                continue
             result = metadata.get("result", {})
             classification = result.get("classification") or {}
             expected = review.get("expected_class")
@@ -90,7 +93,7 @@ def main():
                 _optional_binary(review, "is_dented"),
                 _optional_binary(review, "has_label"),
                 _optional_binary(review, "has_foreign_material"),
-                -1, "reviewed_capture",
+                -1, "reviewed_capture", 1,
             )
         )
 
@@ -101,6 +104,7 @@ def main():
             [
                 "filepath", "split", "source_id", "material", "category",
                 "dent", "label", "foreign_material", "label_proxy", "raw_dirtiness",
+                "source_object_count",
             ]
         )
         writer.writerows(rows)

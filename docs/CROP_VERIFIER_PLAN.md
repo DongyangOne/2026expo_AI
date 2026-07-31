@@ -20,6 +20,7 @@
 ```
 
 - YOLO는 전체 화면에서 객체를 찾는 역할로 유지한다. epoch 40 체크포인트를 기준선으로 고정하고 당장 다시 학습하지 않는다.
+- 학습에는 원본 JSON의 `ANNOTATION_INFO`가 정확히 1개인 이미지와, 검수자가 단일 객체라고 확인한 운영 캡처만 사용한다.
 - 검증기는 하나의 공유 백본과 4개 헤드를 사용한다. 한 이미지에 품목·찌그러짐·라벨·이물질 속성이 동시에 존재하므로 단일 라벨 분류기로 합치지 않는다.
 - crop은 비율을 왜곡하거나 물체 끝을 자르지 않도록 `letterbox`로 만든다.
 - 첫 배포는 **shadow mode**로 운영한다. 검증 결과를 로그에만 남기고 기존 응답과 Spring 콜백 JSON은 바꾸지 않는다.
@@ -53,16 +54,18 @@
 | `label` | 검수자가 확정한 `review.has_label` | X |
 | `foreign_material` | 검수자가 확정한 `review.has_foreign_material` | X |
 
-- 기존 `DIRTINESS=이물질(외부)`는 실제 쓰레기 이물질과 제품 라벨을 확실히 구분하지 못한다.
+- 공식 가이드의 `DIRTINESS=이물질(외부)` 정의는 **외부 오염 또는 라벨 부착**을 하나로 묶는다. 스티커와 라벨도 외부 이물질로 기록하도록 되어 있어 기존 JSON만으로 두 상태를 분리할 수 없다.
 - 따라서 `label`과 `foreign_material`은 기본값 `-1`로 두어 loss에서 마스킹한다.
 - `DIRTINESS` 변환값은 `label_proxy` 열에만 보존하며, 명시적인 실험 옵션 없이는 학습하지 않는다.
-- 운영 캡처 JSON에서 사람이 아래 필드를 검수한 데이터만 두 상태 헤드의 정답으로 가져온다.
+- 운영 캡처 JSON에서 사람이 아래 필드를 각각 검수한 데이터만 두 상태 헤드의 정답으로 가져온다. `label`과 `foreign_material`은 train/validation에 `0`과 `1`이 모두 있을 때만 활성화된다.
+- 검수는 `라벨만`, `외부 이물질만`, `둘 다 있음`, `둘 다 없음` 네 조합을 서로 다른 정답으로 기록한다.
 
 ```json
 {
   "review": {
     "is_correct": true,
     "expected_class": "can",
+    "is_single_object": true,
     "is_dented": true,
     "has_label": false,
     "has_foreign_material": false,
@@ -87,12 +90,13 @@ docker build -f Dockerfile.training -t expo-verifier-train:20260731 .
 ```bash
 python /app/extract_verifier_crops.py \
   --dataset-dir /app/ai_dataset/학습용_데이터 \
-  --output-dir /app/crops_verifier_v1 \
+  --output-dir /app/crops_verifier_single_v2 \
   --size 320 --workers 2 \
   --max-per-folder 10000 --val-max-per-folder 2000
 ```
 
 공식 Training/Validation 분리를 그대로 유지하고 직접촬영 데이터만 사용한다. 출력은 `manifest.csv`와 320px crop이다.
+기본값으로 다중 객체 이미지를 제외하며, 운영용 데이터 생성에서 `--allow-multiple-objects`는 사용하지 않는다.
 
 ### 검수 캡처 추가
 
@@ -110,25 +114,26 @@ python /app/import_reviewed_captures.py \
 
 ```bash
 python /app/scripts/audit_verifier_dataset.py \
-  --manifest /app/crops_verifier_v1/manifest.csv \
+  --manifest /app/crops_verifier_single_v2/manifest.csv \
+  --require-single-object \
   --require-masked-status
 ```
 
 ```bash
 python /app/train_verifier.py \
-  --manifest /app/crops_verifier_v1/manifest.csv \
+  --manifest /app/crops_verifier_single_v2/manifest.csv \
   --manifest /app/crops_verifier_reviewed_v1/reviewed_manifest.csv \
-  --output-dir /app/runs/verifier_mnv3_v1 \
+  --output-dir /app/runs/verifier_single_mnv3_v2 \
   --backbone mobilenet_v3_small --size 320
 ```
 
-검수 manifest가 아직 없으면 두 번째 `--manifest`를 생략한다. 이 경우 metadata의 활성 출력은 `material`, `dent`뿐이어야 한다.
+검수 manifest가 아직 없으면 두 번째 `--manifest`를 생략한다. 이 경우 metadata의 활성 출력은 `material`, `dent`뿐이어야 한다. 라벨 또는 외부 이물질 정답이 한쪽 값만 있거나 validation에 없으면 해당 헤드는 자동 비활성화된다.
 
 ### 최신 백본 비교
 
 ```bash
 python /app/train_verifier.py \
-  --manifest /app/crops_verifier_v1/manifest.csv \
+  --manifest /app/crops_verifier_single_v2/manifest.csv \
   --output-dir /app/runs/verifier_mnv4_v1 \
   --backbone mobilenetv4_conv_small.e2400_r224_in1k --size 320
 ```

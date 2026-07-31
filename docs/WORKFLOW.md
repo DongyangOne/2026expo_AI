@@ -109,8 +109,9 @@
 
 ### 멀티헤드 설계 (모델 2)
 - **공유 백본 1개** + material/dent/label/foreign_material 헤드. 추론 1회로 품목과 상태를 재검증한다.
+- 학습 원본은 라벨링된 쓰레기 객체가 정확히 하나인 이미지만 허용한다.
 - dent는 캔+페트에 사용하고 비대상 클래스는 loss에서 마스킹한다.
-- 기존 `DIRTINESS=이물질(외부)`만으로 라벨과 실제 외부 이물질을 분리할 수 없으므로 두 헤드는 사람 검수 정답이 모일 때까지 마스킹한다.
+- 공식 데이터의 `DIRTINESS=이물질(외부)`는 외부 오염과 라벨 부착을 하나로 합친 값이므로 두 헤드는 독립된 사람 검수 정답이 train/validation에 모두 모일 때까지 마스킹한다.
 - 초기에는 검증 결과를 로그에만 남기는 shadow mode로 적용해 기존 응답과 Spring 콜백 계약에 영향을 주지 않는다.
 - 상세 확정안: [`CROP_VERIFIER_PLAN.md`](CROP_VERIFIER_PLAN.md)
 
@@ -134,13 +135,14 @@ AI Hub 원본 JSON+이미지 (2TB)
 AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
   └→ scripts/extract_verifier_crops.py
        · 공식 Training/Validation 분리 유지
+       · ANNOTATION_INFO가 정확히 1개인 원본만 사용
        · bbox crop + 8% 패딩 → 320px letterbox
        · 9종 material 정답
        · DAMAGE → dent (원형0 / 찌그러짐·완전압착1)
        · label/foreign_material → -1 마스킹
        · DIRTINESS 변환값은 검수용 label_proxy에만 저장
        · ※ 원본 사용 필수 (640변환본은 파일명 리네임돼 JSON 매칭 불가)
-  └→ /share/Container/crops_verifier_v1/ (train/ + val/ + manifest.csv)
+  └→ /share/Container/crops_verifier_single_v2/ (train/ + val/ + manifest.csv)
   └→ scripts/import_reviewed_captures.py (운영 검수 정답 추가)
   └→ scripts/train_verifier.py
        · MobileNetV3-Small + material/dent/label/foreign_material 헤드
@@ -184,7 +186,7 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 ### 오인식 개선 루프
 
 1. 실제 키오스크 요청의 원본 이미지와 판정 결과를 같은 `capture_id`로 수집한다.
-2. JSON의 `review.is_correct`, `review.expected_class`, `review.is_dented`, `review.has_label`, `review.has_foreign_material`, `review.notes`를 검수자가 기록한다.
+2. JSON의 `review.is_correct`, `review.expected_class`, `review.is_single_object`, `review.is_dented`, `review.has_label`, `review.has_foreign_material`, `review.notes`를 검수자가 기록한다.
 3. 콜라 캔→스티로폼/종이처럼 틀린 표본과 유사 정상 표본을 함께 hard sample로 구성한다.
 4. 실제 키오스크 배경·조명·거리 분포를 유지해 메인 YOLO를 파인튜닝한다.
 5. 기존 검증셋과 별도의 키오스크 hard-case 검증셋에서 클래스별 혼동행렬을 비교한다.

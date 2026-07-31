@@ -27,6 +27,7 @@ CLASS_NAMES = [
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 TASK_NAMES = ("material", "dent", "label", "foreign_material")
+TASK_CLASSES = {"material": set(range(9)), "dent": {0, 1}, "label": {0, 1}, "foreign_material": {0, 1}}
 
 
 def read_manifest(paths: list[str], use_label_proxy: bool, proxy_weight: float):
@@ -52,6 +53,23 @@ def read_manifest(paths: list[str], use_label_proxy: bool, proxy_weight: float):
                     }
                 )
     return rows
+
+
+def enabled_tasks_for(rows) -> list[str]:
+    enabled = []
+    for task in TASK_NAMES:
+        required = TASK_CLASSES[task]
+        train_values = {
+            row[task] for row in rows
+            if row["split"] == "training" and row[task] >= 0
+        }
+        val_values = {
+            row[task] for row in rows
+            if row["split"] == "validation" and row[task] >= 0
+        }
+        if train_values == required and val_values == required:
+            enabled.append(task)
+    return enabled
 
 
 class VerifierDataset(Dataset):
@@ -223,7 +241,9 @@ def main():
         task: sum(row[task] >= 0 for row in train_rows)
         for task in TASK_NAMES
     }
+    enabled_tasks = enabled_tasks_for(rows)
     print(f"labeled counts={label_counts}", flush=True)
+    print(f"enabled tasks={enabled_tasks}", flush=True)
 
     train_transform = transforms.Compose(
         [
@@ -271,6 +291,10 @@ def main():
         "label": args.label_weight,
         "foreign_material": args.foreign_weight,
     }
+    task_weights = {
+        task: weight if task in enabled_tasks else 0.0
+        for task, weight in task_weights.items()
+    }
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
@@ -285,7 +309,9 @@ def main():
             model, val_loader, criteria, task_weights, device,
         )
         scheduler.step()
-        available = [value for value in val_metrics.values() if value is not None]
+        available = [val_metrics[task] for task in enabled_tasks]
+        if not available:
+            raise RuntimeError("train/validation에 완전한 정답을 가진 활성 task가 없습니다.")
         score = sum(available) / len(available)
         print(
             f"[{epoch:02d}/{args.epochs}] loss={train_loss:.4f}/{val_loss:.4f} "
@@ -318,7 +344,17 @@ def main():
     onnx_path = output_dir / "verifier.onnx"
     export_onnx(export_model, onnx_path, checkpoint["input_size"])
 
-    enabled_outputs = [task for task, count in label_counts.items() if count > 0]
+    enabled_outputs = enabled_tasks
+    task_class_counts = {
+        split: {
+            task: dict(sorted(Counter(
+                row[task] for row in rows
+                if row["split"] == split and row[task] >= 0
+            ).items()))
+            for task in TASK_NAMES
+        }
+        for split in ("training", "validation")
+    }
     metadata = {
         "backbone": args.backbone,
         "input_size": args.size,
@@ -326,6 +362,7 @@ def main():
         "outputs": list(TASK_NAMES),
         "enabled_outputs": enabled_outputs,
         "training_label_counts": label_counts,
+        "task_class_counts": task_class_counts,
         "uses_label_proxy": args.use_label_proxy,
         "warning": "Do not consume outputs absent from enabled_outputs.",
     }

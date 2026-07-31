@@ -8,7 +8,7 @@ AI Hub 원본의 공식 Training/Validation 분리를 유지하고 직접촬영 
 실행 예시 (NAS Docker):
   python /app/extract_verifier_crops.py \
     --dataset-dir /app/ai_dataset/학습용_데이터 \
-    --output-dir /app/crops_verifier_v1 \
+    --output-dir /app/crops_verifier_single_v2 \
     --size 320 --workers 2 --max-per-folder 10000 --val-max-per-folder 2000
 """
 
@@ -53,6 +53,11 @@ def make_source_key(split_name: str, label_dir_name: str, filename: str) -> str:
     """파일시스템의 surrogateescape 문자가 섞인 이름도 안정적으로 해시한다."""
     value = f"{split_name}/{label_dir_name}/{filename}"
     return hashlib.sha1(value.encode("utf-8", errors="surrogateescape")).hexdigest()[:20]
+
+
+def should_use_annotations(annotations: list, single_object_only: bool = True) -> bool:
+    """학습 이미지에 라벨링된 쓰레기 객체가 정확히 하나인지 확인한다."""
+    return bool(annotations) and (not single_object_only or len(annotations) == 1)
 
 
 def category_id(*values: str) -> int | None:
@@ -132,6 +137,7 @@ def collect_tasks(
     cap_per_folder: int,
     size: int,
     padding: float,
+    single_object_only: bool,
 ):
     split_dir = dataset_root / "01-1.정식개방데이터" / split_name
     label_base = split_dir / "02.라벨링데이터"
@@ -162,7 +168,7 @@ def collect_tasks(
             tasks.append(
                 (
                     str(image_path), str(json_path), split_name.lower(), folder_class,
-                    source_key, str(output_dir), size, padding,
+                    source_key, str(output_dir), size, padding, single_object_only,
                 )
             )
             paired += 1
@@ -171,7 +177,10 @@ def collect_tasks(
 
 
 def worker(task):
-    image_path, json_path, split, folder_class, source_key, output_dir, size, padding = task
+    (
+        image_path, json_path, split, folder_class, source_key, output_dir, size,
+        padding, single_object_only,
+    ) = task
     image = _imread_unicode(image_path)
     if image is None:
         return []
@@ -180,8 +189,11 @@ def worker(task):
             annotations = json.load(file).get("ANNOTATION_INFO", [])
     except Exception:
         return []
+    if not should_use_annotations(annotations, single_object_only):
+        return []
 
     height, width = image.shape[:2]
+    source_object_count = len(annotations)
     rows = []
     for ann_index, annotation in enumerate(annotations):
         bbox = points_to_bbox(annotation.get("POINTS", []))
@@ -214,7 +226,7 @@ def worker(task):
         rows.append(
             (
                 relative_path.as_posix(), split, source_key, material, class_name,
-                dent, -1, -1, label_proxy, dirtiness,
+                dent, -1, -1, label_proxy, dirtiness, source_object_count,
             )
         )
     return rows
@@ -229,7 +241,12 @@ def main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--max-per-folder", type=int, default=10000)
     parser.add_argument("--val-max-per-folder", type=int, default=2000)
+    parser.add_argument(
+        "--allow-multiple-objects", action="store_true",
+        help="기본값은 객체가 정확히 1개인 이미지만 사용합니다.",
+    )
     args = parser.parse_args()
+    single_object_only = not args.allow_multiple_objects
 
     dataset_root = Path(args.dataset_dir)
     output_dir = Path(args.output_dir)
@@ -245,13 +262,13 @@ def main():
     tasks.extend(
         collect_tasks(
             dataset_root, output_dir, "Training", args.max_per_folder,
-            args.size, args.padding,
+            args.size, args.padding, single_object_only,
         )
     )
     tasks.extend(
         collect_tasks(
             dataset_root, output_dir, "Validation", args.val_max_per_folder,
-            args.size, args.padding,
+            args.size, args.padding, single_object_only,
         )
     )
     if not tasks:
@@ -273,6 +290,7 @@ def main():
             [
                 "filepath", "split", "source_id", "material", "category",
                 "dent", "label", "foreign_material", "label_proxy", "raw_dirtiness",
+                "source_object_count",
             ]
         )
         writer.writerows(rows)
@@ -283,6 +301,7 @@ def main():
                 "classes": CLASS_NAMES,
                 "input_size": args.size,
                 "padding": args.padding,
+                "single_object_only": single_object_only,
                 "label_policy": "label and foreign_material are masked until human review",
             },
             file,
