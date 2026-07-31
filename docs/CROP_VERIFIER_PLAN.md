@@ -105,6 +105,15 @@ python /app/import_reviewed_captures.py \
 
 ### 기준선 학습
 
+`dataset_info.json` 생성 후 먼저 manifest를 감사한다. 9종·두 분할·이미지 파일·분할
+누수·상태 라벨 마스킹을 모두 통과해야 학습을 시작한다.
+
+```bash
+python /app/scripts/audit_verifier_dataset.py \
+  --manifest /app/crops_verifier_v1/manifest.csv \
+  --require-masked-status
+```
+
 ```bash
 python /app/train_verifier.py \
   --manifest /app/crops_verifier_v1/manifest.csv \

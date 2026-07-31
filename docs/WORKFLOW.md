@@ -282,6 +282,7 @@ scripts/
   extract_crops.py        상태분류기 crop 추출 (bbox + DAMAGE/DIRTINESS)
   train_classifier.py     멀티헤드 학습 (MobileNetV3 + dent/label)
   extract_verifier_crops.py  9종 crop + 안전한 상태 manifest 생성
+  audit_verifier_dataset.py  학습 전 9종·분할·파일·마스킹 무결성 검사
   import_reviewed_captures.py 운영 캡처 검수 정답을 crop manifest로 변환
   train_verifier.py       9종+상태 멀티태스크 검증기 학습/ONNX export
 
