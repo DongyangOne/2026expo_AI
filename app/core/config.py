@@ -41,5 +41,13 @@ class Settings(BaseSettings):
     LOG_RESULTS: bool = True
     LOG_DIR: str = "logs"
 
+    # ── 재학습/오인식 검수용 요청 캡처 ───────────────────────────────────────────
+    # 원본 이미지와 판정 JSON을 동일한 capture_id로 저장한다.
+    CAPTURE_REQUESTS: bool = True
+    CAPTURE_DIR: str = "logs/captures"
+    CAPTURE_MAX_IMAGE_BYTES: int = 20 * 1024 * 1024
+    CAPTURE_RETENTION_DAYS: int = 90
+    CAPTURE_MAX_STORAGE_MB: int = 10 * 1024
+
 
 settings = Settings()

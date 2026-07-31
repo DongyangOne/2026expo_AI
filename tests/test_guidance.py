@@ -41,6 +41,19 @@ class TestConditionsUnmet:
         g = guidance.build_guidance(WasteClass.PET, Conditions(has_label=True, is_dented=False), True)
         assert _codes(g) == [GuidanceCode.EMPTY_CONTENTS, GuidanceCode.REMOVE_LABEL, GuidanceCode.COMPRESS]
 
+    def test_pet_외부이물질까지_불충족_우선순위(self):
+        g = guidance.build_guidance(
+            WasteClass.PET,
+            Conditions(has_foreign_material=True, has_label=True, is_dented=False),
+            True,
+        )
+        assert _codes(g) == [
+            GuidanceCode.EMPTY_CONTENTS,
+            GuidanceCode.FOREIGN_MATERIAL,
+            GuidanceCode.REMOVE_LABEL,
+            GuidanceCode.COMPRESS,
+        ]
+
     def test_can_미압착만(self):
         g = guidance.build_guidance(WasteClass.CAN, Conditions(is_dented=False), False)
         assert _codes(g) == [GuidanceCode.COMPRESS]
@@ -51,7 +64,27 @@ class TestConditionsUnmet:
 
     def test_paper_무게만(self):
         g = guidance.build_guidance(WasteClass.PAPER, Conditions(), True)
+        assert _codes(g) == [GuidanceCode.WEIGHT_ANOMALY]
+
+    def test_vinyl_무게만(self):
+        g = guidance.build_guidance(WasteClass.VINYL, Conditions(), True)
+        assert _codes(g) == [GuidanceCode.WEIGHT_ANOMALY]
+
+    def test_plastic_무게만(self):
+        g = guidance.build_guidance(WasteClass.PLASTIC, Conditions(), True)
         assert _codes(g) == [GuidanceCode.EMPTY_CONTENTS]
+
+    def test_can_무게만(self):
+        g = guidance.build_guidance(WasteClass.CAN, Conditions(), True)
+        assert _codes(g) == [GuidanceCode.EMPTY_CONTENTS]
+
+    def test_외부이물질만(self):
+        g = guidance.build_guidance(
+            WasteClass.PAPER,
+            Conditions(has_foreign_material=True),
+            False,
+        )
+        assert _codes(g) == [GuidanceCode.FOREIGN_MATERIAL]
 
 
 # ── 품목별 헤드 비대상은 검사 안 함 (None 무시) ─────────────────────────────────

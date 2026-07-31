@@ -7,7 +7,8 @@ from app.core.security import verify_api_key
 from app.models.registry import ModelRegistry
 from app.schemas.request import DetectFormData
 from app.schemas.response import DetectResponse, ErrorResponse
-from app.services import pipeline, spring_client
+from app.core.config import settings
+from app.services import pipeline, request_capture, spring_client
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +36,14 @@ def _get_registry(request: Request) -> ModelRegistry:
     },
     summary="쓰레기 분류",
     description=(
-        "이미지와 무게 값으로 9-class 분류 후 상태(압착/라벨/무게)를 검사합니다.\n\n"
+        "이미지와 무게 값으로 9-class 분류 후 상태(압착/라벨/외부 이물질/무게)를 검사합니다.\n\n"
         "- `status=ALLOWED`: 재활용 허용 (페트/플라스틱/캔/종이 + 조건 충족)\n"
         "- `status=REJECTED`: 조건 불충족(`guidance` 재처리 안내) 또는 완전거부(`rejection`, 유리·건전지 등)\n"
         "- `status=GENERAL_WASTE`: 일반쓰레기 (`general` — 비닐/저신뢰/미분류)\n"
         "- `status=NOT_DETECTED`: 미감지\n"
         "- `client_id`: 하드웨어가 보낸 사용자/피드백 구분 ID를 응답과 Spring 콜백에 그대로 포함\n"
-        "- `conditions`: is_dented(페트·캔 압착), has_label(페트·플라스틱 라벨)"
+        "- `conditions`: is_dented(페트·캔 압착), has_label(페트·플라스틱 라벨), "
+        "has_foreign_material(지원 모델의 외부 이물질)"
     ),
 )
 async def detect(
@@ -65,4 +67,24 @@ async def detect(
         )
 
     background_tasks.add_task(spring_client.notify, result)
+
+    if settings.CAPTURE_REQUESTS:
+        try:
+            # 파이프라인에서 소비한 UploadFile을 되감아 원본 바이트를 보존한다.
+            # 제한보다 1바이트 더 읽어 request_capture에서 초과 여부를 판별한다.
+            await form.image.seek(0)
+            image_bytes = await form.image.read(settings.CAPTURE_MAX_IMAGE_BYTES + 1)
+            background_tasks.add_task(
+                request_capture.save_capture,
+                image_bytes=image_bytes,
+                original_filename=form.image.filename,
+                content_type=form.image.content_type,
+                client_id=form.client_id,
+                weight_g=form.weight_g,
+                result=result,
+            )
+        except Exception:
+            # 캡처는 보조 기능이므로 실패해도 추론 응답은 정상 반환한다.
+            logger.exception("요청 이미지 캡처 준비 실패")
+
     return result

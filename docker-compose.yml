@@ -10,6 +10,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./weights:/app/weights
+      # 결과 JSONL과 재학습용 이미지/판정 쌍을 컨테이너 재생성 후에도 보존한다.
+      - ./logs:/app/logs
     deploy:
       resources:
         limits:

@@ -8,7 +8,7 @@ from app.api.v1 import detect
 from app.main import app
 from app.schemas.enums import DetectionStatus
 from app.schemas.response import DetectResponse
-from app.services import pipeline, spring_client
+from app.services import pipeline, request_capture, spring_client
 
 
 def test_detect_contract_requires_and_returns_client_id():
@@ -23,8 +23,18 @@ def test_detect_contract_requires_and_returns_client_id():
     assert "client_id" in response_schema["required"]
 
 
+def test_guidance_contract_exposes_new_codes_and_foreign_material_condition():
+    schemas = app.openapi()["components"]["schemas"]
+
+    assert {"WEIGHT_ANOMALY", "FOREIGN_MATERIAL"}.issubset(
+        set(schemas["GuidanceCode"]["enum"])
+    )
+    assert "has_foreign_material" in schemas["Conditions"]["properties"]
+
+
 def test_detect_echoes_client_id_to_response_and_callback(monkeypatch):
     captured: dict = {}
+    image_bytes = b"\xff\xd8\xffcaptured-image"
 
     async def fake_run(image, weight_g, client_id, registry):
         captured["pipeline_client_id"] = client_id
@@ -33,8 +43,15 @@ def test_detect_echoes_client_id_to_response_and_callback(monkeypatch):
     async def fake_notify(result):
         captured["callback_client_id"] = result.client_id
 
+    def fake_save_capture(**kwargs):
+        captured["capture_client_id"] = kwargs["client_id"]
+        captured["capture_image"] = kwargs["image_bytes"]
+        captured["capture_result_client_id"] = kwargs["result"].client_id
+
     monkeypatch.setattr(pipeline, "run", fake_run)
     monkeypatch.setattr(spring_client, "notify", fake_notify)
+    monkeypatch.setattr(request_capture, "save_capture", fake_save_capture)
+    monkeypatch.setattr(detect.settings, "CAPTURE_REQUESTS", True)
     app.dependency_overrides[detect._get_registry] = lambda: object()
 
     try:
@@ -42,7 +59,7 @@ def test_detect_echoes_client_id_to_response_and_callback(monkeypatch):
         response = client.post(
             "/api/v1/detect",
             headers={"X-API-Key": "test-key"},
-            files={"image": ("sample.jpg", b"not-read-by-fake-pipeline", "image/jpeg")},
+            files={"image": ("sample.jpg", image_bytes, "image/jpeg")},
             data={"client_id": "hardware-user-001", "weight_g": "28.0"},
         )
     finally:
@@ -53,6 +70,9 @@ def test_detect_echoes_client_id_to_response_and_callback(monkeypatch):
     assert captured == {
         "pipeline_client_id": "hardware-user-001",
         "callback_client_id": "hardware-user-001",
+        "capture_client_id": "hardware-user-001",
+        "capture_image": image_bytes,
+        "capture_result_client_id": "hardware-user-001",
     }
 
 

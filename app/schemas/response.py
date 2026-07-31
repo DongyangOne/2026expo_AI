@@ -6,7 +6,7 @@
   ├─ client_id       : str               ← 하드웨어가 보낸 사용자/피드백 구분 ID
   ├─ status          : DetectionStatus   ← Spring 의 1차 분기 판별자
   ├─ classification  : Classification?   ← 분류 결과 (NOT_DETECTED 시 null)
-  ├─ conditions      : Conditions        ← 상태 감지 (멀티헤드: is_dented/has_label)
+  ├─ conditions      : Conditions        ← 상태 감지 (is_dented/has_label/has_foreign_material)
   ├─ weight          : WeightInfo        ← 무게 + 이상 여부
   ├─ guidance        : Guidance[]        ← 조건 불충족 시 재처리 안내 (압착/라벨/비우기). 충족 시 빈 배열
   ├─ rejection       : Rejection?        ← 완전 거부 사유 (유리/건전지 등)
@@ -43,8 +43,9 @@ class Classification(BaseModel):
 
 class Conditions(BaseModel):
     """객체 상태 (멀티헤드). 모델 미탑재 또는 비대상 헤드는 null."""
-    has_label: Optional[bool] = Field(None, description="라벨 부착 여부 (페트·플라스틱)")
-    is_dented: Optional[bool] = Field(None, description="압착(찌그러짐) 여부 (페트·캔)")
+    has_label: Optional[bool]            = Field(None, description="라벨 부착 여부 (페트·플라스틱)")
+    is_dented: Optional[bool]            = Field(None, description="압착(찌그러짐) 여부 (페트·캔)")
+    has_foreign_material: Optional[bool] = Field(None, description="외부 이물질 여부 (지원 모델 탑재 시)")
 
 
 class WeightInfo(BaseModel):
@@ -89,7 +90,7 @@ class DetectResponse(BaseModel):
                     "client_id": "hardware-user-001",
                     "status": "ALLOWED",
                     "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
-                    "conditions": {"has_label": False, "is_dented": True},
+                    "conditions": {"has_label": False, "is_dented": True, "has_foreign_material": None},
                     "weight": {"value_g": 28.0, "anomaly": False},
                     "guidance": [],
                     "rejection": None,
@@ -100,10 +101,11 @@ class DetectResponse(BaseModel):
                     "client_id": "hardware-user-001",
                     "status": "REJECTED",
                     "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.91},
-                    "conditions": {"has_label": True, "is_dented": False},
+                    "conditions": {"has_label": True, "is_dented": False, "has_foreign_material": True},
                     "weight": {"value_g": 540.0, "anomaly": True},
                     "guidance": [
                         {"code": "EMPTY_CONTENTS", "message": "내용물이 남아 있는 것 같아요. 비우고 다시 넣어 주세요."},
+                        {"code": "FOREIGN_MATERIAL", "message": "외부 이물질을 제거하고 다시 넣어 주세요."},
                         {"code": "REMOVE_LABEL", "message": "라벨을 제거해 주세요."},
                         {"code": "COMPRESS", "message": "페트병·캔은 납작하게 압착해서 넣어 주세요."}
                     ],

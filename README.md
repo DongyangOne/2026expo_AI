@@ -41,7 +41,7 @@ curl -X POST http://localhost:8000/api/v1/detect \
   "client_id": "hardware-user-001",
   "status": "ALLOWED",
   "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
-  "conditions": {"has_label": false, "is_dented": true},
+  "conditions": {"has_label": false, "is_dented": true, "has_foreign_material": null},
   "weight": {"value_g": 28.0, "anomaly": false},
   "guidance": [],
   "rejection": null,
@@ -63,9 +63,13 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 | code | 의미 |
 |------|------|
-| `EMPTY_CONTENTS` | 내용물 비우기 |
+| `EMPTY_CONTENTS` | 내용물 비우기 (페트·플라스틱·캔 무게 이상) |
+| `WEIGHT_ANOMALY` | 무게 이상 확인 (종이·비닐) |
+| `FOREIGN_MATERIAL` | 외부 이물질 제거 |
 | `REMOVE_LABEL` | 라벨 제거 (페트·플라스틱) |
 | `COMPRESS` | 압착 (페트·캔) |
+
+> 현재 배포된 상태 모델은 `dent`/`label` 2헤드이므로 `has_foreign_material`은 `null`이다. `foreign_material` 헤드가 포함된 모델을 탑재하면 `FOREIGN_MATERIAL` 안내가 자동 활성화된다.
 
 ### `rejection` 코드 (완전 거부)
 
@@ -109,6 +113,11 @@ WEIGHT_ANOMALY_ENABLED=true
 # 결과 로깅 (Spring 없이도 logs/results.jsonl 에 저장)
 LOG_RESULTS=true
 LOG_DIR=logs
+# 재학습/오인식 검수용 원본 이미지 + 판정 JSON 저장
+CAPTURE_REQUESTS=true
+CAPTURE_DIR=logs/captures
+CAPTURE_RETENTION_DAYS=90
+CAPTURE_MAX_STORAGE_MB=10240
 ```
 
 ### 결과 로그 (`logs/results.jsonl`)
@@ -119,6 +128,35 @@ LOG_DIR=logs
 ```jsonl
 {"timestamp":"2026-07-03T10:00:00+00:00","client_id":"hardware-user-001","status":"ALLOWED","classification":{"class_id":1,...},...}
 ```
+
+### 요청 이미지와 판정 캡처 (`logs/captures/`)
+
+`CAPTURE_REQUESTS=true`이면 정상적으로 판정된 요청마다 원본 이미지와 판정 JSON을 같은
+`capture_id`로 저장한다. Docker Compose에서는 `./logs:/app/logs` 볼륨을 사용하므로
+컨테이너를 다시 만들어도 파일이 유지된다.
+
+```text
+logs/captures/2026-07-31/
+  20260731T012345123456Z_a1b2c3d4e5f6.jpg
+  20260731T012345123456Z_a1b2c3d4e5f6.json
+```
+
+JSON에는 요청의 `client_id`와 무게, 예측 클래스·신뢰도·bbox·상태, 이미지 SHA-256과
+아래 검수 필드가 포함된다. API 키와 요청 헤더는 저장하지 않는다.
+
+```json
+{
+  "review": {
+    "is_correct": null,
+    "expected_class": null,
+    "notes": null
+  }
+}
+```
+
+기본 보존 기간은 90일, 최대 용량은 10GB이며 초과 시 오래된 이미지/JSON 쌍부터 제거한다.
+오인식이 확인되면 검수 필드를 채운 뒤 해당 이미지를 실제 키오스크 환경의 hard sample로
+재학습 데이터에 추가한다.
 
 ---
 

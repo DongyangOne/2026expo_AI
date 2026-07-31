@@ -8,7 +8,9 @@
         미감지            → NOT_DETECTED
         저신뢰            → GENERAL_WASTE (일반쓰레기)
         거부품목(유리 등)  → REJECTED (완전 거부)
-        비닐              → GENERAL_WASTE
+        비닐              → 상태·무게 검사
+                            이상 있음 → REJECTED (재처리 guidance)
+                            이상 없음 → GENERAL_WASTE
         허용품목          → 멀티헤드 상태(inference.run_state) + 무게 검사
                             조건 충족  → ALLOWED
                             조건 불충족 → REJECTED (재처리 guidance)
@@ -110,12 +112,32 @@ async def run(
             bbox=bbox_rounded,
         )
 
-    # ── 일반쓰레기 (비닐) ────────────────────────────────────────────────────────
+    # ── 일반쓰레기 (비닐) — 무게/외부 이물질 이상이면 먼저 재처리 안내 ───────────
     if guidance.is_general(cls):
+        conditions = await loop.run_in_executor(
+            _executor, inference.run_state, registry.state(), img, bbox, cls
+        )
+        weight_info.anomaly = (
+            settings.WEIGHT_ANOMALY_ENABLED
+            and weight_g is not None
+            and is_anomaly(cls.value, weight_g, bbox=bbox, img_area=float(img.shape[0] * img.shape[1]))
+        )
+        guide = guidance.build_guidance(cls, conditions, weight_info.anomaly)
+        if guide:
+            return DetectResponse(
+                client_id=client_id,
+                status=DetectionStatus.REJECTED,
+                classification=classification,
+                conditions=conditions,
+                weight=weight_info,
+                guidance=guide,
+                bbox=bbox_rounded,
+            )
         return DetectResponse(
             client_id=client_id,
             status=DetectionStatus.GENERAL_WASTE,
             classification=classification,
+            conditions=conditions,
             weight=weight_info,
             general=guidance.build_general(GeneralWasteCode.VINYL),
             bbox=bbox_rounded,

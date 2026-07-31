@@ -42,7 +42,7 @@
 | 구분 | 클래스 | status | 후속 |
 |------|--------|--------|------|
 | **재활용 허용** | 페트·플라스틱·캔·종이 | ALLOWED(조건충족) / REJECTED(불충족) | 조건검사 후 재활용 함 |
-| **일반쓰레기** | 비닐 · 저신뢰 · 미분류 | GENERAL_WASTE | 일반함 |
+| **일반쓰레기** | 비닐 · 저신뢰 · 미분류 | 비닐 정상: GENERAL_WASTE / 비닐 무게·이물질 이상: REJECTED | 일반함 또는 재처리 |
 | **수거 거부** | 유리·건전지·형광등·스티로폼 | REJECTED | 분리 불가 안내 |
 | **미감지** | — | NOT_DETECTED | 재시도 |
 
@@ -54,8 +54,20 @@
 | 캔 | — | ✅ | ✅ |
 | 종이 | — | — | ✅ |
 
-> 조건 하나라도 불충족 → `REJECTED` + guidance(`REMOVE_LABEL`/`COMPRESS`/`EMPTY_CONTENTS`) 재처리 안내 → 사용자 처리 후 재투입.
-> 비닐 = 일반쓰레기(`GENERAL_WASTE`), 유리·건전지·형광등·스티로폼 = 완전 수거거부(`REJECTED`+`rejection`). 색 구분/안내 없음.
+> 조건 하나라도 불충족 → `REJECTED` + guidance(`EMPTY_CONTENTS`/`WEIGHT_ANOMALY`/`FOREIGN_MATERIAL`/`REMOVE_LABEL`/`COMPRESS`) 재처리 안내 → 사용자 처리 후 재투입.
+> 비닐은 무게·외부 이물질 이상이 없으면 일반쓰레기(`GENERAL_WASTE`)이고, 이상이 있으면 재처리(`REJECTED`)한다. 유리·건전지·형광등·스티로폼은 완전 수거거부(`REJECTED`+`rejection`).
+
+### GuidanceCode 매핑
+
+| 조건 | 코드 |
+|------|------|
+| 페트·플라스틱·캔 무게 이상/내용물 존재 | `EMPTY_CONTENTS` |
+| 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
+| 외부 이물질 | `FOREIGN_MATERIAL` |
+| 라벨 미제거 | `REMOVE_LABEL` |
+| 페트·캔 미압착 | `COMPRESS` |
+
+> 현재 배포된 상태 모델은 `dent`/`label` 2헤드다. 계약과 런타임은 선택적 `foreign_material` 출력을 지원하지만, 해당 헤드가 없는 현 모델에서는 `conditions.has_foreign_material=null`이며 `FOREIGN_MATERIAL`을 자동 생성하지 않는다.
 
 ---
 
@@ -71,11 +83,11 @@
 4. 신뢰도 판정
      └ confidence < TRUST_CONF(0.55) → LOW_CONFIDENCE (일반쓰레기)
 5. [허용: 페트/플라스틱/캔/종이]
-     ├ 상태 멀티헤드(crop ONNX) → conditions.is_dented / has_label
+     ├ 상태 멀티헤드(crop ONNX) → conditions.is_dented / has_label / has_foreign_material(선택)
      ├ 무게 → weight.anomaly
      └ build_guidance() → 불충족 안내. 비면 ALLOWED, 있으면 REJECTED(재처리)
 6. [거부: 유리/건전지/형광등/스티로폼] → REJECTED + rejection
-7. [비닐] → GENERAL_WASTE + general / [저신뢰] → GENERAL_WASTE
+7. [비닐] → 무게·외부 이물질 이상이면 REJECTED + guidance, 정상이면 GENERAL_WASTE + general
 8. `client_id`를 포함한 DetectResponse 조립 → 하드웨어 응답 + Spring 콜백(fire-and-forget)
 ```
 
@@ -90,7 +102,7 @@
 | # | 모델 | 입력 | 출력 | 백본 | 포맷 | 상태 |
 |---|------|------|------|------|------|------|
 | 1 | 메인 감지 | 640px | 9클래스 bbox | YOLO26m | NCNN | Pi5 배포·로드 정상 |
-| 2 | 상태 멀티헤드 | 224px crop | dent(2) + label(2) | MobileNetV3-Small | ONNX | Pi5 배포·로드 정상 |
+| 2 | 상태 멀티헤드 | 224px crop | dent(2) + label(2), foreign_material(선택) | MobileNetV3-Small | ONNX | Pi5 배포 모델은 2헤드 |
 | (3) | 색/재질 SubClass | 224px crop | 무색/유색, 철/알루미늄 | — | — | **보류** (상태 우선) |
 
 > 모델 3은 이전 설계의 색·재질 세부분류. 이번 우선순위는 **상태(라벨/찌그러짐)**라 보류.
@@ -160,7 +172,22 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 - 실제 환경 파일: `/home/one/2026expo_AI/.env`
 - Spring 콜백: `SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
 - 결과 로그: `LOG_RESULTS=true`이면 `logs/results.jsonl`에 항상 기록
+- 재학습 캡처: `CAPTURE_REQUESTS=true`이면 `logs/captures/YYYY-MM-DD/`에 원본 이미지와 판정 JSON 쌍 저장
+- 로그 영속화: Docker Compose의 `./logs:/app/logs` 볼륨 사용
 - 콜백은 fire-and-forget 방식이며 연결 실패·타임아웃이 AI 응답에 영향을 주지 않는다.
+
+### 오인식 개선 루프
+
+1. 실제 키오스크 요청의 원본 이미지와 판정 결과를 같은 `capture_id`로 수집한다.
+2. JSON의 `review.is_correct`, `review.expected_class`, `review.notes`를 검수자가 기록한다.
+3. 콜라 캔→스티로폼/종이처럼 틀린 표본과 유사 정상 표본을 함께 hard sample로 구성한다.
+4. 실제 키오스크 배경·조명·거리 분포를 유지해 메인 YOLO를 파인튜닝한다.
+5. 기존 검증셋과 별도의 키오스크 hard-case 검증셋에서 클래스별 혼동행렬을 비교한다.
+
+> 현재 모델은 재활용 데이터셋의 촬영 분포를 학습했기 때문에 흰 배경 상품 이미지,
+> 렌더링 이미지, 인쇄 무늬처럼 운영 카메라와 다른 입력에서 재질 대신 배경·윤곽·색상에
+> 치우쳐 오분류할 수 있다. 단순 임계값 상향만으로는 고신뢰 오분류를 해결할 수 없으므로
+> 운영 이미지 수집과 재학습을 우선한다.
 
 ### 배포 흐름
 
@@ -223,6 +250,7 @@ curl http://127.0.0.1:8000/health
 app/
   core/config.py          설정 (임계값, 모델경로, Spring URL)
   models/registry.py      모델 보관소 (graceful degradation)
+  services/request_capture.py  재학습용 원본 이미지/판정 JSON 쌍 저장
   schemas/
     enums.py              WasteClass, DetectionStatus, GuidanceCode, RejectionCode, GeneralWasteCode
     response.py           DetectResponse DTO (client_id/status/classification/conditions/weight/guidance/rejection/general)

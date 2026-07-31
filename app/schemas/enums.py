@@ -37,9 +37,11 @@ class DetectionStatus(str, Enum):
 
 class GuidanceCode(str, Enum):
     """허용 품목의 조건 불충족 시 재처리 안내 코드."""
-    EMPTY_CONTENTS = "EMPTY_CONTENTS"  # 내용물 비우기 (무게 이상)
-    REMOVE_LABEL   = "REMOVE_LABEL"    # 라벨 제거 (페트·플라스틱)
-    COMPRESS       = "COMPRESS"        # 압착 (페트·캔 미압착)
+    EMPTY_CONTENTS  = "EMPTY_CONTENTS"   # 내용물 비우기 (페트·플라스틱·캔 무게 이상)
+    WEIGHT_ANOMALY  = "WEIGHT_ANOMALY"   # 무게 이상 (종이·비닐)
+    FOREIGN_MATERIAL = "FOREIGN_MATERIAL"  # 외부 이물질 제거
+    REMOVE_LABEL    = "REMOVE_LABEL"     # 라벨 제거 (페트·플라스틱)
+    COMPRESS        = "COMPRESS"         # 압착 (페트·캔 미압착)
 
 
 class RejectionCode(str, Enum):

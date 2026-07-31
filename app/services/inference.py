@@ -56,6 +56,7 @@ def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> C
     """
     bbox 크롭 → 멀티헤드 추론 → Conditions.
     세션 미탑재(None) 또는 헤드 비대상 품목은 해당 값 None.
+    기존 모델은 dent/label 2헤드이며, foreign_material 출력이 있는 모델은 자동 사용한다.
     """
     if session is None:
         return Conditions()
@@ -74,7 +75,21 @@ def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> C
     rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     arr = ((rgb - _MEAN) / _STD).transpose(2, 0, 1)[None]  # (1,3,224,224)
 
-    dent_out, label_out = session.run(["dent", "label"], {"img": arr})
+    output_names = {output.name for output in session.get_outputs()}
+    requested_outputs = ["dent", "label"]
+    if "foreign_material" in output_names:
+        requested_outputs.append("foreign_material")
+    output_values = session.run(requested_outputs, {"img": arr})
+    outputs = dict(zip(requested_outputs, output_values))
+
+    dent_out = outputs["dent"]
+    label_out = outputs["label"]
     is_dented = bool(dent_out[0].argmax()) if cls in _DENT_CLASSES else None
     has_label = bool(label_out[0].argmax()) if cls in _LABEL_CLASSES else None
-    return Conditions(is_dented=is_dented, has_label=has_label)
+    foreign_out = outputs.get("foreign_material")
+    has_foreign_material = bool(foreign_out[0].argmax()) if foreign_out is not None else None
+    return Conditions(
+        is_dented=is_dented,
+        has_label=has_label,
+        has_foreign_material=has_foreign_material,
+    )
