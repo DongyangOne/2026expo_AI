@@ -1,0 +1,6 @@
+FROM ultralytics/ultralytics:latest
+
+COPY requirements-training.txt /tmp/requirements-training.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-training.txt
+
+WORKDIR /app

@@ -1,7 +1,7 @@
 # 2026 동양미래 EXPO — 재활용 분류 AI 워크플로우
 
 > 키오스크 재활용품 자동 분류 시스템. 사진 + 무게센서 + `client_id` 입력 → 분류·상태 판정 → Spring 서버 전송.
-> 최종 갱신: 2026-07-20
+> 최종 갱신: 2026-07-31
 
 ---
 
@@ -97,21 +97,22 @@
 
 ---
 
-## 5. 모델 구성 (3-tier)
+## 5. 모델 구성 (2-stage + 상태 헤드)
 
 | # | 모델 | 입력 | 출력 | 백본 | 포맷 | 상태 |
 |---|------|------|------|------|------|------|
-| 1 | 메인 감지 | 640px | 9클래스 bbox | YOLO26m | NCNN | Pi5 배포·로드 정상 |
-| 2 | 상태 멀티헤드 | 224px crop | dent(2) + label(2), foreign_material(선택) | MobileNetV3-Small | ONNX | Pi5 배포 모델은 2헤드 |
-| (3) | 색/재질 SubClass | 224px crop | 무색/유색, 철/알루미늄 | — | — | **보류** (상태 우선) |
+| 1 | 메인 감지 | 640px | 9클래스 bbox + 1차 품목 | YOLO26m epoch 40 | NCNN | 체크포인트 고정, Pi5 배포 기준선 |
+| 2 | crop 검증기 | 320px crop | material(9) + dent(2) + label(2) + foreign_material(2) | MobileNetV3-Small 기준선 | ONNX | material/dent부터 학습, shadow 적용 예정 |
 
-> 모델 3은 이전 설계의 색·재질 세부분류. 이번 우선순위는 **상태(라벨/찌그러짐)**라 보류.
-> 단 캔 철/알루미늄은 무게가 달라(철>알루미늄) 무게로직 정밀도에 도움 → 추후 재검토.
+> 최신 경량 후보 MobileNetV4 Conv Small과 RepViT는 동일 데이터로 학습한 뒤 Pi5의
+> 실제 ONNX 정확도·p50/p95 지연시간을 비교해 기준선보다 좋을 때만 교체한다.
 
 ### 멀티헤드 설계 (모델 2)
-- **공유 백본 1개** + dent 헤드 + label 헤드. 추론 1회로 두 출력.
-- 런타임에서는 페트병은 두 헤드, 캔은 dent, 플라스틱은 label 결과를 사용한다.
-- dent는 페트+캔 공통 학습, label은 페트+플라스틱 공통 학습하며 비대상 헤드는 loss에서 마스킹한다.
+- **공유 백본 1개** + material/dent/label/foreign_material 헤드. 추론 1회로 품목과 상태를 재검증한다.
+- dent는 캔+페트에 사용하고 비대상 클래스는 loss에서 마스킹한다.
+- 기존 `DIRTINESS=이물질(외부)`만으로 라벨과 실제 외부 이물질을 분리할 수 없으므로 두 헤드는 사람 검수 정답이 모일 때까지 마스킹한다.
+- 초기에는 검증 결과를 로그에만 남기는 shadow mode로 적용해 기존 응답과 Spring 콜백 계약에 영향을 주지 않는다.
+- 상세 확정안: [`CROP_VERIFIER_PLAN.md`](CROP_VERIFIER_PLAN.md)
 
 ---
 
@@ -128,19 +129,23 @@ AI Hub 원본 JSON+이미지 (2TB)
   └→ YOLO26m 학습 → best.pt → NCNN export
 ```
 
-### 6-2. 상태 멀티헤드 분류기
+### 6-2. 객체 crop 멀티태스크 검증기
 ```
 AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
-  └→ scripts/extract_crops.py
-       · bbox crop + 12% 패딩 → 224px letterbox
+  └→ scripts/extract_verifier_crops.py
+       · 공식 Training/Validation 분리 유지
+       · bbox crop + 8% 패딩 → 320px letterbox
+       · 9종 material 정답
        · DAMAGE → dent (원형0 / 찌그러짐·완전압착1)
-       · DIRTINESS → label (오염없음0 / 이물질외부1, 내부·전체는 -1 마스킹)
+       · label/foreign_material → -1 마스킹
+       · DIRTINESS 변환값은 검수용 label_proxy에만 저장
        · ※ 원본 사용 필수 (640변환본은 파일명 리네임돼 JSON 매칭 불가)
-  └→ /share/Container/crops_state_v1/ (pet/ + can/ + manifest.csv)
-  └→ scripts/train_classifier.py
-       · MobileNetV3-Small + dent/label 헤드
-       · 클래스 불균형 → CrossEntropy class-weight
-  └→ best.pt → multihead.onnx → onnx2ncnn
+  └→ /share/Container/crops_verifier_v1/ (train/ + val/ + manifest.csv)
+  └→ scripts/import_reviewed_captures.py (운영 검수 정답 추가)
+  └→ scripts/train_verifier.py
+       · MobileNetV3-Small + material/dent/label/foreign_material 헤드
+       · 미라벨 상태는 masked loss
+  └→ best_verifier.pt + verifier.onnx + verifier_metadata.json
 ```
 
 ---
@@ -150,7 +155,7 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 - **재활용품 분류 및 선별 데이터**, 약 100만 장, JSON 라벨 (BBOX 70% / POLYGON 30%)
 - 촬영: 직접촬영 70.2% (키오스크 환경 유사) + 선별영상추출 29.8% (컨베이어)
 - **객체 속성 5개**: `DAMAGE` `DIRTINESS` `COVER` `TRANSPARENCY` `SHAPE`
-- **핵심 발견**: `DIRTINESS=이물질(외부)` ≈ **라벨 부착** (육안검증). `오염없음`=라벨 뗀 맨 용기.
+- **핵심 제약**: `DIRTINESS=이물질(외부)`에는 상품 라벨과 실제 외부 이물질이 섞일 수 있어 두 정답으로 직접 사용하지 않는다.
 - 상세: `memory/dataset_attribute_labels.md`, 데이터 점검: `docs/DATA_AUDIT.md`
 
 ### 실측 상태 분포 (직접촬영)
@@ -179,7 +184,7 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 ### 오인식 개선 루프
 
 1. 실제 키오스크 요청의 원본 이미지와 판정 결과를 같은 `capture_id`로 수집한다.
-2. JSON의 `review.is_correct`, `review.expected_class`, `review.notes`를 검수자가 기록한다.
+2. JSON의 `review.is_correct`, `review.expected_class`, `review.is_dented`, `review.has_label`, `review.has_foreign_material`, `review.notes`를 검수자가 기록한다.
 3. 콜라 캔→스티로폼/종이처럼 틀린 표본과 유사 정상 표본을 함께 hard sample로 구성한다.
 4. 실제 키오스크 배경·조명·거리 분포를 유지해 메인 YOLO를 파인튜닝한다.
 5. 기존 검증셋과 별도의 키오스크 hard-case 검증셋에서 클래스별 혼동행렬을 비교한다.
@@ -217,7 +222,7 @@ curl http://127.0.0.1:8000/health
 
 | 항목 | 값 |
 |------|-----|
-| NAS | QNAP, 192.168.0.110, Ryzen 1700 + RTX 2000 Ada 16GB |
+| NAS | QNAP, 192.168.0.110, Ryzen 5 PRO 1600 (12 logical CPU) + RTX 2000 Ada 16GB |
 | Docker | `/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker` (PATH에 없음, sudo 필요) |
 | 학습 이미지 | `ultralytics/ultralytics:latest` |
 | SMB | `\\192.168.0.110\Container` → 컨테이너 `/app` (`/share/Container`) |
@@ -229,13 +234,15 @@ curl http://127.0.0.1:8000/health
 
 ---
 
-## 10. 현재 운영 상태 (2026-07-20)
+## 10. 현재 운영 상태 (2026-07-31)
 
 | 단계 | 상태 |
 |------|------|
 | 데이터 변환 (convert_v2) | ✅ 완료 (train 라벨 518,728 / val 68,147) |
 | 메인 YOLO26m NCNN | ✅ Pi5 배포 및 로드 정상 |
+| NAS 메인 학습 | ✅ epoch 40 체크포인트 보존 후 중지 (학습 프로세스 0) |
 | 상태 멀티헤드 ONNX | ✅ Pi5 배포 및 로드 정상 |
+| 9종 crop 검증기 | 🚧 추출·학습 파이프라인 구현, NAS 데이터 생성 진행 |
 | `/api/v1/detect` + `client_id` 계약 | ✅ 구현·테스트·배포 완료 |
 | Spring 콜백 URL | ✅ AI 서버 환경 및 컨테이너 반영 완료 |
 | Spring 콜백 수신 테스트 | ⏳ Spring 측 엔드포인트 배포 후 확인 |
@@ -274,9 +281,15 @@ scripts/
   convert_v2.py           메인 학습용 변환 (폴리곤복원 + 640리사이즈)
   extract_crops.py        상태분류기 crop 추출 (bbox + DAMAGE/DIRTINESS)
   train_classifier.py     멀티헤드 학습 (MobileNetV3 + dent/label)
+  extract_verifier_crops.py  9종 crop + 안전한 상태 manifest 생성
+  import_reviewed_captures.py 운영 캡처 검수 정답을 crop manifest로 변환
+  train_verifier.py       9종+상태 멀티태스크 검증기 학습/ONNX export
+
+requirements-training.txt NAS 학습의 ONNX export 및 최신 경량 백본 의존성
 
 docs/
   WORKFLOW.md             (이 문서)
+  CROP_VERIFIER_PLAN.md   객체 crop 검증기 확정 구조·라벨 정책·실행 절차
   WEIGHT_KIOSK_PARAMS.md  무게 로직 + 키오스크 파라미터 체크리스트
   DATA_AUDIT.md           변환 데이터 정합성 점검
 ```

@@ -160,6 +160,9 @@ def save_capture(
             "review": {
                 "is_correct": None,
                 "expected_class": None,
+                "is_dented": None,
+                "has_label": None,
+                "has_foreign_material": None,
                 "notes": None,
             },
         }

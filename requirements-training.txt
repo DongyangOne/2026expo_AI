@@ -1,0 +1,7 @@
+# NAS 학습/ONNX 내보내기용 추가 의존성
+# 기본 ultralytics/ultralytics 이미지에는 torch/torchvision이 포함되어 있다.
+onnx>=1.16.0,<2.0
+timm>=1.0.0,<2.0
+# QNAP Ultralytics 이미지의 spin 패키지와 호환되는 범위로 고정한다.
+huggingface-hub>=0.34.0,<1.0
+click>=8.0,<8.4,!=8.3.0
