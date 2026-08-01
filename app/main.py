@@ -25,6 +25,7 @@ async def lifespan(app: FastAPI):
         app.state.registry = ModelRegistry(
             main_path=settings.MAIN_MODEL_PATH,
             state_path=settings.STATE_MODEL_PATH,
+            verifier_path=settings.VERIFIER_MODEL_PATH,
         )
         logger.info("모델 로드 완료: %s", app.state.registry.status())
     except FileNotFoundError as exc:
@@ -84,5 +85,7 @@ async def health_check(request: Request) -> dict:
     registry = getattr(request.app.state, "registry", None)
     return {
         "status": "ok",
-        "models": registry.status() if registry else {"main": False, "state": False},
+        "models": registry.status() if registry else {
+            "main": False, "state": False, "verifier": False,
+        },
     }

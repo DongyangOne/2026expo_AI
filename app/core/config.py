@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     MAIN_MODEL_PATH: str = "weights/yolo26m_best_ncnn_model"
     # 상태 멀티헤드(dent/label) ONNX 경로. None = 미탑재 → conditions=null (무게만 검사)
     STATE_MODEL_PATH: str | None = "weights/multihead.onnx"
+    # YOLO bbox를 320px crop으로 다시 확인하는 임시 9종+상태 검증기.
+    VERIFIER_MODEL_PATH: str | None = "weights/verifier_qwen35_mnv3_v1.onnx"
+    # 초기에는 응답/콜백을 바꾸지 않고 YOLO와의 비교 결과만 별도 JSONL에 기록한다.
+    VERIFIER_SHADOW_ENABLED: bool = True
+    VERIFIER_SHADOW_LOG_PATH: str = "logs/verifier_shadow.jsonl"
 
     # ── 추론 설정 ────────────────────────────────────────────────────────────────
     # 2단계 임계값:

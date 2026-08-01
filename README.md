@@ -107,6 +107,9 @@ SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results
 # 선택
 MAIN_MODEL_PATH=weights/yolo26m_best_ncnn_model
 STATE_MODEL_PATH=weights/multihead.onnx
+VERIFIER_MODEL_PATH=weights/verifier_qwen35_mnv3_v1.onnx
+VERIFIER_SHADOW_ENABLED=true
+VERIFIER_SHADOW_LOG_PATH=logs/verifier_shadow.jsonl
 DETECT_CONF=0.25
 TRUST_CONF=0.55
 WEIGHT_ANOMALY_ENABLED=true
@@ -159,15 +162,29 @@ JSON에는 요청의 `client_id`와 무게, 예측 클래스·신뢰도·bbox·�
 ```
 
 기본 보존 기간은 90일, 최대 용량은 10GB이며 초과 시 오래된 이미지/JSON 쌍부터 제거한다.
-오인식이 확인되면 검수 필드를 채운 뒤 해당 이미지를 실제 키오스크 환경의 hard sample로
-재학습 데이터에 추가한다.
+운영 캡처는 자동 teacher의 tight/context 합의와 확신도 기준을 통과한 경우에만 hard
+sample로 재학습 데이터에 추가한다. 합의 실패·저신뢰·다중 객체는 `-1`로 마스킹해
+학습에서 제외하며 사람 검토를 전제로 하지 않는다.
 
-crop 검증기 학습에는 `review.is_single_object=true`로 확인된 캡처만 사용한다.
-`has_label`과 `has_foreign_material`은 서로 독립된 정답이며, 네 조합(둘 다 없음/라벨만/
-외부 이물질만/둘 다 있음)을 그대로 기록한다.
+### 임시 crop 검증기 shadow 로그
+
+`VERIFIER_SHADOW_ENABLED=true`이면 기존 YOLO가 만든 bbox를 임시 320px 검증기로
+비동기 재검증하고 `logs/verifier_shadow.jsonl`에 YOLO/검증기 품목 일치 여부와
+압착·라벨·외부 이물질 출력을 기록한다. 이 결과는 초기에는 API 응답, guidance,
+Spring 콜백을 변경하지 않는다. 임시 모델의 운영 분포 정확도를 확인한 뒤에만 판정에
+사용한다.
+
+crop 검증기 학습에는 원본 정답이 단일 객체이고 자동 teacher도 단일 주 객체로
+판정한 이미지만 사용한다. `label`과 `foreign_material`은 서로 독립된 정답이며,
+네 조합(둘 다 없음/라벨만/외부 이물질만/둘 다 있음)을 그대로 기록한다.
 
 객체 bbox를 crop한 뒤 9종 품목과 상태를 다시 확인하는 검증기의 확정 구조, 라벨 정책,
 NAS 실행 명령은 [`docs/CROP_VERIFIER_PLAN.md`](docs/CROP_VERIFIER_PLAN.md)에 정리했다.
+1일차 prototype은 고해상도 원본을 복제하지 않고 경로+bbox만 참조하며, 320px crop 생성 →
+기존 `naco-ollama`의 `qwen3.5:9b-q4_K_M`로 tight/context 자동 합의 상태 pseudo-label을
+만드는 순서로 진행한다. 사람 검토는 두지 않는다. NAS 여유 공간 500GB와
+새 crop 20GB 상한을 통과해야 전체 정제를 계속한다.
+Ollama는 연속 이미지 prompt cache와 16K context를 지원하는 `0.32.0`을 사용한다.
 
 ---
 

@@ -8,17 +8,23 @@ AI Hub 원본의 공식 Training/Validation 분리를 유지하고 직접촬영 
 실행 예시 (NAS Docker):
   python /app/extract_verifier_crops.py \
     --dataset-dir /app/ai_dataset/학습용_데이터 \
-    --output-dir /app/crops_verifier_single_v2 \
+    --output-dir /app/crops_verifier_single_v3 \
     --size 320 --workers 2 --max-per-folder 10000 --val-max-per-folder 2000
+
+고해상도 원본을 복제하지 않고 원본 경로와 bbox만 manifest에 기록한다. 원본
+경로는 깨진 파일명도 왕복할 수 있도록 URL-safe base64로 저장한다.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import json
+import os
 import re
+import shutil
 from collections import Counter
 from multiprocessing import Pool
 from pathlib import Path
@@ -47,6 +53,34 @@ DENT_CLASSES = {0, 1}  # can, pet
 LABEL_CLASSES = {1, 3}  # pet, plastic
 DENT_MAP = {"원형": 0, "찌그러짐": 1, "완전압착": 1}
 LABEL_PROXY_MAP = {"오염없음": 0, "이물질(외부)": 1}
+GIB = 1024 ** 3
+
+
+def encode_source_path(path: str | Path) -> str:
+    """surrogateescape가 포함된 NAS 경로를 UTF-8 CSV에 안전하게 기록한다."""
+    return base64.urlsafe_b64encode(os.fsencode(str(path))).decode("ascii")
+
+
+def decode_source_path(value: str) -> Path:
+    """manifest의 URL-safe base64 경로를 현재 파일시스템 경로로 복원한다."""
+    return Path(os.fsdecode(base64.urlsafe_b64decode(value.encode("ascii"))))
+
+
+def check_storage_limits(
+    free_bytes: int,
+    written_bytes: int,
+    min_free_gb: float,
+    max_output_gb: float,
+) -> None:
+    """NAS 여유 공간 또는 이번 출력 상한을 넘기기 전에 작업을 중단한다."""
+    if min_free_gb > 0 and free_bytes < min_free_gb * GIB:
+        raise RuntimeError(
+            f"NAS free space guard: {free_bytes / GIB:.1f}GB < {min_free_gb:.1f}GB"
+        )
+    if max_output_gb > 0 and written_bytes > max_output_gb * GIB:
+        raise RuntimeError(
+            f"crop output guard: {written_bytes / GIB:.2f}GB > {max_output_gb:.2f}GB"
+        )
 
 
 def make_source_key(split_name: str, label_dir_name: str, filename: str) -> str:
@@ -130,6 +164,27 @@ def _find_image(stem: str, directories: list[Path]) -> Path | None:
     return None
 
 
+def _is_single_object_json(path: Path) -> bool:
+    try:
+        with open(path, encoding="utf-8") as file:
+            annotations = json.load(file).get("ANNOTATION_INFO", [])
+    except Exception:
+        return False
+    return should_use_annotations(annotations, single_object_only=True)
+
+
+def _cap_tasks_per_class(tasks: list[tuple], cap: int) -> list[tuple]:
+    if cap <= 0:
+        return tasks
+    grouped: dict[int, list[tuple]] = {}
+    for task in tasks:
+        grouped.setdefault(task[3], []).append(task)
+    selected = []
+    for material in sorted(grouped):
+        selected.extend(_stride_sample(grouped[material], cap))
+    return selected
+
+
 def collect_tasks(
     dataset_root: Path,
     output_dir: Path,
@@ -138,6 +193,7 @@ def collect_tasks(
     size: int,
     padding: float,
     single_object_only: bool,
+    cap_per_class: int = 0,
 ):
     split_dir = dataset_root / "01-1.정식개방데이터" / split_name
     label_base = split_dir / "02.라벨링데이터"
@@ -158,7 +214,11 @@ def collect_tasks(
             print(f"[WARN] 원천 폴더 없음: {source_prefix}", flush=True)
             continue
 
-        json_files = _stride_sample(sorted(label_dir.rglob("*.json")), cap_per_folder)
+        json_files = sorted(label_dir.rglob("*.json"))
+        if single_object_only:
+            # 폴더 cap을 먼저 적용하면 다중 객체가 cap을 차지해 실제 단일 객체를 놓친다.
+            json_files = [path for path in json_files if _is_single_object_json(path)]
+        json_files = _stride_sample(json_files, cap_per_folder)
         paired = 0
         for json_path in json_files:
             image_path = _find_image(json_path.stem, source_dirs)
@@ -173,6 +233,14 @@ def collect_tasks(
             )
             paired += 1
         print(f"  {split_name} {label_dir.name}: {paired:,}쌍", flush=True)
+    tasks = _cap_tasks_per_class(tasks, cap_per_class)
+    if cap_per_class > 0:
+        counts = Counter(task[3] for task in tasks)
+        for material, count in sorted(counts.items()):
+            print(
+                f"  {split_name} class-cap {CLASS_NAMES[material]}: {count:,}/{cap_per_class:,}",
+                flush=True,
+            )
     return tasks
 
 
@@ -181,20 +249,24 @@ def worker(task):
         image_path, json_path, split, folder_class, source_key, output_dir, size,
         padding, single_object_only,
     ) = task
-    image = _imread_unicode(image_path)
-    if image is None:
-        return []
     try:
         with open(json_path, encoding="utf-8") as file:
             annotations = json.load(file).get("ANNOTATION_INFO", [])
     except Exception:
-        return []
+        return [], 0
     if not should_use_annotations(annotations, single_object_only):
-        return []
+        return [], 0
+
+    # 큰 원본 이미지는 단일 객체 조건을 통과한 뒤에만 읽는다.
+    image = _imread_unicode(image_path)
+    if image is None:
+        return [], 0
 
     height, width = image.shape[:2]
     source_object_count = len(annotations)
+    source_path_b64 = encode_source_path(image_path)
     rows = []
+    written_bytes = 0
     for ann_index, annotation in enumerate(annotations):
         bbox = points_to_bbox(annotation.get("POINTS", []))
         if bbox is None:
@@ -219,6 +291,8 @@ def worker(task):
         if not ok:
             continue
         encoded.tofile(absolute_path)
+        crop_bytes = int(encoded.nbytes)
+        written_bytes += crop_bytes
 
         dent = DENT_MAP.get(annotation.get("DAMAGE", ""), -1) if material in DENT_CLASSES else -1
         dirtiness = annotation.get("DIRTINESS", "")
@@ -227,9 +301,11 @@ def worker(task):
             (
                 relative_path.as_posix(), split, source_key, material, class_name,
                 dent, -1, -1, label_proxy, dirtiness, source_object_count,
+                source_path_b64, x, y, box_w, box_h, x1, y1, x2, y2,
+                width, height, crop_bytes,
             )
         )
-    return rows
+    return rows, written_bytes
 
 
 def main():
@@ -241,6 +317,22 @@ def main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--max-per-folder", type=int, default=10000)
     parser.add_argument("--val-max-per-folder", type=int, default=2000)
+    parser.add_argument(
+        "--max-per-class", type=int, default=0,
+        help="training 품목별 최종 상한. 0이면 폴더 상한만 적용합니다.",
+    )
+    parser.add_argument(
+        "--val-max-per-class", type=int, default=0,
+        help="validation 품목별 최종 상한. 0이면 폴더 상한만 적용합니다.",
+    )
+    parser.add_argument(
+        "--min-free-gb", type=float, default=500,
+        help="출력 볼륨의 여유 공간이 이 값 미만이면 중단합니다. 0이면 해제.",
+    )
+    parser.add_argument(
+        "--max-output-gb", type=float, default=20,
+        help="이번 crop 출력의 누적 상한입니다. 0이면 해제.",
+    )
     parser.add_argument(
         "--allow-multiple-objects", action="store_true",
         help="기본값은 객체가 정확히 1개인 이미지만 사용합니다.",
@@ -257,18 +349,21 @@ def main():
     for split in ("training", "validation"):
         for class_name in CLASS_NAMES:
             (output_dir / split / class_name).mkdir(parents=True, exist_ok=True)
+    check_storage_limits(
+        shutil.disk_usage(output_dir).free, 0, args.min_free_gb, args.max_output_gb
+    )
 
     tasks = []
     tasks.extend(
         collect_tasks(
             dataset_root, output_dir, "Training", args.max_per_folder,
-            args.size, args.padding, single_object_only,
+            args.size, args.padding, single_object_only, args.max_per_class,
         )
     )
     tasks.extend(
         collect_tasks(
             dataset_root, output_dir, "Validation", args.val_max_per_folder,
-            args.size, args.padding, single_object_only,
+            args.size, args.padding, single_object_only, args.val_max_per_class,
         )
     )
     if not tasks:
@@ -276,13 +371,28 @@ def main():
 
     rows = []
     stats = Counter()
+    total_written_bytes = 0
+    last_free_bytes = shutil.disk_usage(output_dir).free
     with Pool(args.workers, initializer=_init_worker) as pool:
-        for index, result_rows in enumerate(pool.imap_unordered(worker, tasks, chunksize=32), 1):
+        for index, (result_rows, written_bytes) in enumerate(
+            pool.imap_unordered(worker, tasks, chunksize=32), 1
+        ):
             rows.extend(result_rows)
+            total_written_bytes += written_bytes
             for row in result_rows:
                 stats[(row[1], row[4])] += 1
             if index % 5000 == 0:
-                print(f"  진행 {index:,}/{len(tasks):,} JSON", flush=True)
+                last_free_bytes = shutil.disk_usage(output_dir).free
+            check_storage_limits(
+                last_free_bytes, total_written_bytes, args.min_free_gb, args.max_output_gb
+            )
+            if index % 5000 == 0:
+                print(
+                    f"  진행 {index:,}/{len(tasks):,} JSON, "
+                    f"crop={total_written_bytes / GIB:.2f}GB, "
+                    f"free={last_free_bytes / GIB:.1f}GB",
+                    flush=True,
+                )
 
     with open(manifest_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
@@ -290,7 +400,10 @@ def main():
             [
                 "filepath", "split", "source_id", "material", "category",
                 "dent", "label", "foreign_material", "label_proxy", "raw_dirtiness",
-                "source_object_count",
+                "source_object_count", "source_path_b64",
+                "source_bbox_x", "source_bbox_y", "source_bbox_w", "source_bbox_h",
+                "crop_x1", "crop_y1", "crop_x2", "crop_y2",
+                "source_width", "source_height", "crop_bytes",
             ]
         )
         writer.writerows(rows)
@@ -302,14 +415,30 @@ def main():
                 "input_size": args.size,
                 "padding": args.padding,
                 "single_object_only": single_object_only,
-                "label_policy": "label and foreign_material are masked until human review",
+                "source_reference": "source_path_b64 + original bbox; no high-resolution copy",
+                "crop_output_bytes": total_written_bytes,
+                "storage_guards": {
+                    "min_free_gb": args.min_free_gb,
+                    "max_output_gb": args.max_output_gb,
+                },
+                "class_caps": {
+                    "training": args.max_per_class,
+                    "validation": args.val_max_per_class,
+                },
+                "label_policy": (
+                    "label and foreign_material remain masked until high-confidence "
+                    "two-view automatic VLM consensus"
+                ),
             },
             file,
             ensure_ascii=False,
             indent=2,
         )
 
-    print(f"\n완료: {len(rows):,} crops → {manifest_path}", flush=True)
+    print(
+        f"\n완료: {len(rows):,} crops ({total_written_bytes / GIB:.2f}GB) → {manifest_path}",
+        flush=True,
+    )
     for (split, class_name), count in sorted(stats.items()):
         print(f"  {split:10s} {class_name:12s}: {count:,}", flush=True)
 

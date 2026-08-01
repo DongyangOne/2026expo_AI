@@ -32,7 +32,7 @@ from app.core.config import settings
 from app.models.registry import ModelRegistry
 from app.schemas.enums import DetectionStatus, GeneralWasteCode, WasteClass
 from app.schemas.response import Classification, DetectResponse, WeightInfo
-from app.services import guidance, inference
+from app.services import guidance, inference, verifier_shadow
 from app.services.weight_check import is_anomaly
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ _CLASS_BY_ID: dict[int, WasteClass] = {
 
 def shutdown() -> None:
     _executor.shutdown(wait=True)
+    verifier_shadow.shutdown()
 
 
 async def _read_image(upload: UploadFile) -> np.ndarray:
@@ -82,6 +83,12 @@ async def run(
         )
 
     class_id, confidence, bbox = detection
+    verifier_session = (
+        registry.verifier() if hasattr(registry, "verifier") else None
+    )
+    verifier_shadow.submit(
+        verifier_session, img, bbox, class_id, confidence, client_id
+    )
     cls = _CLASS_BY_ID.get(class_id)
     bbox_rounded = [round(v, 1) for v in bbox]
     weight_info = WeightInfo(value_g=weight_g)

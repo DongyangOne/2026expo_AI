@@ -10,6 +10,7 @@ os.environ.setdefault("API_KEY", "test-key")
 
 from app.schemas.enums import DetectionStatus, GeneralWasteCode, GuidanceCode
 from app.services import inference, pipeline
+from app.services import verifier_shadow
 
 
 class _Registry:
@@ -54,3 +55,40 @@ def test_vinyl_무게정상은_기존_general_waste(monkeypatch):
     assert result.guidance == []
     assert result.general is not None
     assert result.general.code is GeneralWasteCode.VINYL
+
+
+def test_shadow_verifier_receives_yolo_result_without_changing_response(monkeypatch):
+    captured = {}
+
+    class _ShadowRegistry(_Registry):
+        def verifier(self):
+            return "temporary-verifier-session"
+
+    def fake_submit(session, img, bbox, class_id, confidence, client_id):
+        captured.update({
+            "session": session,
+            "bbox": bbox,
+            "class_id": class_id,
+            "confidence": confidence,
+            "client_id": client_id,
+        })
+
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit", fake_submit)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "hardware-shadow-001", _ShadowRegistry())
+        )
+
+    assert result.status is DetectionStatus.GENERAL_WASTE
+    assert captured == {
+        "session": "temporary-verifier-session",
+        "bbox": [10.0, 10.0, 90.0, 90.0],
+        "class_id": 5,
+        "confidence": 0.90,
+        "client_id": "hardware-shadow-001",
+    }

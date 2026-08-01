@@ -22,6 +22,10 @@ _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 # 멀티헤드 헤드 대상 품목 (모델 구조 지식)
 _DENT_CLASSES = (WasteClass.PET, WasteClass.CAN)        # 압착 검사
 _LABEL_CLASSES = (WasteClass.PET, WasteClass.PLASTIC)   # 라벨 검사
+VERIFIER_CLASS_NAMES = (
+    "can", "pet", "paper", "plastic", "styrofoam",
+    "vinyl", "glass", "battery", "fluorescent",
+)
 
 
 def run_main(registry: ModelRegistry, img: np.ndarray):
@@ -93,3 +97,60 @@ def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> C
         has_label=has_label,
         has_foreign_material=has_foreign_material,
     )
+
+
+def _confidence(logits: np.ndarray) -> tuple[int, float]:
+    values = np.asarray(logits[0], dtype=np.float64)
+    shifted = values - values.max()
+    probabilities = np.exp(shifted) / np.exp(shifted).sum()
+    class_id = int(probabilities.argmax())
+    return class_id, float(probabilities[class_id])
+
+
+def run_verifier(session, img: np.ndarray, bbox: list[float]) -> dict | None:
+    """YOLO bbox를 임시 320px 검증기로 재판정한다. 운영 응답에는 직접 사용하지 않는다."""
+    if session is None:
+        return None
+
+    height, width = img.shape[:2]
+    x1, y1, x2, y2 = bbox
+    box_w, box_h = x2 - x1, y2 - y1
+    padding = 0.08
+    x1 = max(0, int(x1 - box_w * padding))
+    y1 = max(0, int(y1 - box_h * padding))
+    x2 = min(width, int(x2 + box_w * padding))
+    y2 = min(height, int(y2 + box_h * padding))
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    model_input = session.get_inputs()[0]
+    input_size = model_input.shape[-1]
+    if not isinstance(input_size, int):
+        input_size = 320
+    crop = _letterbox(img[y1:y2, x1:x2], size=input_size)
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    array = ((rgb - _MEAN) / _STD).transpose(2, 0, 1)[None]
+
+    output_names = ("material", "dent", "label", "foreign_material")
+    available = {output.name for output in session.get_outputs()}
+    missing = set(output_names) - available
+    if missing:
+        raise RuntimeError(f"crop verifier outputs missing: {sorted(missing)}")
+    values = session.run(list(output_names), {model_input.name: array})
+    predictions = {
+        name: _confidence(value) for name, value in zip(output_names, values)
+    }
+    material_id, material_confidence = predictions["material"]
+    return {
+        "material": {
+            "class_id": material_id,
+            "class_name": VERIFIER_CLASS_NAMES[material_id],
+            "confidence": round(material_confidence, 6),
+        },
+        "heads": {
+            name: {"value": bool(class_id), "confidence": round(confidence, 6)}
+            for name, (class_id, confidence) in predictions.items()
+            if name != "material"
+        },
+        "input_size": input_size,
+    }

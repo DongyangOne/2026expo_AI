@@ -102,7 +102,7 @@
 | # | 모델 | 입력 | 출력 | 백본 | 포맷 | 상태 |
 |---|------|------|------|------|------|------|
 | 1 | 메인 감지 | 640px | 9클래스 bbox + 1차 품목 | YOLO26m epoch 40 | NCNN | 체크포인트 고정, Pi5 배포 기준선 |
-| 2 | crop 검증기 | 320px crop | material(9) + dent(2) + label(2) + foreign_material(2) | MobileNetV3-Small 기준선 | ONNX | material/dent부터 학습, shadow 적용 예정 |
+| 2 | crop 검증기 | 320px crop | material(9) + dent(2) + label(2) + foreign_material(2) | MobileNetV3-Small 기준선 | ONNX | 2천 teacher 임시 모델 학습 완료, shadow 적용 |
 
 > 최신 경량 후보 MobileNetV4 Conv Small과 RepViT는 동일 데이터로 학습한 뒤 Pi5의
 > 실제 ONNX 정확도·p50/p95 지연시간을 비교해 기준선보다 좋을 때만 교체한다.
@@ -111,7 +111,7 @@
 - **공유 백본 1개** + material/dent/label/foreign_material 헤드. 추론 1회로 품목과 상태를 재검증한다.
 - 학습 원본은 라벨링된 쓰레기 객체가 정확히 하나인 이미지만 허용한다.
 - dent는 캔+페트에 사용하고 비대상 클래스는 loss에서 마스킹한다.
-- 공식 데이터의 `DIRTINESS=이물질(외부)`는 외부 오염과 라벨 부착을 하나로 합친 값이므로 두 헤드는 독립된 사람 검수 정답이 train/validation에 모두 모일 때까지 마스킹한다.
+- 공식 데이터의 `DIRTINESS=이물질(외부)`는 외부 오염과 라벨 부착을 하나로 합친 값이므로 두 헤드는 Qwen3-VL 두 시야 자동 합의 정답이 train/validation에 모두 모일 때까지 마스킹한다.
 - 초기에는 검증 결과를 로그에만 남기는 shadow mode로 적용해 기존 응답과 Spring 콜백 계약에 영향을 주지 않는다.
 - 상세 확정안: [`CROP_VERIFIER_PLAN.md`](CROP_VERIFIER_PLAN.md)
 
@@ -140,10 +140,15 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
        · 9종 material 정답
        · DAMAGE → dent (원형0 / 찌그러짐·완전압착1)
        · label/foreign_material → -1 마스킹
-       · DIRTINESS 변환값은 검수용 label_proxy에만 저장
+       · DIRTINESS 변환값은 teacher 힌트용 label_proxy에만 저장
+       · 고해상도 원본 복제 없이 source_path_b64+bbox로 참조
        · ※ 원본 사용 필수 (640변환본은 파일명 리네임돼 JSON 매칭 불가)
-  └→ /share/Container/crops_verifier_single_v2/ (train/ + val/ + manifest.csv)
-  └→ scripts/import_reviewed_captures.py (운영 검수 정답 추가)
+  └→ /share/Container/crops_verifier_single_v3/ (training/ + validation/ + manifest.csv)
+  └→ scripts/pseudo_label_status_qwen.py
+       · 기존 naco-ollama의 qwen3.5:9b-q4_K_M 멀티모달 teacher
+       · tight/context 두 시야가 일치하고 확신도 0.90 이상일 때만 자동 수용
+       · 라벨/진짜 이물질/같은 재질 부속품 허용 규칙을 독립 판정
+  └→ scripts/audit_pseudo_status.py (처리 완료·일관성·헤드 분포 자동 검사)
   └→ scripts/train_verifier.py
        · MobileNetV3-Small + material/dent/label/foreign_material 헤드
        · 미라벨 상태는 masked loss
@@ -176,6 +181,8 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 
 - 메인 모델: `MAIN_MODEL_PATH=weights/yolo26m_best_ncnn_model` (NCNN, ARM CPU 추론)
 - 상태 모델: `STATE_MODEL_PATH=weights/multihead.onnx` (ONNX Runtime)
+- 임시 검증기: `VERIFIER_MODEL_PATH=weights/verifier_qwen35_mnv3_v1.onnx`
+- shadow 로그: `VERIFIER_SHADOW_ENABLED=true`, `logs/verifier_shadow.jsonl`
 - 실제 환경 파일: `/home/one/2026expo_AI/.env`
 - Spring 콜백: `SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
 - 결과 로그: `LOG_RESULTS=true`이면 `logs/results.jsonl`에 항상 기록
@@ -186,10 +193,10 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 ### 오인식 개선 루프
 
 1. 실제 키오스크 요청의 원본 이미지와 판정 결과를 같은 `capture_id`로 수집한다.
-2. JSON의 `review.is_correct`, `review.expected_class`, `review.is_single_object`, `review.is_dented`, `review.has_label`, `review.has_foreign_material`, `review.notes`를 검수자가 기록한다.
-3. 콜라 캔→스티로폼/종이처럼 틀린 표본과 유사 정상 표본을 함께 hard sample로 구성한다.
-4. 실제 키오스크 배경·조명·거리 분포를 유지해 메인 YOLO를 파인튜닝한다.
-5. 기존 검증셋과 별도의 키오스크 hard-case 검증셋에서 클래스별 혼동행렬을 비교한다.
+2. YOLO가 선택한 bbox를 crop하고 Qwen3-VL teacher의 tight/context 두 판정을 수행한다.
+3. 두 판정이 일치하고 확신도 0.90 이상인 단일 객체만 hard sample로 자동 수용한다. 나머지는 `-1`로 마스킹해 학습에서 제외한다.
+4. 수용된 상태 표본과 유사 정상 표본을 함께 검증기 hard sample로 구성한다.
+5. 실제 키오스크 배경·조명·거리 분포를 유지하고, 기존 검증셋과 별도의 키오스크 hard-case 검증셋에서 혼동행렬을 비교한다.
 
 > 현재 모델은 재활용 데이터셋의 촬영 분포를 학습했기 때문에 흰 배경 상품 이미지,
 > 렌더링 이미지, 인쇄 무늬처럼 운영 카메라와 다른 입력에서 재질 대신 배경·윤곽·색상에
@@ -212,10 +219,10 @@ docker ps --filter name=ai-server
 curl http://127.0.0.1:8000/health
 ```
 
-정상 헬스 응답:
+임시 검증기까지 로드된 정상 헬스 응답:
 
 ```json
-{"status":"ok","models":{"main":true,"state":true}}
+{"status":"ok","models":{"main":true,"state":true,"verifier":true}}
 ```
 
 ---
@@ -236,7 +243,7 @@ curl http://127.0.0.1:8000/health
 
 ---
 
-## 10. 현재 운영 상태 (2026-07-31)
+## 10. 현재 운영 상태 (2026-08-01)
 
 | 단계 | 상태 |
 |------|------|
@@ -244,7 +251,9 @@ curl http://127.0.0.1:8000/health
 | 메인 YOLO26m NCNN | ✅ Pi5 배포 및 로드 정상 |
 | NAS 메인 학습 | ✅ epoch 40 체크포인트 보존 후 중지 (학습 프로세스 0) |
 | 상태 멀티헤드 ONNX | ✅ Pi5 배포 및 로드 정상 |
-| 9종 crop 검증기 | 🚧 추출·학습 파이프라인 구현, NAS 데이터 생성 진행 |
+| 9종 crop 검증기 | ✅ 임시 MobileNetV3 50 epoch/ONNX 완료, shadow 통합 |
+| 최대 데이터 v4 추출 | 🚧 단일 객체·품목당 최대 5만장, validation 최대 1만장 추출 중 |
+| Qwen 상태 teacher 확장 | 🚧 2천건에서 총 5만건 목표로 자동 판정 중 |
 | `/api/v1/detect` + `client_id` 계약 | ✅ 구현·테스트·배포 완료 |
 | Spring 콜백 URL | ✅ AI 서버 환경 및 컨테이너 반영 완료 |
 | Spring 콜백 수신 테스트 | ⏳ Spring 측 엔드포인트 배포 후 확인 |
@@ -259,6 +268,7 @@ curl http://127.0.0.1:8000/health
 app/
   core/config.py          설정 (임계값, 모델경로, Spring URL)
   models/registry.py      모델 보관소 (graceful degradation)
+  services/verifier_shadow.py  YOLO/crop 검증기 비교 비동기 JSONL 로그
   services/request_capture.py  재학습용 원본 이미지/판정 JSON 쌍 저장
   schemas/
     enums.py              WasteClass, DetectionStatus, GuidanceCode, RejectionCode, GeneralWasteCode
@@ -285,7 +295,8 @@ scripts/
   train_classifier.py     멀티헤드 학습 (MobileNetV3 + dent/label)
   extract_verifier_crops.py  9종 crop + 안전한 상태 manifest 생성
   audit_verifier_dataset.py  학습 전 9종·분할·파일·마스킹 무결성 검사
-  import_reviewed_captures.py 운영 캡처 검수 정답을 crop manifest로 변환
+  audit_pseudo_status.py     자동 상태 라벨의 처리 완료·일관성·헤드 분포 검사
+  import_reviewed_captures.py 운영 캡처의 선택 정답을 crop manifest로 변환(자동 학습 기본 경로에서는 미사용)
   train_verifier.py       9종+상태 멀티태스크 검증기 학습/ONNX export
 
 requirements-training.txt NAS 학습의 ONNX export 및 최신 경량 백본 의존성
