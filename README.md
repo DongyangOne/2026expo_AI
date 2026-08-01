@@ -181,10 +181,25 @@ crop 검증기 학습에는 원본 정답이 단일 객체이고 자동 teacher�
 객체 bbox를 crop한 뒤 9종 품목과 상태를 다시 확인하는 검증기의 확정 구조, 라벨 정책,
 NAS 실행 명령은 [`docs/CROP_VERIFIER_PLAN.md`](docs/CROP_VERIFIER_PLAN.md)에 정리했다.
 1일차 prototype은 고해상도 원본을 복제하지 않고 경로+bbox만 참조하며, 320px crop 생성 →
-기존 `naco-ollama`의 `qwen3.5:9b-q4_K_M`로 tight/context 자동 합의 상태 pseudo-label을
-만드는 순서로 진행한다. 사람 검토는 두지 않는다. NAS 여유 공간 500GB와
+기존 `naco-ollama`와 동일 모델 볼륨을 공유하는 두 개의 `qwen3.5:9b-q4_K_M`
+인스턴스로 적응형 tight/context 상태 pseudo-label을 만드는 순서로 진행한다. 384px
+tight 한 장의 1차 판정이 확실한 정상 샘플이면 종료하고, 양성·불확실 샘플과 10%
+정상 감사 샘플만 640px wider-context 한 장으로 2차 합의를 수행한다. 서로 다른 두
+시야의 판정을 비교하되 같은 tight 이미지를 재전송하지 않는다. 사람 검토는 두지 않는다.
+NAS 여유 공간 500GB와
 새 crop 20GB 상한을 통과해야 전체 정제를 계속한다.
-Ollama는 연속 이미지 prompt cache와 16K context를 지원하는 `0.32.0`을 사용한다.
+`label` head를 사용하지 않는 can/paper/vinyl의 `label_only`는 2차 강제 대상에서
+제외하고 정상 감사 표본에만 포함한다. 외부 이물질과 PET/plastic 라벨은 항상 2차로
+확인한다.
+teacher 응답은 생성 시간을 줄이기 위해 `decision`으로부터 계산 가능한 label/foreign
+boolean을 보내지 않고 짧은 wire key와 근거 enum만 사용하지만,
+JSONL에는 기존 `decision`/`has_removable_label`/`has_true_foreign_material` 계약으로
+복원해 저장한다.
+Ollama는 연속 이미지 prompt cache를 지원하는 `0.32.0`과 인스턴스당 8K context를
+사용한다. Qwen3.5는 한 Ollama 서버의 parallel slot을 지원하지 않아 두 독립 서버에
+worker를 하나씩 고정하며, 모델 파일은 중복 저장하지 않는다.
+최종 v7의 5.35분 warm 실측은 20.55건/분으로 기존 순차 실행 대비 3.16배였으며,
+장기 작업은 `pseudo_teacher_qwen35_50k_adaptive_dual_v7_20260801`에서 계속된다.
 
 ---
 

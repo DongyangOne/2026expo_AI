@@ -44,8 +44,71 @@ from scripts.pseudo_label_status_qwen import (
     _select_candidates,
     accepted_status,
     consensus_teacher,
+    needs_adaptive_second_pass,
+    ollama_url_for_row,
     parse_teacher_output,
 )
+
+
+def test_adaptive_consensus_only_rechecks_risky_or_audited_samples():
+    row = {
+        "source_id": "clean", "filepath": "clean.jpg", "raw_dirtiness": "오염없음"
+    }
+    clean = {
+        "decision": "neither", "is_single_primary_item": True, "confidence": 0.99,
+    }
+    assert needs_adaptive_second_pass(clean, row, 0.97, 0.0) is False
+
+    dirty = dict(row, raw_dirtiness="이물질(외부)")
+    assert needs_adaptive_second_pass(clean, dirty, 0.97, 0.0) is False
+
+    low_confidence = dict(clean, confidence=0.95)
+    assert needs_adaptive_second_pass(low_confidence, row, 0.97, 0.0) is True
+
+    positive = dict(clean, decision="foreign_only")
+    assert needs_adaptive_second_pass(positive, row, 0.97, 0.0) is True
+    label = dict(clean, decision="label_only")
+    assert needs_adaptive_second_pass(label, dict(row, category="can"), 0.97, 0.0) is False
+    assert needs_adaptive_second_pass(label, dict(row, category="pet"), 0.97, 0.0) is True
+    assert needs_adaptive_second_pass(clean, row, 0.97, 1.0) is True
+
+
+def test_compact_teacher_wire_format_expands_to_stable_record_contract():
+    parsed = parse_teacher_output(
+        '{"d":"label_only","s":true,"c":0.96,"e":"label"}'
+    )
+    assert parsed == {
+        "decision": "label_only",
+        "has_removable_label": True,
+        "has_true_foreign_material": False,
+        "same_material_accessory_only": False,
+        "is_single_primary_item": True,
+        "confidence": 0.96,
+        "reason": "label",
+    }
+
+    repaired = parse_teacher_output(
+        '{"d":"neither","l":false,"f":true,"a":false,'
+        '"s":true,"c":0.85,"e":"contamination"}'
+    )
+    assert repaired["decision"] == "foreign_only"
+    assert repaired["has_true_foreign_material"] is True
+
+    accessory = parse_teacher_output(
+        '{"d":"neither","s":true,"c":0.99,"e":"same_material_accessory"}'
+    )
+    assert accessory["same_material_accessory_only"] is True
+
+
+def test_ollama_multi_instance_routing_is_stable_per_sample():
+    urls = "http://ollama-a:11434,http://ollama-b:11434"
+    rows = [
+        {"source_id": f"item-{index}", "filepath": f"{index}.jpg"}
+        for index in range(20)
+    ]
+    routed = [ollama_url_for_row(urls, row) for row in rows]
+    assert set(routed) == {"http://ollama-a:11434", "http://ollama-b:11434"}
+    assert routed == [ollama_url_for_row(urls, row) for row in rows]
 
 
 def test_teacher_retry_selects_only_previous_errors():

@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import json
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict, deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import cv2
@@ -33,27 +35,25 @@ OLLAMA_IMAGE_MAX_SIDE_DEFAULT = 640
 STATUS_CATEGORIES = {"can", "pet", "paper", "plastic", "vinyl"}
 LABEL_CATEGORIES = {"pet", "plastic"}
 DECISIONS = {"neither", "label_only", "foreign_only", "both", "exclude", "ambiguous"}
+EVIDENCE_CODES = {
+    "none", "label", "different_material", "contamination",
+    "same_material_accessory", "multiple_items", "unclear",
+}
 
 OLLAMA_FORMAT = {
     "type": "object",
     "properties": {
-        "decision": {"type": "string", "enum": sorted(DECISIONS)},
-        "has_removable_label": {"type": ["boolean", "null"]},
-        "has_true_foreign_material": {"type": ["boolean", "null"]},
-        "same_material_accessory_only": {"type": "boolean"},
-        "is_single_primary_item": {"type": "boolean"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "reason": {"type": "string"},
+        "d": {"type": "string", "enum": sorted(DECISIONS)},
+        "s": {"type": "boolean"},
+        "c": {"type": "number", "minimum": 0, "maximum": 1},
+        "e": {"type": "string", "enum": sorted(EVIDENCE_CODES)},
     },
-    "required": [
-        "decision", "has_removable_label", "has_true_foreign_material",
-        "same_material_accessory_only", "is_single_primary_item", "confidence", "reason",
-    ],
+    "required": ["d", "s", "c", "e"],
     "additionalProperties": False,
 }
 
 PROMPT = """You are cleaning a recycling-kiosk image dataset.
-The two images show the SAME annotated object. View order: {view_order}.
+The supplied image(s) show the SAME annotated object. View(s): {view_order}.
 Known material category: {category}
 Legacy DIRTINESS value (candidate hint only, NEVER ground truth): {raw_dirtiness}
 
@@ -64,10 +64,12 @@ Decide only from visible evidence using these exact rules:
 4. Material must be compared with the main item. For example, a paper sleeve/band on a plastic or PET takeaway cup is true foreign material and must be foreign_only or both. A primary recyclable item with a visibly attached different material can still be a single primary item.
 5. A removable product sleeve or sticker is always handled by has_removable_label, even when its material is similar to the main item.
 6. If multiple separate waste objects are present, the crop is unclear, or evidence is insufficient, use ambiguous or exclude. Never guess.
-7. For decision=exclude or ambiguous, both has_removable_label and has_true_foreign_material MUST be null. For the other four decisions, use booleans matching the decision.
+7. decision fully determines the label/foreign flags; do not add redundant fields.
 
-Return ONLY one JSON object with exactly these fields:
-{{"decision":"neither|label_only|foreign_only|both|exclude|ambiguous","has_removable_label":true|false|null,"has_true_foreign_material":true|false|null,"same_material_accessory_only":true|false,"is_single_primary_item":true|false,"confidence":0.0,"reason":"short visible evidence"}}
+Return ONLY one compact JSON object. Keys: d=decision, s=single primary item,
+c=confidence, e=visible evidence code. e must be one of none, label,
+different_material, contamination, same_material_accessory, multiple_items, unclear.
+{{"d":"neither|label_only|foreign_only|both|exclude|ambiguous","s":true,"c":0.99,"e":"none"}}
 """
 
 
@@ -100,6 +102,57 @@ def parse_teacher_output(text: str) -> dict:
         lines = value.splitlines()
         value = "\n".join(lines[1:-1]).strip()
     result = json.loads(value)
+    if set(result) == {"d", "s", "c", "e"}:
+        if result["e"] not in EVIDENCE_CODES:
+            raise ValueError(f'invalid evidence code: {result["e"]}')
+        label_flag, foreign_flag = {
+            "neither": (False, False),
+            "label_only": (True, False),
+            "foreign_only": (False, True),
+            "both": (True, True),
+            "exclude": (None, None),
+            "ambiguous": (None, None),
+        }[result["d"]]
+        result = {
+            "decision": result["d"],
+            "has_removable_label": label_flag,
+            "has_true_foreign_material": foreign_flag,
+            "same_material_accessory_only": result["e"] == "same_material_accessory",
+            "is_single_primary_item": result["s"],
+            "confidence": result["c"],
+            "reason": result["e"],
+        }
+    if set(result) == {"d", "l", "f", "a", "s", "c", "e"}:
+        if result["e"] not in EVIDENCE_CODES:
+            raise ValueError(f'invalid evidence code: {result["e"]}')
+        label_flag = result["l"]
+        foreign_flag = result["f"]
+        if label_flag is None or foreign_flag is None:
+            if not (
+                label_flag is None
+                and foreign_flag is None
+                and result["d"] in {"exclude", "ambiguous"}
+            ):
+                raise ValueError("compact null flags require exclude or ambiguous")
+            decision = result["d"]
+        else:
+            if not isinstance(label_flag, bool) or not isinstance(foreign_flag, bool):
+                raise ValueError("compact label/foreign flags must be bool or null")
+            decision = {
+                (False, False): "neither",
+                (True, False): "label_only",
+                (False, True): "foreign_only",
+                (True, True): "both",
+            }[(label_flag, foreign_flag)]
+        result = {
+            "decision": decision,
+            "has_removable_label": label_flag,
+            "has_true_foreign_material": foreign_flag,
+            "same_material_accessory_only": result["a"],
+            "is_single_primary_item": result["s"],
+            "confidence": result["c"],
+            "reason": result["e"],
+        }
     required = {
         "decision", "has_removable_label", "has_true_foreign_material",
         "same_material_accessory_only", "is_single_primary_item", "confidence", "reason",
@@ -352,7 +405,7 @@ def _infer_ollama(
     base_url: str,
     model_name: str,
     first: np.ndarray,
-    second: np.ndarray,
+    second: np.ndarray | None,
     prompt: str,
     timeout: int,
     num_ctx: int,
@@ -360,7 +413,10 @@ def _infer_ollama(
     request_retries: int,
 ) -> str:
     first = _resize_max_side(first, image_max_side)
-    second = _resize_max_side(second, image_max_side)
+    images = [_jpeg_b64(first)]
+    if second is not None:
+        second = _resize_max_side(second, image_max_side)
+        images.append(_jpeg_b64(second))
     payload = {
         "model": model_name,
         "stream": False,
@@ -371,7 +427,7 @@ def _infer_ollama(
             {
                 "role": "user",
                 "content": prompt,
-                "images": [_jpeg_b64(first), _jpeg_b64(second)],
+                "images": images,
             }
         ],
         "options": {
@@ -415,12 +471,188 @@ def _infer_ollama(
     return content
 
 
+def needs_adaptive_second_pass(
+    teacher: dict,
+    row: dict,
+    confidence_threshold: float,
+    negative_audit_rate: float,
+) -> bool:
+    """양성·불확실 샘플은 재검증하고, 확실한 정상은 감사분만 재검증한다."""
+    decision = teacher["decision"]
+    label_irrelevant = (
+        decision == "label_only" and row.get("category") not in LABEL_CATEGORIES
+    )
+    if decision != "neither" and not label_irrelevant:
+        return True
+    if not teacher["is_single_primary_item"]:
+        return True
+    if float(teacher["confidence"]) < confidence_threshold:
+        return True
+    if negative_audit_rate <= 0:
+        return False
+    key = f'{row["source_id"]}|{row["filepath"]}'.encode("utf-8")
+    bucket = int.from_bytes(hashlib.sha256(key).digest()[:8], "big") / 2**64
+    return bucket < negative_audit_rate
+
+
+def ollama_url_for_row(ollama_urls: str, row: dict) -> str:
+    """같은 샘플의 모든 pass를 한 Ollama 인스턴스에 고정해 분산한다."""
+    urls = [url.strip().rstrip("/") for url in ollama_urls.split(",") if url.strip()]
+    if not urls:
+        raise ValueError("at least one Ollama URL is required")
+    key = f'{row["source_id"]}|{row["filepath"]}'.encode("utf-8")
+    index = int.from_bytes(hashlib.sha256(key).digest()[:8], "big") % len(urls)
+    return urls[index]
+
+
+def _process_candidate(
+    row: dict,
+    args,
+    model=None,
+    processor=None,
+    torch=None,
+    ollama_url_override: str | None = None,
+) -> dict:
+    record = {
+        "source_id": row["source_id"],
+        "filepath": row["filepath"],
+        "split": row["split"],
+        "category": row["category"],
+        "model": args.model,
+    }
+    raw_outputs = []
+    try:
+        image_path = decode_source_path(row["source_path_b64"])
+        image = _imread_unicode(image_path)
+        if image is None:
+            raise ValueError("source image unreadable")
+        tight = _crop(image, row, padding=0.08)
+        context = _crop(image, row, padding=0.30)
+        if tight is None or context is None:
+            raise ValueError("invalid source bbox")
+        if args.adaptive_consensus:
+            view_orders = [
+                (tight, None, "one tight crop for the fast first pass"),
+                (context, None, "one wider context crop for the verification pass"),
+            ]
+        else:
+            view_orders = [
+                (tight, context, "tight crop first, wider context crop second"),
+                (context, tight, "wider context crop first, tight crop second"),
+            ]
+        teacher_passes = []
+        second_pass = args.consensus_passes == 2 and not args.adaptive_consensus
+        ollama_url = (
+            ollama_url_override or ollama_url_for_row(args.ollama_url, row)
+            if args.backend == "ollama" else None
+        )
+        for pass_index, (first, second, view_order) in enumerate(view_orders):
+            if pass_index == 1 and not second_pass:
+                break
+            prompt = PROMPT.format(
+                view_order=view_order,
+                category=row["category"],
+                raw_dirtiness=row.get("raw_dirtiness", ""),
+            )
+            if args.backend == "ollama":
+                max_side = (
+                    args.adaptive_first_image_max_side
+                    if args.adaptive_consensus and pass_index == 0
+                    else args.image_max_side
+                )
+                raw = _infer_ollama(
+                    ollama_url, args.model, first, second,
+                    prompt, args.request_timeout, args.num_ctx,
+                    max_side, args.request_retries,
+                )
+            else:
+                raw = _infer_transformers(
+                    model, processor, torch, first, second, prompt
+                )
+            raw_outputs.append(raw)
+            teacher_passes.append(parse_teacher_output(raw))
+            if pass_index == 0 and args.adaptive_consensus and args.consensus_passes == 2:
+                second_pass = needs_adaptive_second_pass(
+                    teacher_passes[0], row, args.adaptive_confidence,
+                    args.adaptive_negative_audit_rate,
+                )
+        record["raw_outputs"] = raw_outputs
+        teacher = consensus_teacher(teacher_passes)
+        record["teacher_passes"] = teacher_passes
+        record["teacher"] = teacher
+        record["adaptive"] = {
+            "enabled": args.adaptive_consensus,
+            "second_pass": len(teacher_passes) == 2,
+            "first_image_max_side": (
+                args.adaptive_first_image_max_side
+                if args.adaptive_consensus else args.image_max_side
+            ),
+            "second_image_max_side": args.image_max_side,
+        }
+        record["accepted"] = accepted_status(
+            teacher, row["category"], args.min_confidence
+        )
+    except Exception as error:
+        record["raw_outputs"] = raw_outputs
+        record["teacher"] = None
+        record["accepted"] = {
+            "label": -1, "foreign_material": -1, "status_eligible": 0,
+        }
+        record["error"] = f"{type(error).__name__}: {error}"
+    return record
+
+
+def _processed_records(candidates, args, model=None, processor=None, torch=None):
+    if args.workers == 1:
+        for row in candidates:
+            yield _process_candidate(row, args, model, processor, torch)
+        return
+
+    iterator = iter(candidates)
+    ollama_urls = [
+        url.strip().rstrip("/")
+        for url in args.ollama_url.split(",")
+        if url.strip()
+    ]
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        pending = {}
+        for worker_index in range(args.workers):
+            try:
+                row = next(iterator)
+            except StopIteration:
+                break
+            ollama_url = (
+                ollama_urls[worker_index % len(ollama_urls)]
+                if args.backend == "ollama" else None
+            )
+            pending[executor.submit(
+                _process_candidate, row, args, model, processor, torch,
+                ollama_url,
+            )] = ollama_url
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                ollama_url = pending.pop(future)
+                yield future.result()
+                try:
+                    row = next(iterator)
+                except StopIteration:
+                    continue
+                pending[executor.submit(
+                    _process_candidate, row, args, model, processor, torch,
+                    ollama_url,
+                )] = ollama_url
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--backend", choices=("ollama", "transformers"), default="ollama")
     parser.add_argument("--model")
-    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument(
+        "--ollama-url", default="http://127.0.0.1:11434",
+        help="Ollama URL. 여러 인스턴스는 쉼표로 구분하며 샘플 단위로 분산합니다.",
+    )
     parser.add_argument("--request-timeout", type=int, default=300)
     parser.add_argument("--num-ctx", type=int, default=OLLAMA_NUM_CTX_DEFAULT)
     parser.add_argument(
@@ -428,6 +660,7 @@ def main():
         help="Ollama로 보내기 전 tight/context 각각의 최대 변 길이.",
     )
     parser.add_argument("--request-retries", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--output-jsonl")
     parser.add_argument("--merged-manifest")
     parser.add_argument("--min-confidence", type=float, default=0.90)
@@ -435,6 +668,13 @@ def main():
         "--consensus-passes", type=int, choices=(1, 2), default=2,
         help="1=한 번, 2=tight/context 순서를 바꿔 두 판정이 일치할 때만 채택.",
     )
+    parser.add_argument(
+        "--adaptive-consensus", action="store_true",
+        help="384px 1차 후 양성·불확실 샘플과 음성 감사분만 640px 2차 합의를 수행합니다.",
+    )
+    parser.add_argument("--adaptive-confidence", type=float, default=0.90)
+    parser.add_argument("--adaptive-first-image-max-side", type=int, default=384)
+    parser.add_argument("--adaptive-negative-audit-rate", type=float, default=0.10)
     parser.add_argument("--limit", type=int, default=0, help="새로 판정할 최대 행 수. 0이면 전체.")
     parser.add_argument("--split", choices=("all", "training", "validation"), default="all")
     parser.add_argument(
@@ -448,6 +688,18 @@ def main():
         raise SystemExit("[ERROR] --image-max-side must be at least 320")
     if args.request_retries < 0:
         raise SystemExit("[ERROR] --request-retries must be non-negative")
+    if args.workers < 1:
+        raise SystemExit("[ERROR] --workers must be at least 1")
+    if args.backend == "transformers" and args.workers != 1:
+        raise SystemExit("[ERROR] transformers backend requires --workers 1")
+    if args.backend == "transformers" and args.adaptive_consensus:
+        raise SystemExit("[ERROR] adaptive consensus currently requires Ollama")
+    if not 0 <= args.adaptive_confidence <= 1:
+        raise SystemExit("[ERROR] --adaptive-confidence must be between 0 and 1")
+    if args.adaptive_first_image_max_side < 320:
+        raise SystemExit("[ERROR] --adaptive-first-image-max-side must be at least 320")
+    if not 0 <= args.adaptive_negative_audit_rate <= 1:
+        raise SystemExit("[ERROR] --adaptive-negative-audit-rate must be between 0 and 1")
     if args.model is None:
         args.model = (
             OLLAMA_MODEL_DEFAULT
@@ -495,61 +747,10 @@ def main():
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     try:
         with open(output_jsonl, "a", encoding="utf-8") as output:
-            for index, row in enumerate(candidates, 1):
-                record = {
-                    "source_id": row["source_id"],
-                    "filepath": row["filepath"],
-                    "split": row["split"],
-                    "category": row["category"],
-                    "model": args.model,
-                }
-                raw_outputs = []
-                try:
-                    image_path = decode_source_path(row["source_path_b64"])
-                    image = _imread_unicode(image_path)
-                    if image is None:
-                        raise ValueError("source image unreadable")
-                    tight = _crop(image, row, padding=0.08)
-                    context = _crop(image, row, padding=0.30)
-                    if tight is None or context is None:
-                        raise ValueError("invalid source bbox")
-                    view_orders = [
-                        (tight, context, "tight crop first, wider context crop second"),
-                        (context, tight, "wider context crop first, tight crop second"),
-                    ][:args.consensus_passes]
-                    teacher_passes = []
-                    for first, second, view_order in view_orders:
-                        prompt = PROMPT.format(
-                            view_order=view_order,
-                            category=row["category"],
-                            raw_dirtiness=row.get("raw_dirtiness", ""),
-                        )
-                        if args.backend == "ollama":
-                            raw = _infer_ollama(
-                                args.ollama_url, args.model, first, second,
-                                prompt, args.request_timeout, args.num_ctx,
-                                args.image_max_side, args.request_retries,
-                            )
-                        else:
-                            raw = _infer_transformers(
-                                model, processor, torch, first, second, prompt
-                            )
-                        raw_outputs.append(raw)
-                        teacher_passes.append(parse_teacher_output(raw))
-                    record["raw_outputs"] = raw_outputs
-                    teacher = consensus_teacher(teacher_passes)
-                    record["teacher_passes"] = teacher_passes
-                    record["teacher"] = teacher
-                    record["accepted"] = accepted_status(
-                        teacher, row["category"], args.min_confidence
-                    )
-                except Exception as error:
-                    record["raw_outputs"] = raw_outputs
-                    record["teacher"] = None
-                    record["accepted"] = {
-                        "label": -1, "foreign_material": -1, "status_eligible": 0,
-                    }
-                    record["error"] = f"{type(error).__name__}: {error}"
+            records = _processed_records(
+                candidates, args, model, processor, torch
+            )
+            for index, record in enumerate(records, 1):
                 output.write(json.dumps(record, ensure_ascii=False) + "\n")
                 output.flush()
                 previous[(record["source_id"], record["filepath"])] = record

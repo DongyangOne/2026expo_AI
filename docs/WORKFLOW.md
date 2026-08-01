@@ -145,8 +145,9 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
        · ※ 원본 사용 필수 (640변환본은 파일명 리네임돼 JSON 매칭 불가)
   └→ /share/Container/crops_verifier_single_v3/ (training/ + validation/ + manifest.csv)
   └→ scripts/pseudo_label_status_qwen.py
-       · 기존 naco-ollama의 qwen3.5:9b-q4_K_M 멀티모달 teacher
-       · tight/context 두 시야가 일치하고 확신도 0.90 이상일 때만 자동 수용
+       · 같은 모델 볼륨을 공유하는 qwen3.5:9b-q4_K_M Ollama 2개/worker 2개
+       · 384px tight 1장 1차 후 양성·불확실·정상 10%만 640px wider-context 1장 2차 합의
+       · 2차 대상은 tight/context 두 시야가 일치하고 확신도 0.90 이상일 때만 자동 수용
        · 라벨/진짜 이물질/같은 재질 부속품 허용 규칙을 독립 판정
   └→ scripts/audit_pseudo_status.py (처리 완료·일관성·헤드 분포 자동 검사)
   └→ scripts/train_verifier.py
@@ -253,7 +254,7 @@ curl http://127.0.0.1:8000/health
 | 상태 멀티헤드 ONNX | ✅ Pi5 배포 및 로드 정상 |
 | 9종 crop 검증기 | ✅ 임시 MobileNetV3 50 epoch/ONNX 완료, shadow 통합 |
 | 최대 데이터 v4 추출 | 🚧 단일 객체·품목당 최대 5만장, validation 최대 1만장 추출 중 |
-| Qwen 상태 teacher 확장 | 🚧 2천건에서 총 5만건 목표로 자동 판정 중 |
+| Qwen 상태 teacher 확장 | 🚧 v7 실행 중, 20.55건/분(기존 대비 3.16배), 총 5만건 목표 |
 | `/api/v1/detect` + `client_id` 계약 | ✅ 구현·테스트·배포 완료 |
 | Spring 콜백 URL | ✅ AI 서버 환경 및 컨테이너 반영 완료 |
 | Spring 콜백 수신 테스트 | ⏳ Spring 측 엔드포인트 배포 후 확인 |

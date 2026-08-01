@@ -121,12 +121,25 @@ python /app/scripts/audit_verifier_dataset.py \
 
 외부 API로 이미지를 보내지 않고 NAS의 기존 `naco-ollama`와 RTX 2000 Ada에서
 `qwen3.5:9b-q4_K_M`를 실행한다. 이 모델은 2026년 공개된 Qwen3.5 계열의 이미지 입력
-지원 모델이며, 구조화 JSON 생성을 위해 thinking은 끈다. 모델은 기존 `/share/Container/naco_ai/ollama` 볼륨에
-한 번만 저장하며 별도 Ollama 컨테이너나 모델 볼륨을 만들지 않는다.
+지원 모델이며, 구조화 JSON 생성을 위해 thinking은 끈다. 모델은 기존
+`/share/Container/naco_ai/ollama` 볼륨에 한 번만 저장한다.
 연속 멀티모달 요청의 prompt-cache 수정이 포함된 `ollama/ollama:0.32.0`을 고정해
-사용하고, 고해상도 tight/context 두 장이 4K를 넘을 수 있으므로 `num_ctx=16384`를
-사용한다. teacher 입력은 각 crop의 최대 변만 640px로 축소해 원본 bbox 증거를
-보존하면서 이미지 토큰과 처리 시간을 제한한다. 작은 prototype limit은 split, 품목,
+사용한다. 5만건 확장 작업은 16GB VRAM에 9B Q4 모델 두 개를 동시에 적재할 수 있도록
+인스턴스당 `num_ctx=8192`를 사용한다. teacher 입력은 384px tight 한 장의 1차 판정 후
+양성·불확실 샘플과 결정론적으로 선택한 정상 10%만 640px wider-context 한 장으로
+2차 합의를 수행한다. tight와 wider-context라는 서로 다른 시야의 판정을 비교하면서
+첫 tight 이미지는 다시 보내지 않는다. 확실한 정상 샘플의 불필요한 context 인코딩과
+2차 판정을 생략하되 원본 bbox 증거는 유지한다.
+원본 `DIRTINESS`는 Qwen prompt 힌트로는 유지하지만 공식 값이 라벨과 외부 이물질을
+구분하지 못하므로 2차 강제 조건으로 사용하지 않는다.
+`label` 학습 대상이 아닌 can/paper/vinyl의 `label_only`는 정상 음성과 동일하게 10%
+감사만 수행한다. PET/plastic의 라벨 양성과 모든 `foreign_only`/`both`는 640px 2차를
+반드시 수행한다.
+모델 응답은 자유문장 reason과 decision에서 결정 가능한 중복 boolean을 생략하고,
+`decision`/`single`/`confidence`/근거 enum의 compact wire key만 생성한다. parser에서
+기존 긴 필드 구조로 즉시 복원하므로 JSONL·manifest 계약은 유지하면서 생성 토큰
+병목만 줄인다.
+작은 prototype limit은 split, 품목,
 기존 `DIRTINESS` 힌트를 round-robin해 깨끗함/내부/외부/전체 오염 후보가 한쪽으로
 쏠리지 않게 한다.
 기존 Compose는
@@ -155,16 +168,23 @@ docker run --rm --network naco_naco-internal \
   python /app/pseudo_label_status_qwen.py \
   --manifest /app/crops_verifier_single_v3_smoke_20260731/manifest.csv \
   --backend ollama \
-  --ollama-url http://naco-ollama:11434 \
+  --ollama-url http://naco-ollama:11434,http://naco-ollama-worker2:11434 \
   --model qwen3.5:9b-q4_K_M \
-  --num-ctx 16384 \
+  --num-ctx 8192 \
+  --workers 2 \
+  --adaptive-consensus \
+  --adaptive-confidence 0.90 \
+  --adaptive-first-image-max-side 384 \
+  --adaptive-negative-audit-rate 0.10 \
   --image-max-side 640 \
   --limit 50 --min-confidence 0.90
 ```
 
 teacher 실행은 이미 만들어 둔 `expo-verifier-train:20260731` 이미지를
-`naco_naco-internal` 네트워크에 잠시 연결한다. Ollama 컨테이너와 모델 볼륨은
-기존 `naco-ollama`를 그대로 사용하고 NAS 호스트에 11434 포트를 새로 공개하지 않는다.
+`naco_naco-internal` 네트워크에 잠시 연결한다. `naco-ollama`와
+`naco-ollama-worker2`는 같은 모델 볼륨을 읽고 각각 worker 하나를 처리한다. Qwen3.5는
+Ollama 0.32에서 한 서버의 parallel slot을 지원하지 않으므로 서버를 둘로 분리했으며,
+NAS 호스트에 11434 포트를 새로 공개하지 않는다.
 
 #### 2026-07-31 teacher 모델 선택
 
@@ -269,6 +289,22 @@ MobileNetV4/RepViT 채택은 validation macro-F1, 오분류 혼동행렬, ONNX �
   부족한 두 품목은 중복 파일로 수량을 부풀리지 않고 전량 사용+학습 증강으로 보완한다.
 - `pseudo_teacher_qwen35_50k_v2_20260801`: 기존 2,000건을 이어받아 라벨/외부
   이물질 자동 teacher를 총 50,000건까지 확장한다.
+- `pseudo_teacher_qwen35_50k_adaptive_dual_v7_20260801`: 9B 모델 두 인스턴스를 RTX 2000
+  Ada에 동시에 적재하고 worker를 각 서버에 고정한다. 384px tight 단일 이미지 1차와
+  조건부 640px wider-context 단일 이미지 2차 합의로 기존 전 샘플 640px 2-pass 대비 처리 시간을
+  줄인다. JSONL은 매
+  샘플 flush하므로 전환 전 결과와 오류도 그대로 이어받는다.
+
+#### v7 속도·리소스 실측 (2026-08-01 12:57 KST)
+
+- 모델 warm 이후 5.35분 동안 110건을 추가해 `20.55건/분`을 기록했다. 기존 9B
+  순차 640px 2-pass의 약 `6.5건/분` 대비 `3.16배`다.
+- 110건 중 조건부 2차 판정은 38건(`34.5%`), 신규 오류는 0건이었다.
+- 측정 시 고유 누적 3,041건, 남은 46,959건이며 같은 속도 기준 예상 완료는
+  `2026-08-03 03:02 KST`다. 실제 완료 시각은 이미지 난이도별 2차 비율에 따라 변한다.
+- 두 Ollama 9B 인스턴스가 사용한 GPU 메모리는 `13,546/16,380MiB`, 측정 온도는
+  `82°C`였다. v7 teacher와 두 Ollama 컨테이너, v4 crop 추출 컨테이너가 모두 실행
+  상태임을 확인했다.
 
 ## 6. 단계별 적용 기준
 
