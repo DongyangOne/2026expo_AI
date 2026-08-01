@@ -41,21 +41,23 @@
 
 | 구분 | 클래스 | status | 후속 |
 |------|--------|--------|------|
-| **재활용 허용** | 페트·플라스틱·캔·종이 | ALLOWED(조건충족) / REJECTED(불충족) | 조건검사 후 재활용 함 |
-| **일반쓰레기** | 비닐 · 저신뢰 · 미분류 | 비닐 정상: GENERAL_WASTE / 비닐 무게·이물질 이상: REJECTED | 일반함 또는 재처리 |
-| **수거 거부** | 유리·건전지·형광등·스티로폼 | REJECTED | 분리 불가 안내 |
+| **지정 함 허용** | 플라스틱(PET 포함)·캔·종이·비닐 | ALLOWED(조건충족) / REJECTED(불충족) | 조건검사 후 해당 함 |
+| **분류 불가** | 저신뢰 · 미분류 | GENERAL_WASTE | 일반함 |
+| **수거 거부** | 유리·건전지·형광등·스티로폼 | REJECTED | 수거 불가 안내 |
 | **미감지** | — | NOT_DETECTED | 재시도 |
+
+> 모델은 학습 정확도를 위해 PET와 기타 플라스틱을 별도 클래스로 유지한다. 운영 응답과 Spring 콜백에서는 PET도 `class_id=3`, `class_name=plastic`으로 정규화한다.
 
 ### 상태 조건 (허용 품목) — 충족=ALLOWED, 불충족=REJECTED(재처리)
 | 품목 | 라벨 떼기 | 압착 | 무게정상 |
 |------|:---:|:---:|:---:|
-| 페트병 | ✅ | ✅ | ✅ |
-| 플라스틱 | ✅ | — | ✅ |
+| 플라스틱 병(모델 PET) | ✅ | ✅ | ✅ |
+| 기타 플라스틱 | ✅ | — | ✅ |
 | 캔 | — | ✅ | ✅ |
 | 종이 | — | — | ✅ |
 
 > 조건 하나라도 불충족 → `REJECTED` + guidance(`EMPTY_CONTENTS`/`WEIGHT_ANOMALY`/`FOREIGN_MATERIAL`/`REMOVE_LABEL`/`COMPRESS`) 재처리 안내 → 사용자 처리 후 재투입.
-> 비닐은 무게·외부 이물질 이상이 없으면 일반쓰레기(`GENERAL_WASTE`)이고, 이상이 있으면 재처리(`REJECTED`)한다. 유리·건전지·형광등·스티로폼은 완전 수거거부(`REJECTED`+`rejection`).
+> 비닐은 무게·외부 이물질 이상이 없을 때만 비닐함 투입(`ALLOWED`)을 허용하고, 이상이 있으면 재처리(`REJECTED`)한다. 저신뢰·미분류는 `GENERAL_WASTE`로 유지한다. 유리·건전지·형광등·스티로폼은 완전 수거거부(`REJECTED`+`rejection`).
 
 ### GuidanceCode 매핑
 
@@ -79,15 +81,15 @@
 1. 필수 `client_id` 수신 + 이미지 디코드
 2. 메인 YOLO 감지 (conf=DETECT_CONF 0.25)
      └ 박스 없음 → NOT_DETECTED
-3. 최고신뢰 박스 → class_id, confidence, bbox
+3. 최고신뢰 박스 → 모델 class_id, confidence, bbox (PET은 외부 응답에서 PLASTIC으로 정규화)
 4. 신뢰도 판정
      └ confidence < TRUST_CONF(0.55) → LOW_CONFIDENCE (일반쓰레기)
-5. [허용: 페트/플라스틱/캔/종이]
+5. [허용: 플라스틱(PET 포함)/캔/종이]
      ├ 상태 멀티헤드(crop ONNX) → conditions.is_dented / has_label / has_foreign_material(선택)
      ├ 무게 → weight.anomaly
      └ build_guidance() → 불충족 안내. 비면 ALLOWED, 있으면 REJECTED(재처리)
 6. [거부: 유리/건전지/형광등/스티로폼] → REJECTED + rejection
-7. [비닐] → 무게·외부 이물질 이상이면 REJECTED + guidance, 정상이면 GENERAL_WASTE + general
+7. [비닐] → 무게·외부 이물질 이상이면 REJECTED + guidance, 정상이면 ALLOWED(비닐함)
 8. `client_id`를 포함한 DetectResponse 조립 → 하드웨어 응답 + Spring 콜백(fire-and-forget)
 ```
 

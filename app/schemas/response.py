@@ -10,7 +10,7 @@
   ├─ weight          : WeightInfo        ← 무게 + 이상 여부
   ├─ guidance        : Guidance[]        ← 조건 불충족 시 재처리 안내 (압착/라벨/비우기). 충족 시 빈 배열
   ├─ rejection       : Rejection?        ← 완전 거부 사유 (유리/건전지 등)
-  ├─ general         : GeneralWaste?     ← 일반쓰레기 사유 (비닐/저신뢰)
+  ├─ general         : GeneralWaste?     ← 일반쓰레기 사유 (저신뢰/미분류)
   └─ bbox            : float[]?          ← 감지 영역 [x1,y1,x2,y2]
 
 status 별 채워지는 필드:
@@ -35,9 +35,9 @@ from app.schemas.enums import (
 
 
 class Classification(BaseModel):
-    """분류 결과. 주 분류 + 신뢰도. (색·재질 세부분류 없음)"""
-    class_id:   int        = Field(..., description="클래스 ID (0~8)", ge=0, le=8)
-    class_name: WasteClass = Field(..., description="주 분류 (9-class)")
+    """외부 분류 결과. 모델 PET 출력은 PLASTIC(class_id=3)으로 통합한다."""
+    class_id:   int        = Field(..., description="외부 클래스 ID (PET은 PLASTIC의 3으로 정규화)", ge=0, le=8)
+    class_name: WasteClass = Field(..., description="주 분류 (PET은 plastic으로 정규화)")
     confidence: float      = Field(..., description="주 분류 신뢰도", ge=0.0, le=1.0)
 
 
@@ -67,7 +67,7 @@ class Rejection(BaseModel):
 
 
 class GeneralWaste(BaseModel):
-    """일반쓰레기 안내 (비닐/저신뢰/미분류)."""
+    """일반쓰레기 안내. VINYL 코드는 기존 계약 호환을 위해 유지한다."""
     code:    GeneralWasteCode = Field(..., description="일반쓰레기 사유 코드")
     message: str              = Field(..., description="안내 문구")
 
@@ -89,7 +89,7 @@ class DetectResponse(BaseModel):
                 {
                     "client_id": "hardware-user-001",
                     "status": "ALLOWED",
-                    "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
+                    "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.94},
                     "conditions": {"has_label": False, "is_dented": True, "has_foreign_material": None},
                     "weight": {"value_g": 28.0, "anomaly": False},
                     "guidance": [],
@@ -99,15 +99,15 @@ class DetectResponse(BaseModel):
                 },
                 {
                     "client_id": "hardware-user-001",
-                    "status": "REJECTED",
-                    "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.91},
+                    "status": "ALLOWED",
+                    "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.91},
                     "conditions": {"has_label": True, "is_dented": False, "has_foreign_material": True},
                     "weight": {"value_g": 540.0, "anomaly": True},
                     "guidance": [
                         {"code": "EMPTY_CONTENTS", "message": "내용물이 남아 있는 것 같아요. 비우고 다시 넣어 주세요."},
                         {"code": "FOREIGN_MATERIAL", "message": "외부 이물질을 제거하고 다시 넣어 주세요."},
                         {"code": "REMOVE_LABEL", "message": "라벨을 제거해 주세요."},
-                        {"code": "COMPRESS", "message": "페트병·캔은 납작하게 압착해서 넣어 주세요."}
+                        {"code": "COMPRESS", "message": "플라스틱 병·캔은 납작하게 압착해서 넣어 주세요."}
                     ],
                     "rejection": None,
                     "general": None,
@@ -125,12 +125,12 @@ class DetectResponse(BaseModel):
                 },
                 {
                     "client_id": "hardware-user-001",
-                    "status": "GENERAL_WASTE",
+                    "status": "REJECTED",
                     "classification": {"class_id": 5, "class_name": "vinyl", "confidence": 0.90},
                     "weight": {"value_g": 12.0, "anomaly": False},
                     "guidance": [],
                     "rejection": None,
-                    "general": {"code": "VINYL", "message": "비닐은 일반쓰레기로 배출해 주세요."},
+                    "general": None,
                     "bbox": [100.0, 110.0, 480.0, 470.0],
                 },
                 {

@@ -37,12 +37,13 @@ def _get_registry(request: Request) -> ModelRegistry:
     summary="쓰레기 분류",
     description=(
         "이미지와 무게 값으로 9-class 분류 후 상태(압착/라벨/외부 이물질/무게)를 검사합니다.\n\n"
-        "- `status=ALLOWED`: 재활용 허용 (페트/플라스틱/캔/종이 + 조건 충족)\n"
+        "- `status=ALLOWED`: 지정 함 투입 허용 (플라스틱(PET 포함)/캔/종이/비닐 + 조건 충족)\n"
         "- `status=REJECTED`: 조건 불충족(`guidance` 재처리 안내) 또는 완전거부(`rejection`, 유리·건전지 등)\n"
-        "- `status=GENERAL_WASTE`: 일반쓰레기 (`general` — 비닐/저신뢰/미분류)\n"
+        "- `status=GENERAL_WASTE`: 저신뢰/미분류 (`general`)\n"
         "- `status=NOT_DETECTED`: 미감지\n"
         "- `client_id`: 하드웨어가 보낸 사용자/피드백 구분 ID를 응답과 Spring 콜백에 그대로 포함\n"
-        "- `conditions`: is_dented(페트·캔 압착), has_label(페트·플라스틱 라벨), "
+        "- `classification`: 모델의 PET 감지도 `class_id=3`, `class_name=plastic`으로 통합\n"
+        "- `conditions`: is_dented(플라스틱 병·캔 압착), has_label(플라스틱 라벨), "
         "has_foreign_material(지원 모델의 외부 이물질)"
     ),
 )

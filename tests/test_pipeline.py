@@ -1,4 +1,4 @@
-"""pipeline 분기 테스트 — 비닐 무게 이상 guidance 계약."""
+"""pipeline 분기 테스트 — 비닐 허용과 PET/플라스틱 통합 계약."""
 
 import asyncio
 import os
@@ -8,7 +8,8 @@ import numpy as np
 
 os.environ.setdefault("API_KEY", "test-key")
 
-from app.schemas.enums import DetectionStatus, GeneralWasteCode, GuidanceCode
+from app.schemas.enums import DetectionStatus, GuidanceCode, WasteClass
+from app.schemas.response import Conditions
 from app.services import inference, pipeline
 from app.services import verifier_shadow
 
@@ -26,6 +27,10 @@ def _fake_vinyl_detection(_registry, _img):
     return 5, 0.90, [10.0, 10.0, 90.0, 90.0]
 
 
+def _fake_pet_detection(_registry, _img):
+    return 1, 0.94, [10.0, 10.0, 90.0, 90.0]
+
+
 def test_vinyl_무게이상은_rejected_weight_anomaly(monkeypatch):
     monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
     monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
@@ -41,7 +46,7 @@ def test_vinyl_무게이상은_rejected_weight_anomaly(monkeypatch):
     assert result.general is None
 
 
-def test_vinyl_무게정상은_기존_general_waste(monkeypatch):
+def test_vinyl_무게정상은_vinyl만_allowed(monkeypatch):
     monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
     monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
     monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
@@ -50,11 +55,34 @@ def test_vinyl_무게정상은_기존_general_waste(monkeypatch):
         monkeypatch.setattr(pipeline, "_executor", executor)
         result = asyncio.run(pipeline.run(None, 20.0, "vinyl-normal", _Registry()))
 
-    assert result.status is DetectionStatus.GENERAL_WASTE
+    assert result.status is DetectionStatus.ALLOWED
     assert result.weight.anomaly is False
     assert result.guidance == []
-    assert result.general is not None
-    assert result.general.code is GeneralWasteCode.VINYL
+    assert result.general is None
+
+
+def test_pet은_상태검사후_plastic으로_응답(monkeypatch):
+    captured = {}
+
+    def fake_run_state(_session, _img, _bbox, cls):
+        captured["state_class"] = cls
+        return Conditions(has_label=False, is_dented=True)
+
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_pet_detection)
+    monkeypatch.setattr(inference, "run_state", fake_run_state)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 20.0, "pet-normalized", _Registry()))
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification is not None
+    assert result.classification.class_id == 3
+    assert result.classification.class_name is WasteClass.PLASTIC
+    assert captured["state_class"] is WasteClass.PET
+    assert result.guidance == []
 
 
 def test_shadow_verifier_receives_yolo_result_without_changing_response(monkeypatch):
@@ -84,7 +112,7 @@ def test_shadow_verifier_receives_yolo_result_without_changing_response(monkeypa
             pipeline.run(None, 20.0, "hardware-shadow-001", _ShadowRegistry())
         )
 
-    assert result.status is DetectionStatus.GENERAL_WASTE
+    assert result.status is DetectionStatus.ALLOWED
     assert captured == {
         "session": "temporary-verifier-session",
         "bbox": [10.0, 10.0, 90.0, 90.0],

@@ -10,10 +10,11 @@
         거부품목(유리 등)  → REJECTED (완전 거부)
         비닐              → 상태·무게 검사
                             이상 있음 → REJECTED (재처리 guidance)
-                            이상 없음 → GENERAL_WASTE
+                            이상 없음 → ALLOWED (비닐함)
         허용품목          → 멀티헤드 상태(inference.run_state) + 무게 검사
                             조건 충족  → ALLOWED
                             조건 불충족 → REJECTED (재처리 guidance)
+        PET 감지          → 내부 상태 검사는 PET 기준, 외부 분류는 PLASTIC으로 정규화
     → DetectResponse 조립
 
 추론은 services.inference, 도메인 규칙은 services.guidance, 무게 판정은 services.weight_check 에 위임.
@@ -45,6 +46,29 @@ _CLASS_BY_ID: dict[int, WasteClass] = {
     3: WasteClass.PLASTIC,   4: WasteClass.STYROFOAM,  5: WasteClass.VINYL,
     6: WasteClass.GLASS,     7: WasteClass.BATTERY,    8: WasteClass.FLUORESCENT,
 }
+
+_PLASTIC_CLASS_ID = 3
+
+
+def _build_classification(
+    model_class_id: int,
+    cls: WasteClass | None,
+    confidence: float,
+) -> Classification | None:
+    """모델의 PET 클래스를 외부 계약에서는 PLASTIC 하나로 통합한다."""
+    if cls is None:
+        return None
+    if cls is WasteClass.PET:
+        return Classification(
+            class_id=_PLASTIC_CLASS_ID,
+            class_name=WasteClass.PLASTIC,
+            confidence=round(confidence, 4),
+        )
+    return Classification(
+        class_id=model_class_id,
+        class_name=cls,
+        confidence=round(confidence, 4),
+    )
 
 
 def shutdown() -> None:
@@ -92,10 +116,7 @@ async def run(
     cls = _CLASS_BY_ID.get(class_id)
     bbox_rounded = [round(v, 1) for v in bbox]
     weight_info = WeightInfo(value_g=weight_g)
-    classification = (
-        Classification(class_id=class_id, class_name=cls, confidence=round(confidence, 4))
-        if cls is not None else None
-    )
+    classification = _build_classification(class_id, cls, confidence)
 
     # ── 저신뢰 → 일반쓰레기 ──────────────────────────────────────────────────────
     if cls is None or confidence < settings.TRUST_CONF:
@@ -119,8 +140,8 @@ async def run(
             bbox=bbox_rounded,
         )
 
-    # ── 일반쓰레기 (비닐) — 무게/외부 이물질 이상이면 먼저 재처리 안내 ───────────
-    if guidance.is_general(cls):
+    # ── 비닐 — 정상일 때만 비닐함 허용, 이상이면 재처리 안내 ────────────────────
+    if guidance.is_vinyl(cls):
         conditions = await loop.run_in_executor(
             _executor, inference.run_state, registry.state(), img, bbox, cls
         )
@@ -142,15 +163,14 @@ async def run(
             )
         return DetectResponse(
             client_id=client_id,
-            status=DetectionStatus.GENERAL_WASTE,
+            status=DetectionStatus.ALLOWED,
             classification=classification,
             conditions=conditions,
             weight=weight_info,
-            general=guidance.build_general(GeneralWasteCode.VINYL),
             bbox=bbox_rounded,
         )
 
-    # ── 허용 (페트/플라스틱/캔/종이) → 상태·무게 조건 검사 ────────────────────────
+    # ── 허용 (플라스틱/PET/캔/종이) → 상태·무게 조건 검사 ────────────────────────
     conditions = await loop.run_in_executor(
         _executor, inference.run_state, registry.state(), img, bbox, cls
     )

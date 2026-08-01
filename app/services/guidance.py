@@ -4,11 +4,12 @@
 파이프라인(흐름 제어)과 분리하여 "쓰레기 처리 규칙"만 모은다.
 문구 수정 시 이 파일만 건드리면 된다.
 
-하드웨어 함: [플라스틱/페트, 캔, 종이, 일반] + 수거거부.
-  - ALLOWED       : pet/plastic/can/paper + 상태 조건 충족 → 재활용 함
-  - REJECTED(재처리): pet/plastic/can/paper + 조건 불충족 → guidance 안내 후 재투입
+하드웨어 함: [플라스틱, 캔, 종이, 일반] + 수거거부.
+  - ALLOWED       : plastic(PET 포함)/can/paper + 상태 조건 충족 → 재활용 함
+  - REJECTED(재처리): plastic(PET 포함)/can/paper + 조건 불충족 → guidance 안내 후 재투입
   - REJECTED(거부) : glass/battery/fluorescent/styrofoam → 수거 불가
-  - GENERAL_WASTE  : vinyl / 저신뢰 / 미분류 → 일반쓰레기함
+  - ALLOWED(비닐)  : vinyl + 상태 조건 충족 → 비닐함
+  - GENERAL_WASTE  : 저신뢰 / 미분류 → 분류 불가
 """
 
 from app.schemas.enums import (
@@ -29,7 +30,7 @@ REJECTED_CLASSES: set[WasteClass] = {
     WasteClass.FLUORESCENT, WasteClass.STYROFOAM,
 }
 
-GENERAL_CLASSES: set[WasteClass] = {
+VINYL_CLASSES: set[WasteClass] = {
     WasteClass.VINYL,
 }
 
@@ -40,7 +41,7 @@ _GUIDANCE_TEXT: dict[GuidanceCode, str] = {
     GuidanceCode.WEIGHT_ANOMALY:   "무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요.",
     GuidanceCode.FOREIGN_MATERIAL: "외부 이물질을 제거하고 다시 넣어 주세요.",
     GuidanceCode.REMOVE_LABEL:     "라벨을 제거하고 다시 넣어 주세요.",
-    GuidanceCode.COMPRESS:         "페트병·캔은 납작하게 압착해서 다시 넣어 주세요.",
+    GuidanceCode.COMPRESS:         "플라스틱 병·캔은 납작하게 압착해서 다시 넣어 주세요.",
 }
 
 _EMPTY_CONTENTS_CLASSES: set[WasteClass] = {
@@ -76,8 +77,8 @@ def is_rejected(cls: WasteClass) -> bool:
     return cls in REJECTED_CLASSES
 
 
-def is_general(cls: WasteClass) -> bool:
-    return cls in GENERAL_CLASSES
+def is_vinyl(cls: WasteClass) -> bool:
+    return cls in VINYL_CLASSES
 
 
 # ── 안내 생성 ────────────────────────────────────────────────────────────────────
@@ -112,5 +113,5 @@ def build_rejection(cls: WasteClass) -> Rejection:
 
 
 def build_general(code: GeneralWasteCode) -> GeneralWaste:
-    """일반쓰레기(비닐/저신뢰/미분류) 안내."""
+    """일반쓰레기 안내. VINYL 코드는 기존 계약 호환을 위해 유지한다."""
     return GeneralWaste(code=code, message=_GENERAL_TEXT[code])

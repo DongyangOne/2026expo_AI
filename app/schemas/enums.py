@@ -11,7 +11,7 @@ from enum import Enum
 
 
 class WasteClass(str, Enum):
-    """주 모델 9-class. value = 모델 라벨명과 일치."""
+    """주 모델 9-class. PET 감지는 외부 응답에서 PLASTIC으로 정규화한다."""
     CAN         = "can"
     PET         = "pet"
     PAPER       = "paper"
@@ -27,10 +27,10 @@ class DetectionStatus(str, Enum):
     """
     Spring 이 가장 먼저 분기하는 판별자(discriminator).
     이 값 하나로 후속 처리 분기가 결정된다.
-    하드웨어 함: [플라스틱/페트, 캔, 종이, 일반] + 수거거부.
+    하드웨어 함: [플라스틱, 캔, 종이, 일반] + 수거거부.
     """
-    ALLOWED       = "ALLOWED"        # 재활용 허용 (pet/plastic/can/paper) + 상태조건 충족
-    GENERAL_WASTE = "GENERAL_WASTE"  # 일반쓰레기함 (vinyl / 저신뢰 / 미분류)
+    ALLOWED       = "ALLOWED"        # 지정 함 투입 허용 (plastic/can/paper/vinyl) + 상태조건 충족
+    GENERAL_WASTE = "GENERAL_WASTE"  # 저신뢰 / 미분류
     REJECTED      = "REJECTED"       # 거부: 조건불충족(재처리 guidance) 또는 완전거부(유리 등 rejection)
     NOT_DETECTED  = "NOT_DETECTED"   # 감지 실패 → 재시도 안내
 
@@ -54,6 +54,6 @@ class RejectionCode(str, Enum):
 
 class GeneralWasteCode(str, Enum):
     """일반쓰레기(GENERAL_WASTE) 사유 코드."""
-    VINYL       = "VINYL"            # 비닐 — 재활용 함 없음
+    VINYL       = "VINYL"            # 하위 호환용 (정상 비닐은 ALLOWED)
     LOW_CONFIDENCE = "LOW_CONFIDENCE"  # 신뢰도 미달
     UNCLASSIFIED   = "UNCLASSIFIED"    # 기타 미분류

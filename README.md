@@ -40,7 +40,7 @@ curl -X POST http://localhost:8000/api/v1/detect \
 {
   "client_id": "hardware-user-001",
   "status": "ALLOWED",
-  "classification": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
+  "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.94},
   "conditions": {"has_label": false, "is_dented": true, "has_foreign_material": null},
   "weight": {"value_g": 28.0, "anomaly": false},
   "guidance": [],
@@ -88,6 +88,8 @@ curl -X POST http://localhost:8000/api/v1/detect \
 | `LOW_CONFIDENCE` | 신뢰도 미달 |
 | `UNCLASSIFIED` | 미분류 |
 
+> 메인 모델은 PET와 플라스틱을 별도로 감지하지만 API 응답과 Spring 콜백에서는 모두 `class_id=3`, `class_name=plastic`으로 통합한다. 비닐은 정확히 판정되고 상태 조건을 충족한 경우에만 `class_id=5`, `class_name=vinyl`, `status=ALLOWED`로 비닐함 투입을 허용한다. 저신뢰·미분류는 계속 `GENERAL_WASTE`다.
+
 ---
 
 ## Spring 콜백
@@ -129,7 +131,7 @@ CAPTURE_MAX_STORAGE_MB=10240
 `SPRING_CALLBACK_URL` 미설정 시 로그만 저장하므로 Spring 서버 없이도 결과를 확인할 수 있다.
 
 ```jsonl
-{"timestamp":"2026-07-03T10:00:00+00:00","client_id":"hardware-user-001","status":"ALLOWED","classification":{"class_id":1,...},...}
+{"timestamp":"2026-07-03T10:00:00+00:00","client_id":"hardware-user-001","status":"ALLOWED","classification":{"class_id":3,"class_name":"plastic",...},...}
 ```
 
 ### 요청 이미지와 판정 캡처 (`logs/captures/`)

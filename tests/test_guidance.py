@@ -107,23 +107,33 @@ class TestClassification:
             assert guidance.is_allowed(c)
 
     def test_rejected(self):
-        for c in (WasteClass.GLASS, WasteClass.BATTERY, WasteClass.FLUORESCENT, WasteClass.STYROFOAM):
+        for c in (
+            WasteClass.GLASS,
+            WasteClass.BATTERY,
+            WasteClass.FLUORESCENT,
+            WasteClass.STYROFOAM,
+        ):
             assert guidance.is_rejected(c)
 
     def test_general(self):
-        assert guidance.is_general(WasteClass.VINYL)
+        assert guidance.is_vinyl(WasteClass.VINYL)
 
     def test_상호배타(self):
-        # 9개 클래스 각각 allowed/rejected/general 중 최대 하나에만 속함
+        # 9개 모델 클래스는 허용/거부/일반 중 정확히 하나에 속함
         for c in WasteClass:
-            n = sum((guidance.is_allowed(c), guidance.is_rejected(c), guidance.is_general(c)))
-            assert n <= 1, f"{c} 가 여러 분류에 중복"
+            n = sum((guidance.is_allowed(c), guidance.is_rejected(c), guidance.is_vinyl(c)))
+            assert n == 1, f"{c} 의 처리 분류가 없거나 중복됨"
 
 
 # ── 안내 메시지 생성 ────────────────────────────────────────────────────────────
 class TestMessages:
     def test_rejection_전품목(self):
-        for c in (WasteClass.GLASS, WasteClass.BATTERY, WasteClass.FLUORESCENT, WasteClass.STYROFOAM):
+        for c in (
+            WasteClass.GLASS,
+            WasteClass.BATTERY,
+            WasteClass.FLUORESCENT,
+            WasteClass.STYROFOAM,
+        ):
             r = guidance.build_rejection(c)
             assert r.code == RejectionCode(c.value.upper()) and r.message
 
