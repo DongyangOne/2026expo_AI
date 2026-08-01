@@ -99,7 +99,7 @@ class DetectResponse(BaseModel):
                 },
                 {
                     "client_id": "hardware-user-001",
-                    "status": "ALLOWED",
+                    "status": "REJECTED",
                     "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.91},
                     "conditions": {"has_label": True, "is_dented": False, "has_foreign_material": True},
                     "weight": {"value_g": 540.0, "anomaly": True},
@@ -125,8 +125,9 @@ class DetectResponse(BaseModel):
                 },
                 {
                     "client_id": "hardware-user-001",
-                    "status": "REJECTED",
+                    "status": "ALLOWED",
                     "classification": {"class_id": 5, "class_name": "vinyl", "confidence": 0.90},
+                    "conditions": {"has_label": None, "is_dented": None, "has_foreign_material": None},
                     "weight": {"value_g": 12.0, "anomaly": False},
                     "guidance": [],
                     "rejection": None,
