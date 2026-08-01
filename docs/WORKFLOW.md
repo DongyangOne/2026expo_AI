@@ -210,6 +210,48 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 > 치우쳐 오분류할 수 있다. 단순 임계값 상향만으로는 고신뢰 오분류를 해결할 수 없으므로
 > 운영 이미지 수집과 재학습을 우선한다.
 
+### 하드웨어 캡처 자동 정제 및 노트북 후보 학습
+
+NAS의 teacher 작업과 충돌하지 않게 운영 캡처 적응 후보는 별도 노트북 환경에서
+만든다. 운영 모델과 원본 캡처는 덮어쓰지 않으며 모든 산출물은 `runs/` 아래에 둔다.
+
+1. Pi5의 `logs/captures` 이미지/JSON 쌍을 로컬로 복사한다.
+2. 이미지 SHA-256으로 재요청 중복을 제거한다.
+3. `audit spec`의 snapshot 개수와 SHA anchor를 확인해 다른 캡처 순서에 잘못된
+   라벨이 적용되지 않게 한다.
+4. 단일 물체만 YOLO 재료 학습에 사용하고, 혼합 이물질은 detector에서 제외한 뒤
+   verifier 상태 manifest에만 `foreign_material=1`로 남긴다.
+5. 빈 장비·사람·장비 밖의 물체는 빈 YOLO 라벨의 negative 이미지로 포함한다.
+6. 동일 실물의 연속 촬영본은 하나의 `object_group`으로 묶어 train/val 누수를 막는다.
+7. 기존 모델과 후보를 동일 holdout, 동일 `DETECT_CONF=0.25` / `TRUST_CONF=0.55`로
+   비교한다. 실제 물체 정분류와 빈 장면 specificity가 모두 확인되기 전에는 export나
+   Pi5 배포를 하지 않는다.
+
+```powershell
+python scripts/prepare_hardware_capture_dataset.py `
+  --captures-dir runs/hardware_capture_prep/raw/captures `
+  --audit-spec runs/hardware_capture_prep/audit_spec.json `
+  --candidates runs/hardware_capture_prep/low_conf_candidates.json `
+  --output-dir runs/hardware_capture_prep/dataset `
+  --render-overlays
+
+python scripts/train_hardware_candidate.py `
+  --model weights/yolo26m_best.pt `
+  --data runs/hardware_capture_prep/dataset/yolo/dataset.yaml `
+  --project runs/hardware_capture_prep/training `
+  --name candidate_freeze20 --epochs 25 --batch 8 --freeze 20
+
+python scripts/evaluate_hardware_detector.py `
+  --model runs/hardware_capture_prep/training/candidate_freeze20/weights/best.pt `
+  --dataset-dir runs/hardware_capture_prep/dataset/yolo `
+  --output runs/hardware_capture_prep/candidate_metrics.json `
+  --thresholds 0.25 0.55
+```
+
+소규모 운영 캡처만으로 만든 모델은 hardware adapter 후보일 뿐 최종 모델이 아니다.
+최종 학습은 NAS의 기존 9종 원본 train 데이터와 정제된 hardware hard sample을 함께
+사용해 glass/battery/fluorescent 등 이번 캡처에 없는 클래스의 망각을 방지한다.
+
 ### 배포 흐름
 
 1. 별도 기능 브랜치 없이 `main`에 직접 반영한다.
@@ -304,12 +346,16 @@ scripts/
   audit_verifier_dataset.py  학습 전 9종·분할·파일·마스킹 무결성 검사
   audit_pseudo_status.py     자동 상태 라벨의 처리 완료·일관성·헤드 분포 검사
   import_reviewed_captures.py 운영 캡처의 선택 정답을 crop manifest로 변환(자동 학습 기본 경로에서는 미사용)
+  prepare_hardware_capture_dataset.py SHA 중복 제거 + YOLO negative/crop 상태 manifest 생성
+  train_hardware_candidate.py 노트북 GPU용 보수적 하드웨어 적응 후보 학습
+  evaluate_hardware_detector.py 고정 holdout의 운영 임계값별 후보 비교
   train_verifier.py       9종+상태 멀티태스크 검증기 학습/ONNX export
 
 requirements-training.txt NAS 학습의 ONNX export 및 최신 경량 백본 의존성
 
 docs/
   WORKFLOW.md             (이 문서)
+  HARDWARE_CAPTURE_PROTOTYPE_20260801.md 노트북 적응 후보 데이터·지표·NAS 인계 게이트
   CROP_VERIFIER_PLAN.md   객체 crop 검증기 확정 구조·라벨 정책·실행 절차
   WEIGHT_KIOSK_PARAMS.md  무게 로직 + 키오스크 파라미터 체크리스트
   DATA_AUDIT.md           변환 데이터 정합성 점검
