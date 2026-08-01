@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     VERIFIER_SHADOW_ENABLED: bool = True
     VERIFIER_SHADOW_LOG_PATH: str = "logs/verifier_shadow.jsonl"
 
+    # 저신뢰 PET/PLASTIC과 VINYL이 같은 bbox에서 경쟁할 때만 crop 검증기로 교정한다.
+    VINYL_CORRECTION_ENABLED: bool = True
+    VINYL_CANDIDATE_CONF: float = 0.10
+    VINYL_CANDIDATE_IOU: float = 0.70
+    VINYL_CANDIDATE_RATIO: float = 0.40
+    VINYL_VERIFIER_CONF: float = 0.65
+    VINYL_VERIFIER_MARGIN: float = 0.25
+
     # ── 추론 설정 ────────────────────────────────────────────────────────────────
     # 2단계 임계값:
     #   DETECT_CONF 미만 → 박스 없음 → NOT_DETECTED

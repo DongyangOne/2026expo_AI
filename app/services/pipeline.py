@@ -48,6 +48,57 @@ _CLASS_BY_ID: dict[int, WasteClass] = {
 }
 
 _PLASTIC_CLASS_ID = 3
+_PET_MODEL_CLASS_ID = 1
+_VINYL_MODEL_CLASS_ID = 5
+
+
+def _bbox_iou(first: list[float], second: list[float]) -> float:
+    x1 = max(first[0], second[0])
+    y1 = max(first[1], second[1])
+    x2 = min(first[2], second[2])
+    y2 = min(first[3], second[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _find_vinyl_candidate(
+    class_id: int,
+    confidence: float,
+    bbox: list[float],
+    candidates: list[tuple[int, float, list[float]]],
+) -> tuple[int, float, list[float]] | None:
+    """저신뢰 PET/PLASTIC과 같은 물체를 가리키는 VINYL 보조 후보를 찾는다."""
+    if (
+        not settings.VINYL_CORRECTION_ENABLED
+        or class_id not in {_PET_MODEL_CLASS_ID, _PLASTIC_CLASS_ID}
+        or confidence >= settings.TRUST_CONF
+    ):
+        return None
+
+    matches = [
+        candidate
+        for candidate in candidates
+        if candidate[0] == _VINYL_MODEL_CLASS_ID
+        and candidate[1] >= settings.VINYL_CANDIDATE_CONF
+        and candidate[1] >= confidence * settings.VINYL_CANDIDATE_RATIO
+        and _bbox_iou(bbox, candidate[2]) >= settings.VINYL_CANDIDATE_IOU
+    ]
+    return max(matches, key=lambda candidate: candidate[1]) if matches else None
+
+
+def _verifier_supports_vinyl(prediction: dict | None, yolo_confidence: float) -> bool:
+    if prediction is None:
+        return False
+    material = prediction.get("material") or {}
+    verifier_confidence = float(material.get("confidence", 0.0))
+    return (
+        material.get("class_id") == _VINYL_MODEL_CLASS_ID
+        and verifier_confidence >= settings.VINYL_VERIFIER_CONF
+        and verifier_confidence - yolo_confidence >= settings.VINYL_VERIFIER_MARGIN
+    )
 
 
 def _build_classification(
@@ -106,13 +157,56 @@ async def run(
             weight=WeightInfo(value_g=weight_g),
         )
 
-    class_id, confidence, bbox = detection
+    if len(detection) == 3:
+        class_id, confidence, bbox = detection
+        candidates: list[tuple[int, float, list[float]]] = []
+    else:
+        class_id, confidence, bbox, candidates = detection
+
+    yolo_class_id = class_id
+    yolo_confidence = confidence
     verifier_session = (
         registry.verifier() if hasattr(registry, "verifier") else None
     )
-    verifier_shadow.submit(
-        verifier_session, img, bbox, class_id, confidence, client_id
+    vinyl_candidate = _find_vinyl_candidate(
+        class_id, confidence, bbox, candidates
     )
+    verifier_prediction = None
+    correction_applied = False
+    if verifier_session is not None and vinyl_candidate is not None:
+        verifier_prediction = await loop.run_in_executor(
+            _executor, inference.run_verifier, verifier_session, img, bbox
+        )
+        if _verifier_supports_vinyl(verifier_prediction, confidence):
+            verifier_confidence = float(
+                verifier_prediction["material"]["confidence"]
+            )
+            logger.info(
+                "저신뢰 %s(%.4f)를 vinyl(%.4f)로 교정: client_id=%s",
+                _CLASS_BY_ID.get(class_id),
+                confidence,
+                verifier_confidence,
+                client_id,
+            )
+            class_id = _VINYL_MODEL_CLASS_ID
+            confidence = verifier_confidence
+            correction_applied = True
+
+    if verifier_prediction is None:
+        verifier_shadow.submit(
+            verifier_session, img, bbox, yolo_class_id, yolo_confidence, client_id
+        )
+    else:
+        verifier_shadow.submit_precomputed(
+            verifier_session,
+            img,
+            bbox,
+            yolo_class_id,
+            yolo_confidence,
+            client_id,
+            verifier_prediction,
+            correction_applied,
+        )
     cls = _CLASS_BY_ID.get(class_id)
     bbox_rounded = [round(v, 1) for v in bbox]
     weight_info = WeightInfo(value_g=weight_g)

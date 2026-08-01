@@ -29,19 +29,42 @@ VERIFIER_CLASS_NAMES = (
 
 
 def run_main(registry: ModelRegistry, img: np.ndarray):
-    """주 9-class YOLO. Returns (class_id, conf, [x1,y1,x2,y2]) | None."""
+    """
+    주 9-class YOLO.
+
+    최종 감지는 기존 ``DETECT_CONF`` 이상만 인정한다. 다만 저신뢰
+    PET/PLASTIC↔VINYL 혼동 교정에 쓸 같은 bbox의 보조 후보를 보존하기 위해 모델에는
+    더 낮은 ``VINYL_CANDIDATE_CONF``를 전달한다.
+
+    Returns:
+        (class_id, confidence, bbox, candidates) | None
+        candidates: [(class_id, confidence, bbox), ...]
+    """
+    candidate_conf = min(settings.DETECT_CONF, settings.VINYL_CANDIDATE_CONF)
     results = registry.main()(
         img,
         imgsz=settings.IMG_SIZE,
-        conf=settings.DETECT_CONF,
+        conf=candidate_conf,
         device=settings.DEVICE,
         verbose=False,
     )
     boxes = results[0].boxes
     if boxes is None or len(boxes) == 0:
         return None
-    best = int(boxes.conf.argmax())
-    return int(boxes.cls[best]), float(boxes.conf[best]), boxes.xyxy[best].tolist()
+
+    candidates = [
+        (int(boxes.cls[index]), float(boxes.conf[index]), boxes.xyxy[index].tolist())
+        for index in range(len(boxes))
+    ]
+    eligible = [
+        index for index, (_, confidence, _) in enumerate(candidates)
+        if confidence >= settings.DETECT_CONF
+    ]
+    if not eligible:
+        return None
+    best = max(eligible, key=lambda index: candidates[index][1])
+    class_id, confidence, bbox = candidates[best]
+    return class_id, confidence, bbox, candidates
 
 
 def _letterbox(crop: np.ndarray, size: int = _STATE_SIZE) -> np.ndarray:

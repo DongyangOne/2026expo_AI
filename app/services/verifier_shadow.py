@@ -26,9 +26,12 @@ def _run_and_log(
     yolo_class_id: int,
     yolo_confidence: float,
     client_id: str,
+    prediction: dict | None = None,
+    correction_applied: bool = False,
 ) -> None:
     try:
-        prediction = inference.run_verifier(session, img, bbox)
+        if prediction is None:
+            prediction = inference.run_verifier(session, img, bbox)
         if prediction is None:
             return
         material = prediction["material"]
@@ -45,7 +48,8 @@ def _run_and_log(
             },
             "verifier": prediction,
             "material_agreement": material["class_id"] == yolo_class_id,
-            "mode": "shadow",
+            "mode": "vinyl_correction" if correction_applied else "shadow",
+            "correction_applied": correction_applied,
         }
         log_path = Path(settings.VERIFIER_SHADOW_LOG_PATH)
         with _write_lock:
@@ -73,6 +77,35 @@ def submit(
         )
     except RuntimeError:
         logger.warning("종료 중이라 crop verifier shadow 작업을 생략합니다")
+
+
+def submit_precomputed(
+    session,
+    img: np.ndarray,
+    bbox: list[float],
+    yolo_class_id: int,
+    yolo_confidence: float,
+    client_id: str,
+    prediction: dict,
+    correction_applied: bool,
+) -> None:
+    """동기 교정 단계에서 이미 계산한 검증 결과를 중복 추론 없이 기록한다."""
+    if not settings.VERIFIER_SHADOW_ENABLED or session is None:
+        return
+    try:
+        _executor.submit(
+            _run_and_log,
+            session,
+            img,
+            bbox,
+            yolo_class_id,
+            yolo_confidence,
+            client_id,
+            prediction,
+            correction_applied,
+        )
+    except RuntimeError:
+        logger.warning("종료 중이라 crop 검증기 교정 로그를 생략합니다")
 
 
 def shutdown() -> None:

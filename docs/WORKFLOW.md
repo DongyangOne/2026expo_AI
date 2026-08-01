@@ -79,18 +79,20 @@
 
 ```
 1. 필수 `client_id` 수신 + 이미지 디코드
-2. 메인 YOLO 감지 (conf=DETECT_CONF 0.25)
-     └ 박스 없음 → NOT_DETECTED
+2. 메인 YOLO 감지 (최종 최소선=DETECT_CONF 0.25, 비닐 보조 후보 최소선=0.10)
+     └ 0.25 이상 박스 없음 → NOT_DETECTED
 3. 최고신뢰 박스 → 모델 class_id, confidence, bbox (PET은 외부 응답에서 PLASTIC으로 정규화)
-4. 신뢰도 판정
+4. 저신뢰 PET/PLASTIC이 같은 bbox의 VINYL 후보와 경쟁하면 crop 검증기 교차 확인
+     └ bbox IoU·후보 비율·검증기 신뢰도·신뢰도 차이를 모두 만족할 때만 VINYL로 교정
+5. 신뢰도 판정
      └ confidence < TRUST_CONF(0.55) → LOW_CONFIDENCE (일반쓰레기)
-5. [허용: 플라스틱(PET 포함)/캔/종이]
+6. [허용: 플라스틱(PET 포함)/캔/종이]
      ├ 상태 멀티헤드(crop ONNX) → conditions.is_dented / has_label / has_foreign_material(선택)
      ├ 무게 → weight.anomaly
      └ build_guidance() → 불충족 안내. 비면 ALLOWED, 있으면 REJECTED(재처리)
-6. [거부: 유리/건전지/형광등/스티로폼] → REJECTED + rejection
-7. [비닐] → 무게·외부 이물질 이상이면 REJECTED + guidance, 정상이면 ALLOWED(비닐함)
-8. `client_id`를 포함한 DetectResponse 조립 → 하드웨어 응답 + Spring 콜백(fire-and-forget)
+7. [거부: 유리/건전지/형광등/스티로폼] → REJECTED + rejection
+8. [비닐] → 무게·외부 이물질 이상이면 REJECTED + guidance, 정상이면 ALLOWED(비닐함)
+9. `client_id`를 포함한 DetectResponse 조립 → 하드웨어 응답 + Spring 콜백(fire-and-forget)
 ```
 
 **2단계 신뢰도 게이트:**
@@ -104,7 +106,7 @@
 | # | 모델 | 입력 | 출력 | 백본 | 포맷 | 상태 |
 |---|------|------|------|------|------|------|
 | 1 | 메인 감지 | 640px | 9클래스 bbox + 1차 품목 | YOLO26m epoch 40 | NCNN | 체크포인트 고정, Pi5 배포 기준선 |
-| 2 | crop 검증기 | 320px crop | material(9) + dent(2) + label(2) + foreign_material(2) | MobileNetV3-Small 기준선 | ONNX | 2천 teacher 임시 모델 학습 완료, shadow 적용 |
+| 2 | crop 검증기 | 320px crop | material(9) + dent(2) + label(2) + foreign_material(2) | MobileNetV3-Small 기준선 | ONNX | 기본 shadow, 저신뢰 PET/PLASTIC↔VINYL 교차 신호에만 제한적 교정 |
 
 > 최신 경량 후보 MobileNetV4 Conv Small과 RepViT는 동일 데이터로 학습한 뒤 Pi5의
 > 실제 ONNX 정확도·p50/p95 지연시간을 비교해 기준선보다 좋을 때만 교체한다.
@@ -185,7 +187,9 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 - 메인 모델: `MAIN_MODEL_PATH=weights/yolo26m_best_ncnn_model` (NCNN, ARM CPU 추론)
 - 상태 모델: `STATE_MODEL_PATH=weights/multihead.onnx` (ONNX Runtime)
 - 임시 검증기: `VERIFIER_MODEL_PATH=weights/verifier_qwen35_mnv3_v1.onnx`
-- shadow 로그: `VERIFIER_SHADOW_ENABLED=true`, `logs/verifier_shadow.jsonl`
+- 검증기 적용: 기본 shadow이며, `VINYL_CORRECTION_ENABLED=true`일 때 같은 bbox의
+  저신뢰 PET/PLASTIC·VINYL 경쟁 사례만 제한적으로 교정
+- shadow/교정 로그: `VERIFIER_SHADOW_ENABLED=true`, `logs/verifier_shadow.jsonl`
 - 실제 환경 파일: `/home/one/2026expo_AI/.env`
 - Spring 콜백: `SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
 - 결과 로그: `LOG_RESULTS=true`이면 `logs/results.jsonl`에 항상 기록

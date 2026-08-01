@@ -112,6 +112,12 @@ STATE_MODEL_PATH=weights/multihead.onnx
 VERIFIER_MODEL_PATH=weights/verifier_qwen35_mnv3_v1.onnx
 VERIFIER_SHADOW_ENABLED=true
 VERIFIER_SHADOW_LOG_PATH=logs/verifier_shadow.jsonl
+VINYL_CORRECTION_ENABLED=true
+VINYL_CANDIDATE_CONF=0.10
+VINYL_CANDIDATE_IOU=0.70
+VINYL_CANDIDATE_RATIO=0.40
+VINYL_VERIFIER_CONF=0.65
+VINYL_VERIFIER_MARGIN=0.25
 DETECT_CONF=0.25
 TRUST_CONF=0.55
 WEIGHT_ANOMALY_ENABLED=true
@@ -124,6 +130,10 @@ CAPTURE_DIR=logs/captures
 CAPTURE_RETENTION_DAYS=90
 CAPTURE_MAX_STORAGE_MB=10240
 ```
+
+저신뢰 PET/플라스틱 결과는 같은 bbox에 비닐 보조 후보가 있고 crop 검증기도 비닐을
+충분한 신뢰도와 차이로 지지할 때만 `vinyl(class_id=5)`로 교정한다. 고신뢰 YOLO
+결과나 비닐 보조 후보가 없는 투명 플라스틱 용기는 검증기 단독 판단으로 덮어쓰지 않는다.
 
 ### 결과 로그 (`logs/results.jsonl`)
 
