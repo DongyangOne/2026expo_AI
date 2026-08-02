@@ -16,6 +16,7 @@ CLASS_NAMES = [
     "vinyl", "glass", "battery", "fluorescent",
 ]
 TASK_NAMES = ("material", "dent", "label", "foreign_material")
+REPORT_NAMES = ("material", "material_external", "dent", "label", "foreign_material")
 MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -36,6 +37,11 @@ def _softmax_prediction(logits: np.ndarray) -> tuple[int, float]:
     probabilities /= probabilities.sum()
     predicted = int(probabilities.argmax())
     return predicted, float(probabilities[predicted])
+
+
+def external_material_id(class_id: int) -> int:
+    """외부 계약에서 PET(1)는 plastic(3)과 같은 투입 분기로 평가한다."""
+    return 3 if class_id == 1 else class_id
 
 
 def _preprocess(path: Path, size: int) -> np.ndarray:
@@ -139,6 +145,12 @@ def evaluate_model(model_path: Path, rows: list[dict], manifest_root: Path) -> d
             confidence_sum[task] / confidence_count[task]
             if confidence_count[task] else None
         )
+    metrics["material_external"] = classification_metrics(
+        [external_material_id(value) for value in labels["material"]],
+        [external_material_id(value) for value in guesses["material"]],
+        len(CLASS_NAMES),
+    )
+    metrics["material_external"]["mean_confidence"] = metrics["material"]["mean_confidence"]
     return {
         "model": str(model_path.resolve()),
         "input_size": input_size,
@@ -184,7 +196,7 @@ def main() -> None:
                 "macro_f1": report["metrics"][task]["macro_f1_present_classes"],
                 "support": report["metrics"][task]["support"],
             }
-            for task in TASK_NAMES
+            for task in REPORT_NAMES
         }
         for name, report in result["models"].items()
     }

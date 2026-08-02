@@ -232,12 +232,17 @@ def main():
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--init-checkpoint")
     parser.add_argument("--use-label-proxy", action="store_true")
     parser.add_argument("--label-proxy-weight", type=float, default=0.25)
     parser.add_argument("--material-weight", type=float, default=1.0)
     parser.add_argument("--dent-weight", type=float, default=0.5)
     parser.add_argument("--label-weight", type=float, default=0.5)
     parser.add_argument("--foreign-weight", type=float, default=1.0)
+    parser.add_argument("--selection-material-weight", type=float, default=1.0)
+    parser.add_argument("--selection-dent-weight", type=float, default=1.0)
+    parser.add_argument("--selection-label-weight", type=float, default=1.0)
+    parser.add_argument("--selection-foreign-weight", type=float, default=1.0)
     args = parser.parse_args()
     if args.oversample_repeats < 1:
         parser.error("--oversample-repeats must be positive")
@@ -293,7 +298,21 @@ def main():
         shuffle=False, num_workers=args.workers, pin_memory=True,
     )
 
-    model = CropVerifier(args.backbone, pretrained=True).to(device)
+    model = CropVerifier(args.backbone, pretrained=not bool(args.init_checkpoint))
+    if args.init_checkpoint:
+        initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        if initial.get("backbone") != args.backbone:
+            raise RuntimeError(
+                f"초기 체크포인트 backbone={initial.get('backbone')!r}, "
+                f"요청 backbone={args.backbone!r} 불일치"
+            )
+        if int(initial.get("input_size", args.size)) != args.size:
+            raise RuntimeError("초기 체크포인트 input_size가 요청 size와 다릅니다.")
+        if initial.get("classes", CLASS_NAMES) != CLASS_NAMES:
+            raise RuntimeError("초기 체크포인트 class 순서가 현재 계약과 다릅니다.")
+        model.load_state_dict(initial["state_dict"])
+        print(f"initial checkpoint={args.init_checkpoint}", flush=True)
+    model = model.to(device)
     weight_values = {
         "material": class_weights([row["material"] for row in train_rows], len(CLASS_NAMES)),
         "dent": class_weights([row["dent"] for row in train_rows], 2),
@@ -316,6 +335,16 @@ def main():
         task: weight if task in enabled_tasks else 0.0
         for task, weight in task_weights.items()
     }
+    selection_weights = {
+        "material": args.selection_material_weight,
+        "dent": args.selection_dent_weight,
+        "label": args.selection_label_weight,
+        "foreign_material": args.selection_foreign_weight,
+    }
+    if any(weight < 0 for weight in selection_weights.values()):
+        parser.error("selection weights must be non-negative")
+    if not any(selection_weights[task] > 0 for task in enabled_tasks):
+        parser.error("at least one enabled selection weight must be positive")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
@@ -330,10 +359,17 @@ def main():
             model, val_loader, criteria, task_weights, device,
         )
         scheduler.step()
-        available = [val_metrics[task] for task in enabled_tasks]
+        available = {
+            task: val_metrics[task]
+            for task in enabled_tasks
+            if val_metrics[task] is not None and selection_weights[task] > 0
+        }
         if not available:
             raise RuntimeError("train/validation에 완전한 정답을 가진 활성 task가 없습니다.")
-        score = sum(available) / len(available)
+        score_weight = sum(selection_weights[task] for task in available)
+        score = sum(
+            value * selection_weights[task] for task, value in available.items()
+        ) / score_weight
         print(
             f"[{epoch:02d}/{args.epochs}] loss={train_loss:.4f}/{val_loss:.4f} "
             f"train {_format_metrics(train_metrics)} | val {_format_metrics(val_metrics)}",
@@ -348,6 +384,9 @@ def main():
                     "backbone": args.backbone,
                     "input_size": args.size,
                     "classes": CLASS_NAMES,
+                    "epoch": epoch,
+                    "selection_score": score,
+                    "selection_weights": selection_weights,
                     "val_metrics": val_metrics,
                     "val_counts": val_counts,
                 },
@@ -385,6 +424,11 @@ def main():
         "training_label_counts": label_counts,
         "task_class_counts": task_class_counts,
         "uses_label_proxy": args.use_label_proxy,
+        "initial_checkpoint": args.init_checkpoint,
+        "best_epoch": checkpoint.get("epoch"),
+        "best_selection_score": checkpoint.get("selection_score"),
+        "best_val_metrics": checkpoint.get("val_metrics"),
+        "selection_weights": checkpoint.get("selection_weights", selection_weights),
         "warning": "Do not consume outputs absent from enabled_outputs.",
     }
     (output_dir / "verifier_metadata.json").write_text(

@@ -306,11 +306,12 @@ curl http://127.0.0.1:8000/health
 | 메인 YOLO26m NCNN | ✅ Pi5 배포 및 로드 정상 |
 | NAS 메인 학습 | ✅ epoch 40 체크포인트 보존 후 중지 (학습 프로세스 0) |
 | 상태 멀티헤드 ONNX | ✅ Pi5 배포 및 로드 정상 |
-| 9종 crop 검증기 | 🚧 임시 모델은 shadow 통합, 최종 선별 MobileNetV3 학습 중 |
+| 9종 crop 검증기 | ✅ v7 선별+하드웨어 보정 MobileNetV3/ONNX 완료, 배포 파일 교체 |
 | 최대 데이터 v4 추출 | ✅ 단일 객체 337,760장, 약 8.5GB 추출 완료 |
 | Qwen 상태 teacher 확장 | ✅ v7 50,000건 완료, 46,913건 수용(93.826%), 오류 46건(0.092%) |
 | 최종 선별 데이터 | ✅ 9종 90,274장 + 하드웨어 verifier 103장, audit 통과 |
-| 최종 검증기 학습 | 🚧 `train_verifier_curated_v7_mnv3_20260803`, 320px/50 epoch/patience 10 |
+| 최종 검증기 학습 | ✅ hard100 보정 20 epoch, best epoch 17, material val 0.95281 |
+| 하드웨어 verifier holdout | ✅ 외부 계약 정확도 42.86%→74.29%, macro-F1 0.598→0.679 |
 | `/api/v1/detect` + `client_id` 계약 | ✅ 구현·테스트·배포 완료 |
 | Spring 콜백 URL | ✅ AI 서버 환경 및 컨테이너 반영 완료 |
 | Spring 콜백 수신 테스트 | ⏳ Spring 측 엔드포인트 배포 후 확인 |
@@ -360,8 +361,9 @@ scripts/
   prepare_hardware_capture_dataset.py SHA 중복 제거 + YOLO negative/crop 상태 manifest 생성
   train_hardware_candidate.py 노트북 GPU용 보수적 하드웨어 적응 후보 학습
   evaluate_hardware_detector.py 고정 holdout의 운영 임계값별 후보 비교
-  evaluate_verifier.py    같은 crop holdout에서 기존/후보 ONNX의 4개 head 비교
-  train_verifier.py       9종+상태 멀티태스크 검증기 학습/하드웨어 train oversampling/ONNX export
+  evaluate_verifier.py    같은 crop holdout에서 기존/후보 ONNX와 PET 통합 외부 계약 비교
+  train_verifier.py       9종+상태 학습/하드웨어 oversampling/checkpoint 이어학습/가중 선택/ONNX export
+  nas/watch_evaluate_verifier.sh 학습 종료 후 고정 holdout 비교를 자동 실행
 
 requirements-training.txt NAS 학습의 ONNX export 및 최신 경량 백본 의존성
 

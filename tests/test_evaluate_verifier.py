@@ -1,6 +1,6 @@
 import pytest
 
-from scripts.evaluate_verifier import classification_metrics
+from scripts.evaluate_verifier import classification_metrics, external_material_id
 
 
 def test_classification_metrics_ignores_absent_classes_in_macro_f1():
@@ -18,3 +18,9 @@ def test_classification_metrics_handles_empty_labels():
 
     assert metrics["accuracy"] is None
     assert metrics["macro_f1_present_classes"] is None
+
+
+def test_external_material_contract_merges_pet_into_plastic():
+    assert external_material_id(1) == 3
+    assert external_material_id(3) == 3
+    assert external_material_id(5) == 5

@@ -60,11 +60,19 @@ Git에 이미지와 모델 파일은 넣지 않는다. 같은 노트북의 다�
 
 - v7은 2026-08-03 00:00:10 KST에 50,000건을 정상 완료했다.
 - 9종 균형 선별 manifest 90,274장에 hardware verifier 103장을 추가했다.
-- hardware training 행은 5배 oversampling하고 hardware validation 행은 한 번만
-  포함했다. 따라서 실제 촬영 분포를 더 학습하되 holdout 점수는 부풀리지 않는다.
-- 학습 컨테이너: `train_verifier_curated_v7_mnv3_20260803`
-- 최종 ONNX가 기존 검증기와 하드웨어 holdout 비교를 통과하기 전에는 Pi5 운영 모델을
-  교체하지 않는다.
+- 1차는 hardware training 행을 5배 oversampling했지만 전체 training의 0.45%에
+  불과해 material macro-F1 게이트를 통과하지 못했다.
+- 기존 9종 75,581장을 계속 replay하면서 hardware training 68장만 증강 포함 100배로
+  높여 20 epoch 저학습률 보정을 수행했다. hardware validation 35장은 학습에 넣지 않았다.
+- 최종 학습 컨테이너: `train_verifier_curated_v7_hard100_mnv3_20260803`
+- 최종 원본 validation: material `0.95281`, dent `0.88587`, label `0.88050`,
+  foreign_material `0.99708` (best epoch 17).
+- 하드웨어 holdout 내부 9종 정확도는 `31.43%` → `71.43%`, 외부 계약에서 PET를
+  plastic으로 합친 투입 분기 정확도는 `42.86%` → `74.29%`다.
+- label은 `31.58%` → `100%`, dent는 `92.31%` 유지했다. 외부 이물질 holdout은
+  음성만 35장이므로 양성 판정은 운영 활성화하지 않는다.
+- 게이트를 통과한 ONNX만 기존 추적 모델 경로에 반영하며 YOLO epoch 40과 Spring
+  콜백 JSON은 변경하지 않는다.
 
 ## YOLO 후보를 다시 학습할 때의 게이트
 

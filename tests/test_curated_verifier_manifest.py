@@ -5,7 +5,7 @@ import pytest
 
 from scripts.merge_pseudo_status_manifest import merge_manifests
 from scripts.select_curated_verifier_manifest import CLASS_NAMES, select_manifest
-from scripts.train_verifier import read_manifest
+from scripts.train_verifier import CLASS_NAMES as TRAIN_CLASS_NAMES, CropVerifier, read_manifest
 
 
 def _base_row(category: str, source_id: str, split: str = "training"):
@@ -129,3 +129,11 @@ def test_oversample_manifest_repeats_training_only(tmp_path):
     loaded = read_manifest([], False, 0.25, [str(manifest)], 4)
     assert sum(row["split"] == "training" for row in loaded) == 4
     assert sum(row["split"] == "validation" for row in loaded) == 1
+
+
+def test_crop_verifier_checkpoint_contract_is_stable():
+    model = CropVerifier("mobilenet_v3_small", pretrained=False)
+
+    assert TRAIN_CLASS_NAMES == list(CLASS_NAMES)
+    assert model.material_head[-1].out_features == 9
+    assert model.label_head[-1].out_features == 2

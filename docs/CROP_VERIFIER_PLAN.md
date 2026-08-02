@@ -307,20 +307,34 @@ MobileNetV4/RepViT 채택은 validation macro-F1, 오분류 혼동행렬, ONNX �
 - pseudo-label audit은 coverage `0.93826`, 최대 오류율 `0.01`, 두 상태 head의
   train/validation 양·음성 존재 조건을 모두 통과했다.
 
-#### 최종 선별 학습 (2026-08-03 시작)
+#### 최종 선별 학습 및 하드웨어 보정 (2026-08-03 완료)
 
 - 전체 데이터를 다시 무차별 학습하지 않고
   `manifest_curated_v7_balanced_20260803.csv` 90,274장을 사용한다. training은
   캔/PET/플라스틱/유리 각 10,000장, 종이 9,982장, 스티로폼 10,000장, 비닐
   9,995장, 건전지 3,225장, 형광등 2,379장이고 validation은 별도로 유지한다.
-- 실제 키오스크 crop 103장은 `hardware_capture_prep_20260803/dataset_v2`에서 합친다.
-  training 행만 5배 oversampling하고 validation은 한 번만 포함해 holdout 누수를 막는다.
-- 최종 학습 컨테이너는 `train_verifier_curated_v7_mnv3_20260803`, 출력은
-  `/share/Container/runs/verifier_curated_v7_mnv3_20260803`이다. MobileNetV3-Small,
-  320px, 최대 50 epoch, early stopping patience 10을 사용한다.
-- 첫 epoch은 material `0.658`, dent `0.776`, label `0.844`, foreign_material
-  `0.876` validation accuracy로 정상 완료했다. 학습 종료 후 ONNX와 메타데이터를
-  검사하고 Ollama 두 인스턴스를 자동 복구한다.
+- 실제 키오스크 crop 103장은 `hardware_capture_prep_20260803/dataset_v2`에서 합쳤다.
+  validation 35장은 항상 한 번만 유지하고 training 68장만 증강 oversampling한다.
+- 1차 `train_verifier_curated_v7_mnv3_20260803`은 18 epoch에서 조기 종료됐다. 하드웨어
+  material 정확도는 기존 `31.43%`에서 `51.43%`로 올랐지만 macro-F1이
+  `0.480`에서 `0.453`으로 내려가 전 품목 배포 게이트는 통과하지 못했다.
+- 원인은 5배 oversampling이 전체 75,921 training 행 중 340행(`0.45%`)에 불과해
+  영수증·납작한 트레이·흰 포장 스티로폼 같은 실기기 분포를 충분히 반영하지 못한 것이다.
+- 1차 최고 체크포인트에서 이어서 하드웨어 training만 100배로 높이고, 기존 9종
+  75,581장을 계속 replay한 `train_verifier_curated_v7_hard100_mnv3_20260803`을
+  20 epoch 학습했다. 학습률은 `3e-4`, material loss weight는 `2.0`, 체크포인트
+  선택 가중치는 material/dent/label/foreign=`4/1/2/1`이다.
+- 최종 최고는 epoch 17이며 원본 validation 정확도는 material `0.95281`, dent
+  `0.88587`, label `0.88050`, foreign_material `0.99708`이다.
+- 하드웨어 holdout 35장의 내부 9종 정확도는 배포 모델 `31.43%` → 최종 후보
+  `71.43%`, macro-F1은 `0.480` → `0.676`이다. 외부 계약에서 PET를 plastic으로
+  합치면 정확도 `42.86%` → `74.29%`, macro-F1 `0.598` → `0.679`다.
+- 하드웨어 label은 `31.58%` → `100%`, dent는 `92.31%` 유지, 외부 이물질 음성
+  오탐은 0건이다. 다만 하드웨어 외부 이물질 양성은 0장이므로 해당 출력의 운영
+  활성화 근거로 사용하지 않는다.
+- 최종 ONNX는 기존 추적 경로 `weights/verifier_qwen35_mnv3_v1.onnx`를 교체한다.
+  런타임은 기존처럼 shadow와 제한적 PET/plastic↔vinyl 교정만 사용하며 Spring JSON
+  계약은 바뀌지 않는다.
 - 고해상도 2TB 원본을 다시 읽는 YOLO 선별 생성은 NAS 부하가 커 현재 실행 경로에서
   제외했다. 필요하면 `select_curated_yolo_dataset.py`를 유휴 시간에 worker 2 이하로
   실행한다. 중간 생성물만 제거했으며 원본 데이터는 건드리지 않았다.
