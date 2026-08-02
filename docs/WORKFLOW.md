@@ -154,6 +154,12 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
        · 2차 대상은 tight/context 두 시야가 일치하고 확신도 0.90 이상일 때만 자동 수용
        · 라벨/진짜 이물질/같은 재질 부속품 허용 규칙을 독립 판정
   └→ scripts/audit_pseudo_status.py (처리 완료·일관성·헤드 분포 자동 검사)
+  └→ scripts/select_curated_verifier_manifest.py
+       · 품목별 최대 10,000 training / 2,000 validation 균형 선별
+       · 상태 네 조합을 round-robin해 validation 양·음성 보존
+  └→ scripts/prepare_hardware_capture_dataset.py
+       · 실제 키오스크 crop manifest 추가
+       · training만 5배 oversampling, validation은 정확히 한 번 유지
   └→ scripts/train_verifier.py
        · MobileNetV3-Small + material/dent/label/foreign_material 헤드
        · 미라벨 상태는 masked loss
@@ -292,7 +298,7 @@ curl http://127.0.0.1:8000/health
 
 ---
 
-## 10. 현재 운영 상태 (2026-08-01)
+## 10. 현재 운영 상태 (2026-08-03)
 
 | 단계 | 상태 |
 |------|------|
@@ -300,9 +306,11 @@ curl http://127.0.0.1:8000/health
 | 메인 YOLO26m NCNN | ✅ Pi5 배포 및 로드 정상 |
 | NAS 메인 학습 | ✅ epoch 40 체크포인트 보존 후 중지 (학습 프로세스 0) |
 | 상태 멀티헤드 ONNX | ✅ Pi5 배포 및 로드 정상 |
-| 9종 crop 검증기 | ✅ 임시 MobileNetV3 50 epoch/ONNX 완료, shadow 통합 |
-| 최대 데이터 v4 추출 | 🚧 단일 객체·품목당 최대 5만장, validation 최대 1만장 추출 중 |
-| Qwen 상태 teacher 확장 | 🚧 v7 실행 중, 20.55건/분(기존 대비 3.16배), 총 5만건 목표 |
+| 9종 crop 검증기 | 🚧 임시 모델은 shadow 통합, 최종 선별 MobileNetV3 학습 중 |
+| 최대 데이터 v4 추출 | ✅ 단일 객체 337,760장, 약 8.5GB 추출 완료 |
+| Qwen 상태 teacher 확장 | ✅ v7 50,000건 완료, 46,913건 수용(93.826%), 오류 46건(0.092%) |
+| 최종 선별 데이터 | ✅ 9종 90,274장 + 하드웨어 verifier 103장, audit 통과 |
+| 최종 검증기 학습 | 🚧 `train_verifier_curated_v7_mnv3_20260803`, 320px/50 epoch/patience 10 |
 | `/api/v1/detect` + `client_id` 계약 | ✅ 구현·테스트·배포 완료 |
 | Spring 콜백 URL | ✅ AI 서버 환경 및 컨테이너 반영 완료 |
 | Spring 콜백 수신 테스트 | ⏳ Spring 측 엔드포인트 배포 후 확인 |
@@ -345,11 +353,15 @@ scripts/
   extract_verifier_crops.py  9종 crop + 안전한 상태 manifest 생성
   audit_verifier_dataset.py  학습 전 9종·분할·파일·마스킹 무결성 검사
   audit_pseudo_status.py     자동 상태 라벨의 처리 완료·일관성·헤드 분포 검사
+  merge_pseudo_status_manifest.py 동일 표본끼리 pseudo-label을 안전하게 병합
+  select_curated_verifier_manifest.py 9종/상태 조합을 균형 선별한 최종 manifest 생성
+  select_curated_yolo_dataset.py 고해상도 원본 기반 선택 YOLO 데이터 생성(유휴 NAS용)
   import_reviewed_captures.py 운영 캡처의 선택 정답을 crop manifest로 변환(자동 학습 기본 경로에서는 미사용)
   prepare_hardware_capture_dataset.py SHA 중복 제거 + YOLO negative/crop 상태 manifest 생성
   train_hardware_candidate.py 노트북 GPU용 보수적 하드웨어 적응 후보 학습
   evaluate_hardware_detector.py 고정 holdout의 운영 임계값별 후보 비교
-  train_verifier.py       9종+상태 멀티태스크 검증기 학습/ONNX export
+  evaluate_verifier.py    같은 crop holdout에서 기존/후보 ONNX의 4개 head 비교
+  train_verifier.py       9종+상태 멀티태스크 검증기 학습/하드웨어 train oversampling/ONNX export
 
 requirements-training.txt NAS 학습의 ONNX export 및 최신 경량 백본 의존성
 

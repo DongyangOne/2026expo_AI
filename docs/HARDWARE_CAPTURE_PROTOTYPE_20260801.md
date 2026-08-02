@@ -4,8 +4,9 @@
 
 Pi5 운영 모델은 교체하지 않았다. 노트북 RTX 3080에서 만든 `freeze20` 후보가
 하드웨어 holdout 성능을 개선했지만 빈 장면 오검출은 줄이지 못했기 때문이다.
-이 후보와 정제 데이터는 NAS v7 teacher 종료 후 기존 9종 원본 데이터와 합치는
-hard sample로 사용한다.
+이 후보의 YOLO 가중치는 배포하지 않았고, 정제한 crop 데이터는 NAS v7 teacher 결과와
+결합한 최종 검증기의 hard sample로 사용한다. 기존 YOLO epoch 40은 bbox 검출기로
+계속 유지한다.
 
 ## 데이터 정제 결과
 
@@ -17,6 +18,9 @@ hard sample로 사용한다.
 - negative: 빈 장비, 사람, 장비 밖 물체 12장
 - PET는 내부 학습 class `pet=1`을 유지하며 외부 응답에서만 `plastic=3`으로 정규화한다.
 - 동일 실물의 연속 촬영본은 `object_group` 단위로 묶어 train/val 누수를 막았다.
+- `dataset_v2/verifier/hardware_manifest.csv`의 crop 경로는 manifest 위치 기준
+  `train/...`/`val/...`으로 기록한다. 기존 `verifier/verifier/...` 이중 경로
+  문제를 수정한 뒤 103장 모두 파일 존재 감사를 통과했다.
 
 ## 고정 holdout 비교
 
@@ -45,15 +49,27 @@ Git에 이미지와 모델 파일은 넣지 않는다. 같은 노트북의 다�
 - 원본 스냅샷: `runs/hardware_capture_prep_20260801/raw/captures`
 - SHA 고정 audit spec: `runs/hardware_capture_prep_20260801/audit_spec_v1.json`
 - 정제 데이터: `runs/hardware_capture_prep_20260801/dataset_v1`
+- 경로 수정 최종본: `runs/hardware_capture_prep_20260801/dataset_v2`
+- NAS 복사본: `/share/Container/hardware_capture_prep_20260803/dataset_v2`
 - baseline 지표: `runs/hardware_capture_prep_20260801/baseline_detector_metrics.json`
 - freeze20 지표: `runs/hardware_capture_prep_20260801/candidate_freeze20_metrics.json`
 - probe 회귀 비교: `runs/hardware_capture_prep_20260801/probe_regression.json`
 - freeze20 가중치: `runs/detect/runs/hardware_capture_prep_20260801/training/candidate_freeze20/weights/best.pt`
 
-## NAS v7 종료 후 합치는 순서
+## NAS v7 종료 후 적용 결과
+
+- v7은 2026-08-03 00:00:10 KST에 50,000건을 정상 완료했다.
+- 9종 균형 선별 manifest 90,274장에 hardware verifier 103장을 추가했다.
+- hardware training 행은 5배 oversampling하고 hardware validation 행은 한 번만
+  포함했다. 따라서 실제 촬영 분포를 더 학습하되 holdout 점수는 부풀리지 않는다.
+- 학습 컨테이너: `train_verifier_curated_v7_mnv3_20260803`
+- 최종 ONNX가 기존 검증기와 하드웨어 holdout 비교를 통과하기 전에는 Pi5 운영 모델을
+  교체하지 않는다.
+
+## YOLO 후보를 다시 학습할 때의 게이트
 
 1. 기존 9종 YOLO train/val을 그대로 보존한다.
-2. `dataset_v1/yolo`의 train hard sample을 기존 train에 추가하고, 하드웨어
+2. `dataset_v2/yolo`의 train hard sample을 기존 train에 추가하고, 하드웨어
    표본은 sampler 또는 복제로 3~5배 가중한다.
 3. 현재 hardware val 41장은 학습에 넣지 않고 별도 검증셋으로 유지한다.
 4. glass/battery/fluorescent가 없는 소규모 캡처만으로 최종 학습하지 않는다.

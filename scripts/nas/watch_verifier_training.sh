@@ -6,7 +6,7 @@ set -u
 DOCKER=/share/CACHEDEV1_DATA/.qpkg/container-station/bin/docker
 KERNEL_DIR=/share/CACHEDEV1_DATA/.qpkg/NvKernelDriver/kernel-open
 TRAIN_NAME=${1:?training container name is required}
-OLLAMA_NAME=${2:-naco-ollama}
+OLLAMA_NAMES=${2:-naco-ollama}
 OUTPUT_DIR=${3:-}
 
 echo "[watch] $(date '+%F %T') waiting for $TRAIN_NAME"
@@ -25,7 +25,7 @@ if [ "$EXIT_CODE" = "0" ] && [ -n "$OUTPUT_DIR" ]; then
   done
 fi
 
-echo "[watch] restoring QNAP GPU for $OLLAMA_NAME"
+echo "[watch] restoring QNAP GPU for $OLLAMA_NAMES"
 /sbin/gpuhal_app -r f >/dev/null 2>&1 || true
 i=0
 while ps | grep -q '[n]vidia-smi'; do
@@ -59,8 +59,17 @@ while ps | grep -q '[n]vidia-smi'; do
   sleep 1
 done
 
-$DOCKER start "$OLLAMA_NAME" >/dev/null 2>&1 || true
+OLD_IFS=$IFS
+IFS=,
+for OLLAMA_NAME in $OLLAMA_NAMES; do
+  $DOCKER start "$OLLAMA_NAME" >/dev/null 2>&1 || true
+done
+IFS=$OLD_IFS
 sleep 15
-$DOCKER ps -a --filter "name=$OLLAMA_NAME" --format '[watch] ollama={{.Status}}'
+IFS=,
+for OLLAMA_NAME in $OLLAMA_NAMES; do
+  $DOCKER ps -a --filter "name=$OLLAMA_NAME" --format '[watch] ollama={{.Names}} {{.Status}}'
+done
+IFS=$OLD_IFS
 echo "[watch] $(date '+%F %T') done training_exit=$EXIT_CODE"
 exit "$EXIT_CODE"

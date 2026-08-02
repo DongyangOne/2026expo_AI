@@ -1,4 +1,5 @@
 import json
+import csv
 from pathlib import Path
 
 import cv2
@@ -60,3 +61,10 @@ def test_prepare_dataset_deduplicates_sha_and_writes_negative_label(tmp_path):
     resolved = json.loads((output / "resolved_audit_by_sha.json").read_text(encoding="utf-8"))
     assert set(resolved) == {"sha-positive", "sha-negative"}
     assert resolved["sha-positive"]["source_image"].endswith("latest.jpg")
+
+    with (output / "verifier" / "hardware_manifest.csv").open(
+        encoding="utf-8", newline=""
+    ) as file:
+        verifier_rows = list(csv.DictReader(file))
+    assert verifier_rows[0]["filepath"].startswith("train/plastic/")
+    assert (output / "verifier" / verifier_rows[0]["filepath"]).is_file()

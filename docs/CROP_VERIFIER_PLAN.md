@@ -280,7 +280,7 @@ MobileNetV4/RepViT 채택은 validation macro-F1, 오분류 혼동행렬, ONNX �
   분포에서 바로 판정을 덮어쓰지 않고 YOLO/검증기 불일치 로그를 먼저 모아야 한다는
   근거다.
 
-### 최대 데이터 확장 작업 (2026-08-01 시작)
+### 최대 데이터 확장 및 v7 완료 (2026-08-03)
 
 - `extract_verifier_single_v4_max50k_20260801`: 다중 객체를 제외한 뒤 training은
   품목당 최대 50,000장, validation은 최대 10,000장으로 추출한다.
@@ -288,30 +288,50 @@ MobileNetV4/RepViT 채택은 validation macro-F1, 오분류 혼동행렬, ONNX �
   스티로폼 약 28,000장, 비닐 약 16,800장, 건전지 3,272장, 형광등 2,403장이다.
   부족한 두 품목은 중복 파일로 수량을 부풀리지 않고 전량 사용+학습 증강으로 보완한다.
 - `pseudo_teacher_qwen35_50k_v2_20260801`: 기존 2,000건을 이어받아 라벨/외부
-  이물질 자동 teacher를 총 50,000건까지 확장한다.
+  이물질 자동 teacher를 총 50,000건까지 확장했다.
 - `pseudo_teacher_qwen35_50k_adaptive_dual_v7_20260801`: 9B 모델 두 인스턴스를 RTX 2000
   Ada에 동시에 적재하고 worker를 각 서버에 고정한다. 384px tight 단일 이미지 1차와
   조건부 640px wider-context 단일 이미지 2차 합의로 기존 전 샘플 640px 2-pass 대비 처리 시간을
-  줄인다. JSONL은 매
-  샘플 flush하므로 전환 전 결과와 오류도 그대로 이어받는다.
+  줄였다. JSONL은 매 샘플 flush하므로 전환 전 결과와 오류도 그대로 이어받았다.
 
-#### v7 속도·리소스 실측 (2026-08-01 12:57 KST)
+#### v7 최종 결과
 
 - 모델 warm 이후 5.35분 동안 110건을 추가해 `20.55건/분`을 기록했다. 기존 9B
   순차 640px 2-pass의 약 `6.5건/분` 대비 `3.16배`다.
 - 110건 중 조건부 2차 판정은 38건(`34.5%`), 신규 오류는 0건이었다.
-- 측정 시 고유 누적 3,041건, 남은 46,959건이며 같은 속도 기준 예상 완료는
-  `2026-08-03 03:02 KST`다. 실제 완료 시각은 이미지 난이도별 2차 비율에 따라 변한다.
-- 두 Ollama 9B 인스턴스가 사용한 GPU 메모리는 `13,546/16,380MiB`, 측정 온도는
-  `82°C`였다. v7 teacher와 두 Ollama 컨테이너, v4 crop 추출 컨테이너가 모두 실행
-  상태임을 확인했다.
+- `pseudo_teacher_qwen35_50k_adaptive_dual_v7_20260801`은 2026-08-03 00:00:10 KST에
+  exit code 0으로 종료했다. 고유 50,000건 중 46,913건(`93.826%`)을 자동 수용했고,
+  teacher 오류는 46건(`0.092%`), 무효 행은 0건이다.
+- 50,000건은 계획한 상태 teacher 상한이다. 전체 manifest 162,305건 중 나머지
+  57,945개 상태 대상 행은 누락이 아니라 의도적으로 미처리 상태를 유지한다.
+- pseudo-label audit은 coverage `0.93826`, 최대 오류율 `0.01`, 두 상태 head의
+  train/validation 양·음성 존재 조건을 모두 통과했다.
+
+#### 최종 선별 학습 (2026-08-03 시작)
+
+- 전체 데이터를 다시 무차별 학습하지 않고
+  `manifest_curated_v7_balanced_20260803.csv` 90,274장을 사용한다. training은
+  캔/PET/플라스틱/유리 각 10,000장, 종이 9,982장, 스티로폼 10,000장, 비닐
+  9,995장, 건전지 3,225장, 형광등 2,379장이고 validation은 별도로 유지한다.
+- 실제 키오스크 crop 103장은 `hardware_capture_prep_20260803/dataset_v2`에서 합친다.
+  training 행만 5배 oversampling하고 validation은 한 번만 포함해 holdout 누수를 막는다.
+- 최종 학습 컨테이너는 `train_verifier_curated_v7_mnv3_20260803`, 출력은
+  `/share/Container/runs/verifier_curated_v7_mnv3_20260803`이다. MobileNetV3-Small,
+  320px, 최대 50 epoch, early stopping patience 10을 사용한다.
+- 첫 epoch은 material `0.658`, dent `0.776`, label `0.844`, foreign_material
+  `0.876` validation accuracy로 정상 완료했다. 학습 종료 후 ONNX와 메타데이터를
+  검사하고 Ollama 두 인스턴스를 자동 복구한다.
+- 고해상도 2TB 원본을 다시 읽는 YOLO 선별 생성은 NAS 부하가 커 현재 실행 경로에서
+  제외했다. 필요하면 `select_curated_yolo_dataset.py`를 유휴 시간에 worker 2 이하로
+  실행한다. 중간 생성물만 제거했으며 원본 데이터는 건드리지 않았다.
 
 ## 6. 단계별 적용 기준
 
 1. 1일차에는 소량 v3 crop과 Qwen teacher 50건으로 끝까지 흐르는 prototype을 만든다.
 2. tight/context 두 판정의 자동 합의율과 품목별 양성·음성 분포를 감사한다.
 3. 전체 v3 crop을 만들되 500GB 여유 공간과 20GB 출력 상한을 계속 적용한다.
-4. 수용된 pseudo-label로 `material`/`dent`/`label`/`foreign_material`을 학습한다.
+4. 수용된 pseudo-label의 품목별 균형 표본과 하드웨어 hard sample로
+   `material`/`dent`/`label`/`foreign_material`을 학습한다.
 5. 실제 키오스크 캡처로 9종 혼동행렬과 YOLO/검증기 불일치율을 측정한다.
 6. shadow mode의 고신뢰 오탐·미탐 후보를 자동 재분류해 주기적으로 개선한다.
 7. 두 상태 헤드가 별도 검증셋 기준을 통과하면 런타임에서 활성화한다.

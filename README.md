@@ -210,8 +210,13 @@ JSONL에는 기존 `decision`/`has_removable_label`/`has_true_foreign_material` 
 Ollama는 연속 이미지 prompt cache를 지원하는 `0.32.0`과 인스턴스당 8K context를
 사용한다. Qwen3.5는 한 Ollama 서버의 parallel slot을 지원하지 않아 두 독립 서버에
 worker를 하나씩 고정하며, 모델 파일은 중복 저장하지 않는다.
-최종 v7의 5.35분 warm 실측은 20.55건/분으로 기존 순차 실행 대비 3.16배였으며,
-장기 작업은 `pseudo_teacher_qwen35_50k_adaptive_dual_v7_20260801`에서 계속된다.
+최종 v7은 2026-08-03 00:00 KST에 50,000건을 모두 처리했다. 자동 수용은
+46,913건(93.826%), teacher 오류는 46건(0.092%), 무효 행은 0건이다. 이 결과에서
+9종을 품목별 최대 10,000장으로 균형 선별한 90,274장과 실제 하드웨어 crop 103장을
+결합해 최종 MobileNetV3-Small 검증기를 학습한다. 하드웨어 training 행만 5배
+oversampling하고 validation 행은 한 번만 평가한다. 기존 YOLO epoch 40은 bbox 검출기로
+계속 유지하며, 새 검증기는 고정 holdout을 통과하기 전까지 운영 판정과 Spring 콜백을
+바꾸지 않는다.
 
 ---
 

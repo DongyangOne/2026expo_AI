@@ -297,8 +297,11 @@ def prepare_dataset(
             left, top = max(0, int(x1 - padding_x)), max(0, int(y1 - padding_y))
             right, bottom = min(width, int(x2 + padding_x)), min(height, int(y2 + padding_y))
             crop = letterbox(image[top:bottom, left:right], crop_size)
-            relative_crop = Path("verifier") / audit["split"] / label / f"capture_{row['sha256'][:16]}.jpg"
-            _write_image(output_dir / relative_crop, crop)
+            # manifest는 output_dir/verifier 안에 있으므로 filepath도 그 위치를
+            # 기준으로 기록한다. verifier/... 를 다시 붙이면 학습기가
+            # verifier/verifier/... 를 찾게 된다.
+            relative_crop = Path(audit["split"]) / label / f"capture_{row['sha256'][:16]}.jpg"
+            _write_image(output_dir / "verifier" / relative_crop, crop)
             verifier_rows.append(
                 {
                     "filepath": relative_crop.as_posix(),

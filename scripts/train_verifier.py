@@ -30,9 +30,17 @@ TASK_NAMES = ("material", "dent", "label", "foreign_material")
 TASK_CLASSES = {"material": set(range(9)), "dent": {0, 1}, "label": {0, 1}, "foreign_material": {0, 1}}
 
 
-def read_manifest(paths: list[str], use_label_proxy: bool, proxy_weight: float):
+def read_manifest(
+    paths: list[str],
+    use_label_proxy: bool,
+    proxy_weight: float,
+    oversample_paths: list[str] | None = None,
+    oversample_repeats: int = 1,
+):
     rows = []
-    for manifest_path in paths:
+    sources = [(path, 1) for path in paths]
+    sources.extend((path, oversample_repeats) for path in (oversample_paths or []))
+    for manifest_path, training_repeats in sources:
         root = Path(manifest_path).parent
         with open(manifest_path, encoding="utf-8") as file:
             for row in csv.DictReader(file):
@@ -41,17 +49,17 @@ def read_manifest(paths: list[str], use_label_proxy: bool, proxy_weight: float):
                 if label < 0 and use_label_proxy:
                     label = int(row.get("label_proxy", -1))
                     label_weight = proxy_weight if label >= 0 else 1.0
-                rows.append(
-                    {
-                        "path": str(root / row["filepath"]),
-                        "split": row["split"].lower(),
-                        "material": int(row["material"]),
-                        "dent": int(row.get("dent", -1)),
-                        "label": label,
-                        "foreign_material": int(row.get("foreign_material", -1)),
-                        "label_weight": label_weight,
-                    }
-                )
+                parsed = {
+                    "path": str(root / row["filepath"]),
+                    "split": row["split"].lower(),
+                    "material": int(row["material"]),
+                    "dent": int(row.get("dent", -1)),
+                    "label": label,
+                    "foreign_material": int(row.get("foreign_material", -1)),
+                    "label_weight": label_weight,
+                }
+                repeats = training_repeats if parsed["split"] == "training" else 1
+                rows.extend(dict(parsed) for _ in range(repeats))
     return rows
 
 
@@ -211,6 +219,11 @@ def export_onnx(model, path: Path, size: int):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", action="append", required=True)
+    parser.add_argument(
+        "--oversample-manifest", action="append", default=[],
+        help="validation은 한 번, training 행만 --oversample-repeats만큼 추가합니다.",
+    )
+    parser.add_argument("--oversample-repeats", type=int, default=5)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--backbone", default="mobilenet_v3_small")
     parser.add_argument("--size", type=int, default=320)
@@ -226,10 +239,18 @@ def main():
     parser.add_argument("--label-weight", type=float, default=0.5)
     parser.add_argument("--foreign-weight", type=float, default=1.0)
     args = parser.parse_args()
+    if args.oversample_repeats < 1:
+        parser.error("--oversample-repeats must be positive")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows = read_manifest(args.manifest, args.use_label_proxy, args.label_proxy_weight)
+    rows = read_manifest(
+        args.manifest,
+        args.use_label_proxy,
+        args.label_proxy_weight,
+        args.oversample_manifest,
+        args.oversample_repeats,
+    )
     train_rows = [row for row in rows if row["split"] == "training"]
     val_rows = [row for row in rows if row["split"] == "validation"]
     if not train_rows or not val_rows:
