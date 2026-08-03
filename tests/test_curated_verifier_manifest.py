@@ -4,8 +4,14 @@ from pathlib import Path
 import pytest
 
 from scripts.merge_pseudo_status_manifest import merge_manifests
+from scripts.mine_focus_verifier_manifest import eligible, select_scored
 from scripts.select_curated_verifier_manifest import CLASS_NAMES, select_manifest
-from scripts.train_verifier import CLASS_NAMES as TRAIN_CLASS_NAMES, CropVerifier, read_manifest
+from scripts.train_verifier import (
+    CLASS_NAMES as TRAIN_CLASS_NAMES,
+    CropVerifier,
+    _parse_oversample_spec,
+    read_manifest,
+)
 
 
 def _base_row(category: str, source_id: str, split: str = "training"):
@@ -129,6 +135,34 @@ def test_oversample_manifest_repeats_training_only(tmp_path):
     loaded = read_manifest([], False, 0.25, [str(manifest)], 4)
     assert sum(row["split"] == "training" for row in loaded) == 4
     assert sum(row["split"] == "validation" for row in loaded) == 1
+
+
+def test_per_manifest_oversample_specs_use_independent_repeat_counts(tmp_path):
+    first = tmp_path / "paper.csv"
+    second = tmp_path / "hardware.csv"
+    _write(first, [_base_row("paper", "paper-train")])
+    _write(second, [_base_row("styrofoam", "foam-train")])
+
+    loaded = read_manifest(
+        [], False, 0.25, oversample_specs=[(str(first), 3), (str(second), 7)],
+    )
+    assert sum(row["material"] == CLASS_NAMES.index("paper") for row in loaded) == 3
+    assert sum(row["material"] == CLASS_NAMES.index("styrofoam") for row in loaded) == 7
+    assert _parse_oversample_spec("focus.csv=12") == ("focus.csv", 12)
+
+
+def test_focus_selection_keeps_clean_single_items_and_prioritizes_hard_rows():
+    clean = _base_row("paper", "hard")
+    clean.update({"_misclassified": "1", "_truth_confidence": "0.05"})
+    easy = _base_row("paper", "easy")
+    easy.update({"_misclassified": "0", "_truth_confidence": "0.99"})
+    dirty = _base_row("paper", "dirty")
+    dirty["raw_dirtiness"] = "이물질(외부)"
+
+    assert eligible(clean, {"paper"}, 4_000, 0.08, 0.90, True)
+    assert not eligible(dirty, {"paper"}, 4_000, 0.08, 0.90, True)
+    selected = select_scored([easy, clean], ["paper"], 1, 7)
+    assert [row["source_id"] for row in selected] == ["hard"]
 
 
 def test_crop_verifier_checkpoint_contract_is_stable():

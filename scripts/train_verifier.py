@@ -36,10 +36,12 @@ def read_manifest(
     proxy_weight: float,
     oversample_paths: list[str] | None = None,
     oversample_repeats: int = 1,
+    oversample_specs: list[tuple[str, int]] | None = None,
 ):
     rows = []
     sources = [(path, 1) for path in paths]
     sources.extend((path, oversample_repeats) for path in (oversample_paths or []))
+    sources.extend(oversample_specs or [])
     for manifest_path, training_repeats in sources:
         root = Path(manifest_path).parent
         with open(manifest_path, encoding="utf-8") as file:
@@ -162,6 +164,8 @@ def run_epoch(model, loader, criteria, task_weights, device, optimizer=None):
     total_loss = 0.0
     correct = {name: 0 for name in TASK_NAMES}
     counts = {name: 0 for name in TASK_NAMES}
+    material_correct = [0] * len(CLASS_NAMES)
+    material_counts = [0] * len(CLASS_NAMES)
 
     for image, material, dent, label, foreign, label_weight in loader:
         image = image.to(device)
@@ -169,6 +173,23 @@ def run_epoch(model, loader, criteria, task_weights, device, optimizer=None):
         label_weight = label_weight.to(device=device, dtype=torch.float32)
         with torch.set_grad_enabled(training):
             outputs = model(image)
+            material_mask = targets[0] >= 0
+            if material_mask.any():
+                material_truth = targets[0][material_mask]
+                material_guess = outputs[0][material_mask].argmax(1)
+                batch_counts = torch.bincount(
+                    material_truth, minlength=len(CLASS_NAMES),
+                ).detach().cpu().tolist()
+                batch_correct = torch.bincount(
+                    material_truth[material_guess == material_truth],
+                    minlength=len(CLASS_NAMES),
+                ).detach().cpu().tolist()
+                material_counts = [
+                    total + value for total, value in zip(material_counts, batch_counts)
+                ]
+                material_correct = [
+                    total + value for total, value in zip(material_correct, batch_correct)
+                ]
             loss = None
             for index, task in enumerate(TASK_NAMES):
                 sample_weight = label_weight if task == "label" else None
@@ -191,7 +212,27 @@ def run_epoch(model, loader, criteria, task_weights, device, optimizer=None):
         task: (correct[task] / counts[task] if counts[task] else None)
         for task in TASK_NAMES
     }
-    return total_loss / max(1, len(loader)), accuracy, counts
+    material_class_accuracy = {
+        CLASS_NAMES[index]: (
+            material_correct[index] / material_counts[index]
+            if material_counts[index] else None
+        )
+        for index in range(len(CLASS_NAMES))
+    }
+    return total_loss / max(1, len(loader)), accuracy, counts, material_class_accuracy
+
+
+def _parse_oversample_spec(value: str) -> tuple[str, int]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("--oversample-spec은 PATH=REPEATS 형식이어야 합니다.")
+    path, raw_repeats = value.rsplit("=", 1)
+    try:
+        repeats = int(raw_repeats)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("REPEATS는 정수여야 합니다.") from exc
+    if not path.strip() or repeats < 1:
+        raise argparse.ArgumentTypeError("PATH는 비어 있지 않고 REPEATS는 양수여야 합니다.")
+    return path.strip(), repeats
 
 
 def _format_metrics(metrics):
@@ -224,6 +265,11 @@ def main():
         help="validation은 한 번, training 행만 --oversample-repeats만큼 추가합니다.",
     )
     parser.add_argument("--oversample-repeats", type=int, default=5)
+    parser.add_argument(
+        "--oversample-spec", action="append", default=[], type=_parse_oversample_spec,
+        metavar="PATH=REPEATS",
+        help="manifest마다 서로 다른 training 반복 수를 지정합니다.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--backbone", default="mobilenet_v3_small")
     parser.add_argument("--size", type=int, default=320)
@@ -233,6 +279,10 @@ def main():
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--init-checkpoint")
+    parser.add_argument(
+        "--camera-augmentation", action="store_true",
+        help="하드웨어 카메라의 원근·약한 초점 흐림을 모사합니다.",
+    )
     parser.add_argument("--use-label-proxy", action="store_true")
     parser.add_argument("--label-proxy-weight", type=float, default=0.25)
     parser.add_argument("--material-weight", type=float, default=1.0)
@@ -243,6 +293,11 @@ def main():
     parser.add_argument("--selection-dent-weight", type=float, default=1.0)
     parser.add_argument("--selection-label-weight", type=float, default=1.0)
     parser.add_argument("--selection-foreign-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--selection-material-target", action="append", default=[], choices=CLASS_NAMES,
+        help="체크포인트 선택에서 별도 평균 재현율을 계산할 품목입니다.",
+    )
+    parser.add_argument("--selection-material-target-weight", type=float, default=0.0)
     args = parser.parse_args()
     if args.oversample_repeats < 1:
         parser.error("--oversample-repeats must be positive")
@@ -255,6 +310,7 @@ def main():
         args.label_proxy_weight,
         args.oversample_manifest,
         args.oversample_repeats,
+        args.oversample_spec,
     )
     train_rows = [row for row in rows if row["split"] == "training"]
     val_rows = [row for row in rows if row["split"] == "validation"]
@@ -271,17 +327,25 @@ def main():
     print(f"labeled counts={label_counts}", flush=True)
     print(f"enabled tasks={enabled_tasks}", flush=True)
 
-    train_transform = transforms.Compose(
-        [
-            transforms.Resize((args.size, args.size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomAffine(degrees=10, translate=(0.04, 0.04), scale=(0.92, 1.08)),
-            transforms.ColorJitter(0.2, 0.2, 0.2, 0.04),
-            transforms.ToTensor(),
-            transforms.RandomErasing(p=0.1, scale=(0.01, 0.05)),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ]
-    )
+    train_steps = [
+        transforms.Resize((args.size, args.size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomAffine(degrees=10, translate=(0.04, 0.04), scale=(0.92, 1.08)),
+    ]
+    if args.camera_augmentation:
+        train_steps.extend([
+            transforms.RandomPerspective(distortion_scale=0.20, p=0.25),
+            transforms.RandomApply(
+                [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.15,
+            ),
+        ])
+    train_steps.extend([
+        transforms.ColorJitter(0.2, 0.2, 0.2, 0.04),
+        transforms.ToTensor(),
+        transforms.RandomErasing(p=0.1, scale=(0.01, 0.05)),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    train_transform = transforms.Compose(train_steps)
     val_transform = transforms.Compose(
         [
             transforms.Resize((args.size, args.size)),
@@ -340,10 +404,15 @@ def main():
         "dent": args.selection_dent_weight,
         "label": args.selection_label_weight,
         "foreign_material": args.selection_foreign_weight,
+        "material_target": args.selection_material_target_weight,
     }
     if any(weight < 0 for weight in selection_weights.values()):
         parser.error("selection weights must be non-negative")
-    if not any(selection_weights[task] > 0 for task in enabled_tasks):
+    if args.selection_material_target_weight > 0 and not args.selection_material_target:
+        parser.error("target weight 사용 시 --selection-material-target이 필요합니다.")
+    if not any(selection_weights[task] > 0 for task in enabled_tasks) and not (
+        args.selection_material_target and args.selection_material_target_weight > 0
+    ):
         parser.error("at least one enabled selection weight must be positive")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
@@ -352,10 +421,10 @@ def main():
     best_score = -1.0
     no_improve = 0
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_metrics, _ = run_epoch(
+        train_loss, train_metrics, _, train_material_classes = run_epoch(
             model, train_loader, criteria, task_weights, device, optimizer,
         )
-        val_loss, val_metrics, val_counts = run_epoch(
+        val_loss, val_metrics, val_counts, val_material_classes = run_epoch(
             model, val_loader, criteria, task_weights, device,
         )
         scheduler.step()
@@ -364,6 +433,13 @@ def main():
             for task in enabled_tasks
             if val_metrics[task] is not None and selection_weights[task] > 0
         }
+        target_values = [
+            val_material_classes[name]
+            for name in args.selection_material_target
+            if val_material_classes[name] is not None
+        ]
+        if target_values and args.selection_material_target_weight > 0:
+            available["material_target"] = sum(target_values) / len(target_values)
         if not available:
             raise RuntimeError("train/validation에 완전한 정답을 가진 활성 task가 없습니다.")
         score_weight = sum(selection_weights[task] for task in available)
@@ -372,7 +448,15 @@ def main():
         ) / score_weight
         print(
             f"[{epoch:02d}/{args.epochs}] loss={train_loss:.4f}/{val_loss:.4f} "
-            f"train {_format_metrics(train_metrics)} | val {_format_metrics(val_metrics)}",
+            f"train {_format_metrics(train_metrics)} | val {_format_metrics(val_metrics)}"
+            + (
+                " | target " + " ".join(
+                    f"{name}={val_material_classes[name]:.3f}"
+                    for name in args.selection_material_target
+                    if val_material_classes[name] is not None
+                )
+                if args.selection_material_target else ""
+            ),
             flush=True,
         )
         if score > best_score:
@@ -389,6 +473,8 @@ def main():
                     "selection_weights": selection_weights,
                     "val_metrics": val_metrics,
                     "val_counts": val_counts,
+                    "val_material_class_accuracy": val_material_classes,
+                    "selection_material_targets": args.selection_material_target,
                 },
                 checkpoint_path,
             )
@@ -425,10 +511,15 @@ def main():
         "task_class_counts": task_class_counts,
         "uses_label_proxy": args.use_label_proxy,
         "initial_checkpoint": args.init_checkpoint,
+        "camera_augmentation": args.camera_augmentation,
         "best_epoch": checkpoint.get("epoch"),
         "best_selection_score": checkpoint.get("selection_score"),
         "best_val_metrics": checkpoint.get("val_metrics"),
+        "best_val_material_class_accuracy": checkpoint.get("val_material_class_accuracy"),
         "selection_weights": checkpoint.get("selection_weights", selection_weights),
+        "selection_material_targets": checkpoint.get(
+            "selection_material_targets", args.selection_material_target,
+        ),
         "warning": "Do not consume outputs absent from enabled_outputs.",
     }
     (output_dir / "verifier_metadata.json").write_text(
