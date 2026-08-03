@@ -30,7 +30,7 @@
 ```
 
 - `client_id`는 1~128자의 필수 문자열이며 AI 서버에서 생성하거나 변경하지 않는다.
-- Spring 콜백 URL: `https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
+- Spring 콜백 URL: `https://oneexpo.kro.kr/api/v1/feedback-detail/result`
 
 ---
 
@@ -197,7 +197,7 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
   저신뢰 PET/PLASTIC·VINYL 경쟁 사례만 제한적으로 교정
 - shadow/교정 로그: `VERIFIER_SHADOW_ENABLED=true`, `logs/verifier_shadow.jsonl`
 - 실제 환경 파일: `/home/one/2026expo_AI/.env`
-- Spring 콜백: `SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
+- Spring 콜백: `SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result`
 - 결과 로그: `LOG_RESULTS=true`이면 `logs/results.jsonl`에 항상 기록
 - 콜백 결과 로그: `logs/callbacks.jsonl`에 성공/재시도/최종 실패와 HTTP 상태 기록
 - 재학습 캡처: `CAPTURE_REQUESTS=true`이면 `logs/captures/YYYY-MM-DD/`에 원본 이미지와 판정 JSON 쌍 저장

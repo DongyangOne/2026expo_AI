@@ -99,7 +99,7 @@ curl -X POST http://localhost:8000/api/v1/detect \
 타임아웃·연결 오류·HTTP 408/425/429/5xx는 지수 백오프로 최대 3회 재시도하며,
 HTTP 4xx 계약 오류는 중복 요청을 피하기 위해 재시도하지 않는다.
 
-콜백 URL: `https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
+콜백 URL: `https://oneexpo.kro.kr/api/v1/feedback-detail/result`
 
 ---
 
@@ -107,7 +107,7 @@ HTTP 4xx 계약 오류는 중복 요청을 피하기 위해 재시도하지 않�
 
 ```env
 API_KEY=인증키
-SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results
+SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result
 SPRING_TIMEOUT_SEC=3.0
 SPRING_MAX_ATTEMPTS=3
 SPRING_RETRY_BACKOFF_SEC=0.5

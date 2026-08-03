@@ -34,7 +34,7 @@ def test_notify_forwards_client_id_unchanged(monkeypatch):
     monkeypatch.setattr(
         spring_client.settings,
         "SPRING_CALLBACK_URL",
-        "https://oneexpo.kro.kr/api/v1/feedbackDetail/results",
+        "https://oneexpo.kro.kr/api/v1/feedback-detail/result",
     )
     monkeypatch.setattr(spring_client.httpx, "AsyncClient", FakeClient)
 
@@ -45,7 +45,7 @@ def test_notify_forwards_client_id_unchanged(monkeypatch):
     asyncio.run(spring_client.notify(result))
 
     assert captured["json"]["client_id"] == "hardware-user-001"
-    assert captured["url"] == "https://oneexpo.kro.kr/api/v1/feedbackDetail/results"
+    assert captured["url"] == "https://oneexpo.kro.kr/api/v1/feedback-detail/result"
 
 
 def test_notify_retries_transient_server_errors(monkeypatch):
@@ -80,7 +80,7 @@ def test_notify_retries_transient_server_errors(monkeypatch):
     monkeypatch.setattr(
         spring_client.settings,
         "SPRING_CALLBACK_URL",
-        "https://oneexpo.kro.kr/api/v1/feedbackDetail/results",
+        "https://oneexpo.kro.kr/api/v1/feedback-detail/result",
     )
     monkeypatch.setattr(spring_client.settings, "SPRING_MAX_ATTEMPTS", 3)
     monkeypatch.setattr(spring_client.settings, "SPRING_RETRY_BACKOFF_SEC", 0.5)
@@ -120,7 +120,7 @@ def test_notify_does_not_retry_contract_errors(monkeypatch):
     monkeypatch.setattr(
         spring_client.settings,
         "SPRING_CALLBACK_URL",
-        "https://oneexpo.kro.kr/api/v1/feedbackDetail/results",
+        "https://oneexpo.kro.kr/api/v1/feedback-detail/result",
     )
     monkeypatch.setattr(spring_client.settings, "SPRING_MAX_ATTEMPTS", 3)
     monkeypatch.setattr(spring_client.httpx, "AsyncClient", FakeClient)
