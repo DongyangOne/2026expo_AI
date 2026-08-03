@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # None 이면 콜백 비활성 (Spring URL 미설정 시)
     SPRING_CALLBACK_URL: str | None = None
     SPRING_TIMEOUT_SEC: float = 3.0
+    # 순간적인 타임아웃/연결 오류/5xx 응답만 재시도한다. 4xx는 계약 오류이므로 즉시 종료한다.
+    SPRING_MAX_ATTEMPTS: int = 3
+    SPRING_RETRY_BACKOFF_SEC: float = 0.5
 
     # ── 결과 로깅 ────────────────────────────────────────────────────────────────
     # True: 판정 결과를 logs/results.jsonl 에 항상 기록 (Spring URL 없어도 동작)

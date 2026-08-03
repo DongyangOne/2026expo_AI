@@ -96,6 +96,8 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 하드웨어 응답 직후 백그라운드로 Spring 서버에 `client_id`를 포함한 동일한 JSON을 POST한다.
 `.env`의 `SPRING_CALLBACK_URL` 미설정 시 전송하지 않는다.
+타임아웃·연결 오류·HTTP 408/425/429/5xx는 지수 백오프로 최대 3회 재시도하며,
+HTTP 4xx 계약 오류는 중복 요청을 피하기 위해 재시도하지 않는다.
 
 콜백 URL: `https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
 
@@ -106,6 +108,9 @@ curl -X POST http://localhost:8000/api/v1/detect \
 ```env
 API_KEY=인증키
 SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results
+SPRING_TIMEOUT_SEC=3.0
+SPRING_MAX_ATTEMPTS=3
+SPRING_RETRY_BACKOFF_SEC=0.5
 # 선택
 MAIN_MODEL_PATH=weights/yolo26m_best_ncnn_model
 STATE_MODEL_PATH=weights/multihead.onnx
@@ -143,6 +148,10 @@ CAPTURE_MAX_STORAGE_MB=10240
 ```jsonl
 {"timestamp":"2026-07-03T10:00:00+00:00","client_id":"hardware-user-001","status":"ALLOWED","classification":{"class_id":3,"class_name":"plastic",...},...}
 ```
+
+Spring 전송 결과는 `logs/callbacks.jsonl`에 `client_id`, 시도 횟수, HTTP 상태와 함께
+`delivered`/`retry`/`failed`로 기록한다. 따라서 AI 판정 성공과 Spring 수신 성공을
+별도로 확인할 수 있다.
 
 ### 요청 이미지와 판정 캡처 (`logs/captures/`)
 

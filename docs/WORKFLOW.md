@@ -199,9 +199,11 @@ AI Hub 원본 JSON+이미지 (2TB, 직접촬영)
 - 실제 환경 파일: `/home/one/2026expo_AI/.env`
 - Spring 콜백: `SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedbackDetail/results`
 - 결과 로그: `LOG_RESULTS=true`이면 `logs/results.jsonl`에 항상 기록
+- 콜백 결과 로그: `logs/callbacks.jsonl`에 성공/재시도/최종 실패와 HTTP 상태 기록
 - 재학습 캡처: `CAPTURE_REQUESTS=true`이면 `logs/captures/YYYY-MM-DD/`에 원본 이미지와 판정 JSON 쌍 저장
 - 로그 영속화: Docker Compose의 `./logs:/app/logs` 볼륨 사용
-- 콜백은 fire-and-forget 방식이며 연결 실패·타임아웃이 AI 응답에 영향을 주지 않는다.
+- 콜백은 fire-and-forget 방식이며 연결 실패·타임아웃·재시도가 AI 응답에 영향을 주지 않는다.
+- 타임아웃·연결 오류·HTTP 408/425/429/5xx만 최대 3회 재시도하고 HTTP 4xx는 즉시 실패 처리한다.
 
 ### 오인식 개선 루프
 

@@ -67,8 +67,6 @@ async def detect(
             detail={"code": "INFERENCE_ERROR", "message": "추론 중 오류가 발생했습니다."},
         )
 
-    background_tasks.add_task(spring_client.notify, result)
-
     if settings.CAPTURE_REQUESTS:
         try:
             # 파이프라인에서 소비한 UploadFile을 되감아 원본 바이트를 보존한다.
@@ -87,5 +85,9 @@ async def detect(
         except Exception:
             # 캡처는 보조 기능이므로 실패해도 추론 응답은 정상 반환한다.
             logger.exception("요청 이미지 캡처 준비 실패")
+
+    # BackgroundTasks는 등록 순서대로 실행한다. 재학습 근거를 먼저 로컬에 보존한 뒤
+    # Spring 콜백을 전송해 순간적인 네트워크 장애가 있어도 요청/판정 원본은 남긴다.
+    background_tasks.add_task(spring_client.notify, result)
 
     return result
