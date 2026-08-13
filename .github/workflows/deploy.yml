@@ -25,5 +25,35 @@ jobs:
       - name: pytest
         run: pytest tests/ -v
 
-  # Pi5 배포는 서버의 ai-autodeploy.timer가 main을 5분마다 확인해 수행한다.
-  # GitHub self-hosted runner는 설치되어 있지 않으므로 CI에서는 테스트만 실행한다.
+  # main 테스트가 성공한 경우에만 GitHub 호스팅 러너가 Tailscale로 Pi5에 접속한다.
+  deploy:
+    name: Pi5 배포
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Tailscale 연결
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          ping: 100.121.110.75
+
+      - name: Pi5 자동 배포 스크립트 실행
+        env:
+          SSHPASS: ${{ secrets.PI_SSH_PASSWORD }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+          mkdir -p ~/.ssh
+          printf '%s\n' '100.121.110.75 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMeeiCP3aeMpcIc2+5Es0+j6uY16f5/1PFc/7Ve2PI25' > ~/.ssh/known_hosts
+          sshpass -e ssh -o StrictHostKeyChecking=yes one@100.121.110.75 \
+            'bash /home/one/auto-deploy.sh'
+
+      - name: 운영 헬스 확인
+        run: |
+          curl --fail --silent --show-error \
+            --retry 12 --retry-delay 5 --retry-all-errors \
+            http://100.121.110.75:8000/health
+
+  # 서버의 ai-autodeploy.timer도 5분마다 main을 확인하는 복구용 경로로 유지한다.
