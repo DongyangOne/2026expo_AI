@@ -35,6 +35,11 @@ def test_ai_response_contract_matches_spring_guidance_and_conditions():
     assert set(schemas["Conditions"]["properties"]) == {"has_label", "is_dented"}
     assert "anyOf" not in schemas["Conditions"]["properties"]["has_label"]
 
+    description = app.openapi()["paths"]["/api/v1/detect"]["post"]["description"]
+    assert "해당 판별 모델이 탑재된 경우에만 검사" in description
+    assert "has_foreign_material`은 반환하지 않" in description
+    assert "REMOVE_FOREIGN_MATERIAL" in description
+
 
 def test_detect_response_omits_spring_optional_null_fields(monkeypatch):
     app.dependency_overrides[detect._get_registry] = lambda: object()

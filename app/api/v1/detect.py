@@ -37,7 +37,9 @@ def _get_registry(request: Request) -> ModelRegistry:
     },
     summary="쓰레기 분류",
     description=(
-        "이미지와 무게 값으로 9-class 분류 후 상태(압착/라벨/무게/외부 이물질)를 검사합니다.\n\n"
+        "이미지와 무게 값으로 9-class 분류 후 압착·라벨·무게 상태를 검사합니다. "
+        "외부 이물질은 해당 판별 모델이 탑재된 경우에만 검사하며, Spring 계약에 맞춰 "
+        "`guidance[].code=REMOVE_FOREIGN_MATERIAL`로 반환합니다.\n\n"
         "- `status=ALLOWED`: 지정 함 투입 허용 (플라스틱(PET 포함)/캔/종이/비닐 + 조건 충족)\n"
         "- `status=REJECTED`: 조건 불충족(`guidance` 재처리 안내) 또는 완전거부(`rejection`, 유리·건전지 등)\n"
         "- `status=GENERAL_WASTE`: 저신뢰/미분류 (`general`)\n"
@@ -45,7 +47,7 @@ def _get_registry(request: Request) -> ModelRegistry:
         "- `client_id`: 하드웨어가 보낸 사용자/피드백 구분 ID를 응답과 Spring 콜백에 그대로 포함\n"
         "- `classification`: 모델의 PET 감지도 `class_id=3`, `class_name=plastic`으로 통합\n"
         "- `conditions`: Spring 계약에 맞춰 is_dented(플라스틱 병·캔 압착), has_label(플라스틱 라벨)만 반환\n"
-        "- 외부 이물질은 `guidance[].code=REMOVE_FOREIGN_MATERIAL`로 반환"
+        "- `has_foreign_material`은 반환하지 않으며, 외부 이물질 판정 시 `REMOVE_FOREIGN_MATERIAL` 안내만 반환"
     ),
 )
 async def detect(
