@@ -37,7 +37,6 @@ jobs:
         uses: tailscale/github-action@v4
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          ping: 100.121.110.75
 
       - name: Pi5 자동 배포 스크립트 실행
         env:
