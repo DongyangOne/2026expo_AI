@@ -41,11 +41,9 @@ curl -X POST http://localhost:8000/api/v1/detect \
   "client_id": "hardware-user-001",
   "status": "ALLOWED",
   "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.94},
-  "conditions": {"has_label": false, "is_dented": true, "has_foreign_material": null},
+  "conditions": {"has_label": false, "is_dented": true},
   "weight": {"value_g": 28.0, "anomaly": false},
   "guidance": [],
-  "rejection": null,
-  "general": null,
   "bbox": [120.0, 80.0, 410.0, 560.0]
 }
 ```
@@ -63,13 +61,12 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 | code | 의미 |
 |------|------|
-| `EMPTY_CONTENTS` | 내용물 비우기 (페트·플라스틱·캔 무게 이상) |
-| `WEIGHT_ANOMALY` | 무게 이상 확인 (종이·비닐) |
-| `FOREIGN_MATERIAL` | 외부 이물질 제거 |
+| `EMPTY_CONTENTS` | 내용물 또는 무게 이상 확인 (전 품목) |
+| `REMOVE_FOREIGN_MATERIAL` | 외부 이물질 제거 |
 | `REMOVE_LABEL` | 라벨 제거 (페트·플라스틱) |
 | `COMPRESS` | 압착 (페트·캔) |
 
-> 현재 배포된 상태 모델은 `dent`/`label` 2헤드이므로 `has_foreign_material`은 `null`이다. `foreign_material` 헤드가 포함된 모델을 탑재하면 `FOREIGN_MATERIAL` 안내가 자동 활성화된다.
+> Spring `ConditionsDto`에는 `has_foreign_material` 필드가 없으므로 외부 JSON에는 보내지 않는다. 향후 `foreign_material` 헤드가 포함된 모델을 탑재하면 `REMOVE_FOREIGN_MATERIAL` 안내 코드로만 전달한다.
 
 ### `rejection` 코드 (완전 거부)
 

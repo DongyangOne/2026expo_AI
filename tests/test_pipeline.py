@@ -60,7 +60,7 @@ def test_vinyl_무게이상은_rejected_weight_anomaly(monkeypatch):
 
     assert result.status is DetectionStatus.REJECTED
     assert result.weight.anomaly is True
-    assert [item.code for item in result.guidance] == [GuidanceCode.WEIGHT_ANOMALY]
+    assert [item.code for item in result.guidance] == [GuidanceCode.EMPTY_CONTENTS]
     assert result.general is None
 
 
@@ -84,7 +84,7 @@ def test_pet은_상태검사후_plastic으로_응답(monkeypatch):
 
     def fake_run_state(_session, _img, _bbox, cls):
         captured["state_class"] = cls
-        return Conditions(has_label=False, is_dented=True)
+        return inference.StatePrediction(Conditions(has_label=False, is_dented=True))
 
     monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
     monkeypatch.setattr(inference, "run_main", _fake_pet_detection)

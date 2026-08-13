@@ -23,13 +23,49 @@ def test_detect_contract_requires_and_returns_client_id():
     assert "client_id" in response_schema["required"]
 
 
-def test_guidance_contract_exposes_new_codes_and_foreign_material_condition():
+def test_ai_response_contract_matches_spring_guidance_and_conditions():
     schemas = app.openapi()["components"]["schemas"]
 
-    assert {"WEIGHT_ANOMALY", "FOREIGN_MATERIAL"}.issubset(
-        set(schemas["GuidanceCode"]["enum"])
-    )
-    assert "has_foreign_material" in schemas["Conditions"]["properties"]
+    assert schemas["GuidanceCode"]["enum"] == [
+        "EMPTY_CONTENTS",
+        "REMOVE_LABEL",
+        "COMPRESS",
+        "REMOVE_FOREIGN_MATERIAL",
+    ]
+    assert set(schemas["Conditions"]["properties"]) == {"has_label", "is_dented"}
+    assert "anyOf" not in schemas["Conditions"]["properties"]["has_label"]
+
+
+def test_detect_response_omits_spring_optional_null_fields(monkeypatch):
+    app.dependency_overrides[detect._get_registry] = lambda: object()
+
+    async def fake_run(image, weight_g, client_id, registry):
+        return DetectResponse(client_id=client_id, status=DetectionStatus.NOT_DETECTED)
+
+    async def fake_notify(result):
+        return None
+
+    monkeypatch.setattr(pipeline, "run", fake_run)
+    monkeypatch.setattr(spring_client, "notify", fake_notify)
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/api/v1/detect",
+            headers={"X-API-Key": "test-key"},
+            files={"image": ("sample.jpg", b"image", "image/jpeg")},
+            data={"client_id": "spring-null-contract"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "client_id": "spring-null-contract",
+        "status": "NOT_DETECTED",
+        "conditions": {},
+        "weight": {"anomaly": False},
+        "guidance": [],
+    }
 
 
 def test_detect_echoes_client_id_to_response_and_callback(monkeypatch):

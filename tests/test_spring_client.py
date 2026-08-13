@@ -44,7 +44,13 @@ def test_notify_forwards_client_id_unchanged(monkeypatch):
     )
     asyncio.run(spring_client.notify(result))
 
-    assert captured["json"]["client_id"] == "hardware-user-001"
+    assert captured["json"] == {
+        "client_id": "hardware-user-001",
+        "status": "NOT_DETECTED",
+        "conditions": {},
+        "weight": {"anomaly": False},
+        "guidance": [],
+    }
     assert captured["url"] == "https://oneexpo.kro.kr/api/v1/feedback-detail/result"
 
 

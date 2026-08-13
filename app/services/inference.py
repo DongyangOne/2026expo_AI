@@ -5,6 +5,8 @@
 전처리 상수는 extract_crops.py / train_classifier.py 와 동일해야 학습-추론이 일치한다.
 """
 
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 
@@ -26,6 +28,18 @@ VERIFIER_CLASS_NAMES = (
     "can", "pet", "paper", "plastic", "styrofoam",
     "vinyl", "glass", "battery", "fluorescent",
 )
+
+
+@dataclass(frozen=True)
+class StatePrediction:
+    """상태 모델 내부 결과.
+
+    Spring 외부 DTO에는 ``has_foreign_material`` 필드가 없으므로 해당 값은
+    안내 코드를 만드는 동안에만 보존한다.
+    """
+
+    conditions: Conditions
+    has_foreign_material: bool | None = None
 
 
 def run_main(registry: ModelRegistry, img: np.ndarray):
@@ -79,14 +93,14 @@ def _letterbox(crop: np.ndarray, size: int = _STATE_SIZE) -> np.ndarray:
     return canvas
 
 
-def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> Conditions:
+def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> StatePrediction:
     """
-    bbox 크롭 → 멀티헤드 추론 → Conditions.
+    bbox 크롭 → 멀티헤드 추론 → 내부 StatePrediction.
     세션 미탑재(None) 또는 헤드 비대상 품목은 해당 값 None.
     기존 모델은 dent/label 2헤드이며, foreign_material 출력이 있는 모델은 자동 사용한다.
     """
     if session is None:
-        return Conditions()
+        return StatePrediction(Conditions())
 
     H, W = img.shape[:2]
     x1, y1, x2, y2 = bbox
@@ -96,7 +110,7 @@ def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> C
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(W, int(x2)), min(H, int(y2))
     if x2 <= x1 or y2 <= y1:
-        return Conditions()
+        return StatePrediction(Conditions())
 
     crop = _letterbox(img[y1:y2, x1:x2])
     rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
@@ -115,9 +129,8 @@ def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> C
     has_label = bool(label_out[0].argmax()) if cls in _LABEL_CLASSES else None
     foreign_out = outputs.get("foreign_material")
     has_foreign_material = bool(foreign_out[0].argmax()) if foreign_out is not None else None
-    return Conditions(
-        is_dented=is_dented,
-        has_label=has_label,
+    return StatePrediction(
+        conditions=Conditions(is_dented=is_dented, has_label=has_label),
         has_foreign_material=has_foreign_material,
     )
 

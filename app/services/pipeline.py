@@ -236,15 +236,21 @@ async def run(
 
     # ── 비닐 — 정상일 때만 비닐함 허용, 이상이면 재처리 안내 ────────────────────
     if guidance.is_vinyl(cls):
-        conditions = await loop.run_in_executor(
+        state_prediction = await loop.run_in_executor(
             _executor, inference.run_state, registry.state(), img, bbox, cls
         )
+        conditions = state_prediction.conditions
         weight_info.anomaly = (
             settings.WEIGHT_ANOMALY_ENABLED
             and weight_g is not None
             and is_anomaly(cls.value, weight_g, bbox=bbox, img_area=float(img.shape[0] * img.shape[1]))
         )
-        guide = guidance.build_guidance(cls, conditions, weight_info.anomaly)
+        guide = guidance.build_guidance(
+            cls,
+            conditions,
+            weight_info.anomaly,
+            state_prediction.has_foreign_material,
+        )
         if guide:
             return DetectResponse(
                 client_id=client_id,
@@ -265,16 +271,22 @@ async def run(
         )
 
     # ── 허용 (플라스틱/PET/캔/종이) → 상태·무게 조건 검사 ────────────────────────
-    conditions = await loop.run_in_executor(
+    state_prediction = await loop.run_in_executor(
         _executor, inference.run_state, registry.state(), img, bbox, cls
     )
+    conditions = state_prediction.conditions
     weight_info.anomaly = (
         settings.WEIGHT_ANOMALY_ENABLED
         and weight_g is not None
         and is_anomaly(cls.value, weight_g, bbox=bbox, img_area=float(img.shape[0] * img.shape[1]))
     )
 
-    guide = guidance.build_guidance(cls, conditions, weight_info.anomaly)
+    guide = guidance.build_guidance(
+        cls,
+        conditions,
+        weight_info.anomaly,
+        state_prediction.has_foreign_material,
+    )
     # 안내가 있으면 조건 불충족 → 재처리 거부, 없으면 충족 → 수거 허용
     status = DetectionStatus.REJECTED if guide else DetectionStatus.ALLOWED
 

@@ -37,19 +37,10 @@ VINYL_CLASSES: set[WasteClass] = {
 # ── 안내 문구 사전 ────────────────────────────────────────────────────────────────
 # 조건 불충족 시 재처리 안내 (있으면 REJECTED, 없으면 ALLOWED)
 _GUIDANCE_TEXT: dict[GuidanceCode, str] = {
-    GuidanceCode.EMPTY_CONTENTS:   "내용물이 남아 있는 것 같아요. 비우고 다시 넣어 주세요.",
-    GuidanceCode.WEIGHT_ANOMALY:   "무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요.",
-    GuidanceCode.FOREIGN_MATERIAL: "외부 이물질을 제거하고 다시 넣어 주세요.",
+    GuidanceCode.EMPTY_CONTENTS:   "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요.",
+    GuidanceCode.REMOVE_FOREIGN_MATERIAL: "외부 이물질을 제거하고 다시 넣어 주세요.",
     GuidanceCode.REMOVE_LABEL:     "라벨을 제거하고 다시 넣어 주세요.",
     GuidanceCode.COMPRESS:         "플라스틱 병·캔은 납작하게 압착해서 다시 넣어 주세요.",
-}
-
-_EMPTY_CONTENTS_CLASSES: set[WasteClass] = {
-    WasteClass.PET, WasteClass.PLASTIC, WasteClass.CAN,
-}
-
-_WEIGHT_ANOMALY_CLASSES: set[WasteClass] = {
-    WasteClass.PAPER, WasteClass.VINYL,
 }
 
 # 완전 수거 거부
@@ -82,7 +73,12 @@ def is_vinyl(cls: WasteClass) -> bool:
 
 
 # ── 안내 생성 ────────────────────────────────────────────────────────────────────
-def build_guidance(cls: WasteClass, conditions: Conditions, weight_anomaly: bool) -> list[Guidance]:
+def build_guidance(
+    cls: WasteClass,
+    conditions: Conditions,
+    weight_anomaly: bool,
+    has_foreign_material: bool | None = None,
+) -> list[Guidance]:
     """
     허용 품목의 조건 불충족 항목을 재처리 안내로 생성.
     빈 리스트  → 모든 조건 충족 → ALLOWED
@@ -92,12 +88,10 @@ def build_guidance(cls: WasteClass, conditions: Conditions, weight_anomaly: bool
     """
     codes: list[GuidanceCode] = []
 
-    if weight_anomaly and cls in _EMPTY_CONTENTS_CLASSES:
+    if weight_anomaly:
         codes.append(GuidanceCode.EMPTY_CONTENTS)
-    elif weight_anomaly and cls in _WEIGHT_ANOMALY_CLASSES:
-        codes.append(GuidanceCode.WEIGHT_ANOMALY)
-    if conditions.has_foreign_material is True:
-        codes.append(GuidanceCode.FOREIGN_MATERIAL)
+    if has_foreign_material is True:
+        codes.append(GuidanceCode.REMOVE_FOREIGN_MATERIAL)
     if conditions.has_label is True:                          # 페트·플라스틱 라벨 부착
         codes.append(GuidanceCode.REMOVE_LABEL)
     if cls in (WasteClass.PET, WasteClass.CAN) and conditions.is_dented is False:  # 미압착

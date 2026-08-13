@@ -5,8 +5,8 @@
   DetectResponse
   ├─ client_id       : str               ← 하드웨어가 보낸 사용자/피드백 구분 ID
   ├─ status          : DetectionStatus   ← Spring 의 1차 분기 판별자
-  ├─ classification  : Classification?   ← 분류 결과 (NOT_DETECTED 시 null)
-  ├─ conditions      : Conditions        ← 상태 감지 (is_dented/has_label/has_foreign_material)
+  ├─ classification  : Classification?   ← 분류 결과 (NOT_DETECTED 시 생략)
+  ├─ conditions      : Conditions        ← 상태 감지 (is_dented/has_label)
   ├─ weight          : WeightInfo        ← 무게 + 이상 여부
   ├─ guidance        : Guidance[]        ← 조건 불충족 시 재처리 안내 (압착/라벨/비우기). 충족 시 빈 배열
   ├─ rejection       : Rejection?        ← 완전 거부 사유 (유리/건전지 등)
@@ -21,9 +21,8 @@ status 별 채워지는 필드:
   NOT_DETECTED   → (없음)
 """
 
-from typing import Optional
-
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from app.schemas.enums import (
     DetectionStatus,
@@ -42,15 +41,14 @@ class Classification(BaseModel):
 
 
 class Conditions(BaseModel):
-    """객체 상태 (멀티헤드). 모델 미탑재 또는 비대상 헤드는 null."""
-    has_label: Optional[bool]            = Field(None, description="라벨 부착 여부 (페트·플라스틱)")
-    is_dented: Optional[bool]            = Field(None, description="압착(찌그러짐) 여부 (페트·캔)")
-    has_foreign_material: Optional[bool] = Field(None, description="외부 이물질 여부 (지원 모델 탑재 시)")
+    """Spring ``ConditionsDto``와 동일한 객체 상태."""
+    has_label: bool | SkipJsonSchema[None] = Field(None, description="라벨 부착 여부 (페트·플라스틱)")
+    is_dented: bool | SkipJsonSchema[None] = Field(None, description="압착(찌그러짐) 여부 (페트·캔)")
 
 
 class WeightInfo(BaseModel):
     """무게 센서 값과 이상 여부."""
-    value_g: Optional[float] = Field(None, description="입력 무게 (g). 미입력 시 null")
+    value_g: float | SkipJsonSchema[None] = Field(None, description="입력 무게 (g). 미입력 시 생략")
     anomaly: bool            = Field(False, description="정상 범위 초과 여부 (내용물/이물질 간주)")
 
 
@@ -73,15 +71,15 @@ class GeneralWaste(BaseModel):
 
 
 class DetectResponse(BaseModel):
-    client_id:       str                      = Field(..., description="요청에서 받은 사용자/피드백 구분 ID")
+    client_id:       str                      = Field(..., min_length=1, description="요청에서 받은 사용자/피드백 구분 ID")
     status:         DetectionStatus          = Field(..., description="처리 판별자 (Spring 1차 분기)")
-    classification: Optional[Classification]  = Field(None, description="분류 결과 (감지 실패 시 null)")
+    classification: Classification | SkipJsonSchema[None] = Field(None, description="분류 결과 (미감지 시 생략)")
     conditions:     Conditions               = Field(default_factory=Conditions)
     weight:         WeightInfo               = Field(default_factory=WeightInfo)
     guidance:       list[Guidance]           = Field(default_factory=list)
-    rejection:      Optional[Rejection]      = Field(None, description="완전 거부 사유 (REJECTED 완전거부)")
-    general:        Optional[GeneralWaste]   = Field(None, description="일반쓰레기 사유 (GENERAL_WASTE)")
-    bbox:           Optional[list[float]]    = Field(None, description="감지 영역 [x1, y1, x2, y2] 픽셀")
+    rejection:      Rejection | SkipJsonSchema[None] = Field(None, description="완전 거부 사유 (REJECTED 완전거부)")
+    general:        GeneralWaste | SkipJsonSchema[None] = Field(None, description="일반쓰레기 사유 (GENERAL_WASTE)")
+    bbox:           list[float] | SkipJsonSchema[None] = Field(None, description="감지 영역 [x1, y1, x2, y2] 픽셀")
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -90,7 +88,7 @@ class DetectResponse(BaseModel):
                     "client_id": "hardware-user-001",
                     "status": "ALLOWED",
                     "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.94},
-                    "conditions": {"has_label": False, "is_dented": True, "has_foreign_material": None},
+                    "conditions": {"has_label": False, "is_dented": True},
                     "weight": {"value_g": 28.0, "anomaly": False},
                     "guidance": [],
                     "rejection": None,
@@ -101,11 +99,11 @@ class DetectResponse(BaseModel):
                     "client_id": "hardware-user-001",
                     "status": "REJECTED",
                     "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.91},
-                    "conditions": {"has_label": True, "is_dented": False, "has_foreign_material": True},
+                    "conditions": {"has_label": True, "is_dented": False},
                     "weight": {"value_g": 540.0, "anomaly": True},
                     "guidance": [
-                        {"code": "EMPTY_CONTENTS", "message": "내용물이 남아 있는 것 같아요. 비우고 다시 넣어 주세요."},
-                        {"code": "FOREIGN_MATERIAL", "message": "외부 이물질을 제거하고 다시 넣어 주세요."},
+                        {"code": "EMPTY_CONTENTS", "message": "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요."},
+                        {"code": "REMOVE_FOREIGN_MATERIAL", "message": "외부 이물질을 제거하고 다시 넣어 주세요."},
                         {"code": "REMOVE_LABEL", "message": "라벨을 제거해 주세요."},
                         {"code": "COMPRESS", "message": "플라스틱 병·캔은 납작하게 압착해서 넣어 주세요."}
                     ],
@@ -127,7 +125,7 @@ class DetectResponse(BaseModel):
                     "client_id": "hardware-user-001",
                     "status": "ALLOWED",
                     "classification": {"class_id": 5, "class_name": "vinyl", "confidence": 0.90},
-                    "conditions": {"has_label": None, "is_dented": None, "has_foreign_material": None},
+                    "conditions": {},
                     "weight": {"value_g": 12.0, "anomaly": False},
                     "guidance": [],
                     "rejection": None,

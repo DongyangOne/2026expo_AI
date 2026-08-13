@@ -76,7 +76,8 @@ async def notify(result: DetectResponse) -> None:
     if not url:
         return
 
-    payload = result.model_dump(mode="json")
+    # Spring DTO의 선택 필드는 nullable이 아니라 미포함으로 정의돼 있다.
+    payload = result.model_dump(mode="json", exclude_none=True)
     max_attempts = max(1, settings.SPRING_MAX_ATTEMPTS)
     base_backoff = max(0.0, settings.SPRING_RETRY_BACKOFF_SEC)
 
