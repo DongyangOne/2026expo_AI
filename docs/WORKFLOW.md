@@ -263,10 +263,9 @@ python scripts/evaluate_hardware_detector.py `
 
 1. 별도 기능 브랜치 없이 `main`에 직접 반영한다.
 2. GitHub Actions는 `main` 푸시 시 단위 테스트를 실행한다.
-3. 테스트 성공 시 GitHub 호스팅 러너가 Tailscale로 Pi5에 접속해 `/home/one/auto-deploy.sh`를 실행한다.
-4. 배포 스크립트는 `git pull --ff-only` 후 `docker compose up -d --build`를 실행하고 Actions가 `/health`를 확인한다.
-5. Pi5의 `ai-autodeploy.timer`도 5분마다 `origin/main`을 확인하는 복구용 배포 경로로 유지한다.
-6. 시스템 nginx가 `https://ai.oneexpo.kro.kr` 요청을 FastAPI `localhost:8000`으로 프록시한다.
+3. Pi5의 `ai-autodeploy.timer`가 5분마다 `origin/main`의 새 커밋을 확인한다.
+4. 새 커밋이 있으면 `/home/one/auto-deploy.sh`가 `git pull --ff-only` 후 `docker compose up -d --build`를 실행한다.
+5. 시스템 nginx가 `https://ai.oneexpo.kro.kr` 요청을 FastAPI `localhost:8000`으로 프록시한다.
 
 운영 확인:
 
