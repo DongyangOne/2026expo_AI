@@ -37,8 +37,62 @@ def test_ai_response_contract_matches_spring_guidance_and_conditions():
 
     description = app.openapi()["paths"]["/api/v1/detect"]["post"]["description"]
     assert "해당 판별 모델이 탑재된 경우에만 검사" in description
-    assert "has_foreign_material`은 반환하지 않" in description
+    assert "`conditions.has_foreign_material`" in description
+    assert "반환하지 않" in description
     assert "REMOVE_FOREIGN_MATERIAL" in description
+
+
+def test_detect_swagger_documents_complete_request_and_response_contract():
+    schema = app.openapi()
+    operation = schema["paths"]["/api/v1/detect"]["post"]
+    description = operation["description"]
+
+    for field_name in (
+        "client_id",
+        "status",
+        "classification",
+        "conditions",
+        "weight",
+        "guidance",
+        "rejection",
+        "general",
+        "bbox",
+    ):
+        assert f"`{field_name}`" in description
+
+    for status in ("ALLOWED", "REJECTED", "GENERAL_WASTE", "NOT_DETECTED"):
+        assert f"`{status}`" in description
+
+    for code in (
+        "EMPTY_CONTENTS",
+        "REMOVE_LABEL",
+        "COMPRESS",
+        "REMOVE_FOREIGN_MATERIAL",
+        "GLASS",
+        "BATTERY",
+        "FLUORESCENT",
+        "STYROFOAM",
+        "LOW_CONFIDENCE",
+        "UNCLASSIFIED",
+        "VINYL",
+    ):
+        assert f"`{code}`" in description
+
+    assert "null" in description
+    assert "필드 자체를 생략" in description
+    assert "`1 / pet`" in description
+    assert "**`3 / plastic`**" in description
+    assert "POST /api/v1/feedback-detail/result" in description
+    assert "Spring 콜백 실패" in description
+
+    response_schema = schema["components"]["schemas"]["DetectResponse"]
+    bbox_schema = response_schema["properties"]["bbox"]
+    assert bbox_schema["minItems"] == 4
+    assert bbox_schema["maxItems"] == 4
+    assert response_schema["properties"]["client_id"]["maxLength"] == 128
+
+    for example in response_schema["examples"]:
+        assert all(value is not None for value in example.values())
 
 
 def test_detect_response_omits_spring_optional_null_fields(monkeypatch):
