@@ -60,7 +60,7 @@ def test_vinyl_무게이상은_rejected_weight_anomaly(monkeypatch):
 
     assert result.status is DetectionStatus.REJECTED
     assert result.weight.anomaly is True
-    assert [item.code for item in result.guidance] == [GuidanceCode.EMPTY_CONTENTS]
+    assert [item.code for item in result.guidance] == [GuidanceCode.WEIGHT_ANOMALY]
     assert result.general is None
 
 

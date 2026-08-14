@@ -17,8 +17,8 @@ router = APIRouter()
 
 _DETECT_DESCRIPTION = """
 이미지와 무게 값으로 9-class 분류 후 압착·라벨·무게 상태를 검사합니다.
-외부 이물질은 해당 판별 모델이 탑재된 경우에만 검사하며, Spring 계약에 맞춰
-`guidance[].code=REMOVE_FOREIGN_MATERIAL`로 반환합니다.
+외부 이물질은 해당 판별 모델이 탑재된 경우에만 검사하며
+`guidance[].code=FOREIGN_MATERIAL`로 반환합니다.
 
 ## 요청 형식
 
@@ -107,10 +107,11 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 
 | code | 발생 조건 |
 |---|---|
-| `EMPTY_CONTENTS` | 허용 품목의 무게 이상 또는 내용물 존재 추정 |
+| `EMPTY_CONTENTS` | 내부 PET·플라스틱·캔의 무게 이상 또는 내용물 존재 추정 |
+| `WEIGHT_ANOMALY` | 종이·비닐의 무게 이상 |
 | `REMOVE_LABEL` | 내부 PET·플라스틱에 라벨이 있음 |
 | `COMPRESS` | 내부 PET·캔이 미압착 상태 |
-| `REMOVE_FOREIGN_MATERIAL` | 지원 모델이 외부 이물질을 감지함. 현재 배포된 2헤드 상태 모델에서는 발생하지 않음 |
+| `FOREIGN_MATERIAL` | 지원 모델이 외부 이물질을 감지함. 현재 배포된 2헤드 상태 모델에서는 발생하지 않음 |
 
 ## 완전거부 및 일반분류 코드
 

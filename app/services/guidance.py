@@ -37,11 +37,15 @@ VINYL_CLASSES: set[WasteClass] = {
 # ── 안내 문구 사전 ────────────────────────────────────────────────────────────────
 # 조건 불충족 시 재처리 안내 (있으면 REJECTED, 없으면 ALLOWED)
 _GUIDANCE_TEXT: dict[GuidanceCode, str] = {
-    GuidanceCode.EMPTY_CONTENTS:   "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요.",
-    GuidanceCode.REMOVE_FOREIGN_MATERIAL: "외부 이물질을 제거하고 다시 넣어 주세요.",
-    GuidanceCode.REMOVE_LABEL:     "라벨을 제거하고 다시 넣어 주세요.",
-    GuidanceCode.COMPRESS:         "플라스틱 병·캔은 납작하게 압착해서 다시 넣어 주세요.",
+    GuidanceCode.EMPTY_CONTENTS:  "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 내용물을 비우고 다시 넣어 주세요.",
+    GuidanceCode.WEIGHT_ANOMALY:  "무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요.",
+    GuidanceCode.FOREIGN_MATERIAL: "외부 이물질을 제거하고 다시 넣어 주세요.",
+    GuidanceCode.REMOVE_LABEL:    "라벨을 제거하고 다시 넣어 주세요.",
+    GuidanceCode.COMPRESS:        "플라스틱 병·캔은 납작하게 압착해서 다시 넣어 주세요.",
 }
+
+_EMPTY_CONTENTS_CLASSES = {WasteClass.PET, WasteClass.PLASTIC, WasteClass.CAN}
+_WEIGHT_ANOMALY_CLASSES = {WasteClass.PAPER, WasteClass.VINYL}
 
 # 완전 수거 거부
 _REJECTION: dict[WasteClass, tuple[RejectionCode, str]] = {
@@ -88,10 +92,12 @@ def build_guidance(
     """
     codes: list[GuidanceCode] = []
 
-    if weight_anomaly:
+    if weight_anomaly and cls in _EMPTY_CONTENTS_CLASSES:
         codes.append(GuidanceCode.EMPTY_CONTENTS)
+    elif weight_anomaly and cls in _WEIGHT_ANOMALY_CLASSES:
+        codes.append(GuidanceCode.WEIGHT_ANOMALY)
     if has_foreign_material is True:
-        codes.append(GuidanceCode.REMOVE_FOREIGN_MATERIAL)
+        codes.append(GuidanceCode.FOREIGN_MATERIAL)
     if conditions.has_label is True:                          # 페트·플라스틱 라벨 부착
         codes.append(GuidanceCode.REMOVE_LABEL)
     if cls in (WasteClass.PET, WasteClass.CAN) and conditions.is_dented is False:  # 미압착

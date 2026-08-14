@@ -23,14 +23,15 @@ def test_detect_contract_requires_and_returns_client_id():
     assert "client_id" in response_schema["required"]
 
 
-def test_ai_response_contract_matches_spring_guidance_and_conditions():
+def test_ai_response_contract_exposes_agreed_guidance_and_conditions():
     schemas = app.openapi()["components"]["schemas"]
 
     assert schemas["GuidanceCode"]["enum"] == [
         "EMPTY_CONTENTS",
+        "WEIGHT_ANOMALY",
+        "FOREIGN_MATERIAL",
         "REMOVE_LABEL",
         "COMPRESS",
-        "REMOVE_FOREIGN_MATERIAL",
     ]
     assert set(schemas["Conditions"]["properties"]) == {"has_label", "is_dented"}
     assert "anyOf" not in schemas["Conditions"]["properties"]["has_label"]
@@ -39,7 +40,7 @@ def test_ai_response_contract_matches_spring_guidance_and_conditions():
     assert "해당 판별 모델이 탑재된 경우에만 검사" in description
     assert "`conditions.has_foreign_material`" in description
     assert "반환하지 않" in description
-    assert "REMOVE_FOREIGN_MATERIAL" in description
+    assert "FOREIGN_MATERIAL" in description
 
 
 def test_detect_swagger_documents_complete_request_and_response_contract():
@@ -65,9 +66,10 @@ def test_detect_swagger_documents_complete_request_and_response_contract():
 
     for code in (
         "EMPTY_CONTENTS",
+        "WEIGHT_ANOMALY",
+        "FOREIGN_MATERIAL",
         "REMOVE_LABEL",
         "COMPRESS",
-        "REMOVE_FOREIGN_MATERIAL",
         "GLASS",
         "BATTERY",
         "FLUORESCENT",

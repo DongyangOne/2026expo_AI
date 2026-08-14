@@ -50,7 +50,7 @@ class TestConditionsUnmet:
         )
         assert _codes(g) == [
             GuidanceCode.EMPTY_CONTENTS,
-            GuidanceCode.REMOVE_FOREIGN_MATERIAL,
+            GuidanceCode.FOREIGN_MATERIAL,
             GuidanceCode.REMOVE_LABEL,
             GuidanceCode.COMPRESS,
         ]
@@ -65,11 +65,11 @@ class TestConditionsUnmet:
 
     def test_paper_무게만(self):
         g = guidance.build_guidance(WasteClass.PAPER, Conditions(), True)
-        assert _codes(g) == [GuidanceCode.EMPTY_CONTENTS]
+        assert _codes(g) == [GuidanceCode.WEIGHT_ANOMALY]
 
     def test_vinyl_무게만(self):
         g = guidance.build_guidance(WasteClass.VINYL, Conditions(), True)
-        assert _codes(g) == [GuidanceCode.EMPTY_CONTENTS]
+        assert _codes(g) == [GuidanceCode.WEIGHT_ANOMALY]
 
     def test_plastic_무게만(self):
         g = guidance.build_guidance(WasteClass.PLASTIC, Conditions(), True)
@@ -86,7 +86,7 @@ class TestConditionsUnmet:
             False,
             has_foreign_material=True,
         )
-        assert _codes(g) == [GuidanceCode.REMOVE_FOREIGN_MATERIAL]
+        assert _codes(g) == [GuidanceCode.FOREIGN_MATERIAL]
 
 
 # ── 품목별 헤드 비대상은 검사 안 함 (None 무시) ─────────────────────────────────

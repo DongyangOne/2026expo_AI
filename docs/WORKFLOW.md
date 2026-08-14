@@ -56,19 +56,20 @@
 | 캔 | — | ✅ | ✅ |
 | 종이 | — | — | ✅ |
 
-> 조건 하나라도 불충족 → `REJECTED` + Spring 계약의 guidance(`EMPTY_CONTENTS`/`REMOVE_LABEL`/`COMPRESS`/`REMOVE_FOREIGN_MATERIAL`) 재처리 안내 → 사용자 처리 후 재투입.
+> 조건 하나라도 불충족 → `REJECTED` + guidance(`EMPTY_CONTENTS`/`WEIGHT_ANOMALY`/`FOREIGN_MATERIAL`/`REMOVE_LABEL`/`COMPRESS`) 재처리 안내 → 사용자 처리 후 재투입.
 > 비닐은 무게·외부 이물질 이상이 없을 때만 비닐함 투입(`ALLOWED`)을 허용하고, 이상이 있으면 재처리(`REJECTED`)한다. 저신뢰·미분류는 `GENERAL_WASTE`로 유지한다. 유리·건전지·형광등·스티로폼은 완전 수거거부(`REJECTED`+`rejection`).
 
 ### GuidanceCode 매핑
 
 | 조건 | 코드 |
 |------|------|
-| 전 품목 무게 이상/내용물 존재 | `EMPTY_CONTENTS` |
-| 외부 이물질 | `REMOVE_FOREIGN_MATERIAL` |
+| 플라스틱(PET 포함)·캔 무게 이상/내용물 존재 | `EMPTY_CONTENTS` |
+| 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
+| 외부 이물질 | `FOREIGN_MATERIAL` |
 | 라벨 미제거 | `REMOVE_LABEL` |
 | 페트·캔 미압착 | `COMPRESS` |
 
-> 현재 배포된 상태 모델은 `dent`/`label` 2헤드다. Spring `ConditionsDto`에는 외부 이물질 필드가 없으므로, 향후 해당 헤드가 추가되어도 외부 상태값은 보내지 않고 `REMOVE_FOREIGN_MATERIAL` guidance만 생성한다.
+> 현재 배포된 상태 모델은 `dent`/`label` 2헤드다. 외부 이물질 필드는 응답 조건값으로 보내지 않으며, 향후 해당 헤드가 추가되면 `FOREIGN_MATERIAL` guidance만 생성한다.
 
 ---
 

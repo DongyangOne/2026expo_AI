@@ -61,12 +61,13 @@ curl -X POST http://localhost:8000/api/v1/detect \
 
 | code | 의미 |
 |------|------|
-| `EMPTY_CONTENTS` | 내용물 또는 무게 이상 확인 (전 품목) |
-| `REMOVE_FOREIGN_MATERIAL` | 외부 이물질 제거 |
+| `EMPTY_CONTENTS` | 플라스틱(PET 포함)·캔의 무게 이상 또는 내용물 존재 |
+| `WEIGHT_ANOMALY` | 종이·비닐의 무게 이상 |
+| `FOREIGN_MATERIAL` | 외부 이물질 제거 |
 | `REMOVE_LABEL` | 라벨 제거 (페트·플라스틱) |
 | `COMPRESS` | 압착 (페트·캔) |
 
-> Spring `ConditionsDto`에는 `has_foreign_material` 필드가 없으므로 외부 JSON에는 보내지 않는다. 향후 `foreign_material` 헤드가 포함된 모델을 탑재하면 `REMOVE_FOREIGN_MATERIAL` 안내 코드로만 전달한다.
+> `conditions.has_foreign_material`은 외부 JSON에 보내지 않는다. 향후 `foreign_material` 헤드가 포함된 모델을 탑재하면 `FOREIGN_MATERIAL` guidance 코드로만 전달한다.
 
 ### `rejection` 코드 (완전 거부)
 

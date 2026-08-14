@@ -102,11 +102,22 @@ class DetectResponse(BaseModel):
                     "conditions": {"has_label": True, "is_dented": False},
                     "weight": {"value_g": 540.0, "anomaly": True},
                     "guidance": [
-                        {"code": "EMPTY_CONTENTS", "message": "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요."},
+                        {"code": "EMPTY_CONTENTS", "message": "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 내용물을 비우고 다시 넣어 주세요."},
                         {"code": "REMOVE_LABEL", "message": "라벨을 제거하고 다시 넣어 주세요."},
                         {"code": "COMPRESS", "message": "플라스틱 병·캔은 납작하게 압착해서 다시 넣어 주세요."}
                     ],
                     "bbox": [120.0, 80.0, 410.0, 560.0],
+                },
+                {
+                    "client_id": "hardware-user-001",
+                    "status": "REJECTED",
+                    "classification": {"class_id": 2, "class_name": "paper", "confidence": 0.93},
+                    "conditions": {},
+                    "weight": {"value_g": 900.0, "anomaly": True},
+                    "guidance": [
+                        {"code": "WEIGHT_ANOMALY", "message": "무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요."}
+                    ],
+                    "bbox": [95.0, 75.0, 430.0, 570.0],
                 },
                 {
                     "client_id": "hardware-user-001",
