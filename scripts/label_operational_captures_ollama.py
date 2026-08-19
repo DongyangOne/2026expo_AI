@@ -76,7 +76,15 @@ def _request(url: str, model: str, image: bytes, prompt: str, timeout: int) -> d
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = json.load(response)
-    result = json.loads(body["message"]["content"])
+    message = body.get("message") or {}
+    content = message.get("content") or ""
+    if not content.strip():
+        raise ValueError(
+            "empty model content "
+            f"(thinking_chars={len(message.get('thinking') or '')}, "
+            f"done_reason={body.get('done_reason')})"
+        )
+    result = json.loads(content)
     if result.get("material") not in MATERIALS:
         raise ValueError(f"invalid material: {result.get('material')}")
     if not 0 <= float(result.get("confidence", -1)) <= 1:
@@ -112,17 +120,22 @@ def label_queue(
                 continue
             image = Path(row["image_path"]).read_bytes()
             passes = []
+            errors = []
             for prompt in PROMPTS:
                 for attempt in range(1, retries + 1):
                     try:
                         passes.append(_request(url, model, image, prompt, timeout))
                         break
-                    except Exception:
+                    except Exception as exc:
                         if attempt == retries:
-                            raise
+                            errors.append(f"{type(exc).__name__}: {exc}")
+                            break
                         time.sleep(attempt * 2)
+                if errors:
+                    break
             consensus = (
-                passes[0]["material"] == passes[1]["material"]
+                len(passes) == len(PROMPTS)
+                and passes[0]["material"] == passes[1]["material"]
                 and passes[0]["single_object"] == passes[1]["single_object"]
                 and passes[0]["foreign_material"] == passes[1]["foreign_material"]
             )
@@ -131,8 +144,13 @@ def label_queue(
                 "image_path": row["image_path"],
                 "model": model,
                 "passes": passes,
+                "errors": errors,
                 "consensus": consensus,
-                "minimum_confidence": min(float(item["confidence"]) for item in passes),
+                "minimum_confidence": (
+                    min(float(item["confidence"]) for item in passes)
+                    if len(passes) == len(PROMPTS)
+                    else 0.0
+                ),
                 "deployed": row.get("deployed"),
                 "verifier": row.get("verifier"),
             }
