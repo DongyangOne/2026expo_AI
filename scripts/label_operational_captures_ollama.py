@@ -21,7 +21,7 @@ SCHEMA = {
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "single_object": {"type": "boolean"},
         "foreign_material": {"type": "boolean"},
-        "description": {"type": "string"},
+        "description": {"type": "string", "maxLength": 160},
     },
     "required": [
         "material", "confidence", "single_object", "foreign_material", "description"
@@ -56,7 +56,14 @@ def _request(url: str, model: str, image: bytes, prompt: str, timeout: int) -> d
         "stream": False,
         "think": False,
         "keep_alive": "30m",
-        "options": {"temperature": 0, "seed": 20260819},
+        "options": {
+            "temperature": 0,
+            "seed": 20260819,
+            # The teacher only needs a compact JSON decision.  A hard ceiling
+            # prevents a malformed/free-form response from monopolising the
+            # NAS GPU while preserving every structured field above.
+            "num_predict": 160,
+        },
     }
     request = urllib.request.Request(
         url.rstrip("/") + "/api/chat",
