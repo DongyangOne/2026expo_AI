@@ -21,11 +21,11 @@ SCHEMA = {
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "single_object": {"type": "boolean"},
         "foreign_material": {"type": "boolean"},
-        "description": {"type": "string", "maxLength": 160},
     },
     "required": [
-        "material", "confidence", "single_object", "foreign_material", "description"
+        "material", "confidence", "single_object", "foreign_material"
     ],
+    "additionalProperties": False,
 }
 
 PROMPTS = (
@@ -48,7 +48,10 @@ def _request(url: str, model: str, image: bytes, prompt: str, timeout: int) -> d
         "messages": [
             {
                 "role": "user",
-                "content": prompt + " JSON 스키마에 맞는 결과만 반환하세요.",
+                "content": (
+                    "/no_think\n" + prompt
+                    + " 설명이나 추론 없이 JSON 스키마 필드만 반환하세요."
+                ),
                 "images": [base64.b64encode(image).decode("ascii")],
             }
         ],
