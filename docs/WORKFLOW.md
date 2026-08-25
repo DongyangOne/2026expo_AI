@@ -314,6 +314,7 @@ curl http://127.0.0.1:8000/health
 | 최종 선별 데이터 | ✅ 9종 90,274장 + 하드웨어 verifier 103장, audit 통과 |
 | 최종 검증기 학습 | ✅ hard100 보정 20 epoch, best epoch 17, material val 0.95281 |
 | 하드웨어 verifier holdout | ✅ 외부 계약 정확도 42.86%→74.29%, macro-F1 0.598→0.679 |
+| proposal background 후보 | 🔄 실제 YOLO bbox 기반 9종+background 데이터 생성·학습, 자동 배포 금지 |
 | `/api/v1/detect` + `client_id` 계약 | ✅ 구현·테스트·배포 완료 |
 | Spring 콜백 URL | ✅ AI 서버 환경 및 컨테이너 반영 완료 |
 | Spring 콜백 수신 테스트 | ⏳ Spring 측 엔드포인트 배포 후 확인 |
@@ -363,9 +364,12 @@ scripts/
   prepare_hardware_capture_dataset.py SHA 중복 제거 + YOLO negative/crop 상태 manifest 생성
   train_hardware_candidate.py 노트북 GPU용 보수적 하드웨어 적응 후보 학습
   evaluate_hardware_detector.py 고정 holdout의 운영 임계값별 후보 비교
+  evaluate_hybrid_policy.py 운영 NCNN 선택 bbox와 negative를 포함한 교정 승격 게이트
+  prepare_proposal_verifier_dataset.py 실제 YOLO bbox의 9종+background crop 데이터 생성
   evaluate_verifier.py    같은 crop holdout에서 기존/후보 ONNX와 PET 통합 외부 계약 비교
   train_verifier.py       9종+상태 학습/하드웨어 oversampling/checkpoint 이어학습/가중 선택/ONNX export
   nas/watch_evaluate_verifier.sh 학습 종료 후 고정 holdout 비교를 자동 실행
+  nas/watch_proposal_verifier_pipeline.sh background 후보 생성·학습 체인(자동 배포 없음)
 
 requirements-training.txt NAS 학습의 ONNX export 및 최신 경량 백본 의존성
 

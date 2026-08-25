@@ -7,8 +7,6 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from ultralytics import YOLO
-
 
 def _load_ground_truth(dataset_dir: Path) -> list[dict]:
     names = {}
@@ -54,6 +52,76 @@ def _iou(first: list[float], second: list[float]) -> float:
     return intersection / union if union else 0.0
 
 
+def _rounded_bbox(value: list[float]) -> list[float]:
+    """보고서 용량을 줄이되 crop을 재현하기에 충분한 좌표 정밀도를 보존한다."""
+    return [round(float(coordinate), 5) for coordinate in value]
+
+
+def select_candidate(candidates: list[dict], threshold: float) -> tuple[dict | None, list[dict]]:
+    """운영 ``run_main``과 동일하게 임계값 이상 최고 신뢰 후보를 선택한다."""
+    eligible = [
+        candidate for candidate in candidates
+        if float(candidate["confidence"]) >= threshold
+    ]
+    selected = max(eligible, key=lambda item: float(item["confidence"]), default=None)
+    return selected, eligible
+
+
+def build_detection_detail(
+    truth: dict,
+    candidates: list[dict],
+    threshold: float,
+    min_iou: float,
+) -> dict:
+    """단일 원본 이미지의 운영 선택 결과와 재현 가능한 bbox 감사를 만든다."""
+    selected, eligible = select_candidate(candidates, threshold)
+    expected = truth["class_name"]
+    selected_iou = (
+        _iou(truth["bbox"], selected["bbox"])
+        if selected is not None and truth["bbox"] is not None else None
+    )
+    if truth["class_id"] is None:
+        outcome = "negative_clean" if selected is None else "negative_false_positive"
+    elif selected is None:
+        outcome = "positive_missed"
+    elif selected_iou is None or selected_iou < min_iou:
+        outcome = "positive_background_false_positive"
+    elif int(selected["class_id"]) != int(truth["class_id"]):
+        outcome = "positive_wrong_class"
+    else:
+        outcome = "positive_correct"
+
+    def audit_candidate(candidate: dict) -> dict:
+        return {
+            "bbox": _rounded_bbox(candidate["bbox"]),
+            "class_id": int(candidate["class_id"]),
+            "class_name": str(candidate["class_name"]),
+            "confidence": round(float(candidate["confidence"]), 6),
+        }
+
+    selected_audit = audit_candidate(selected) if selected is not None else None
+    image_path = Path(truth["image"])
+    return {
+        # 기존 소비자가 쓰는 필드는 그대로 유지한다.
+        "image": image_path.name,
+        "expected": expected,
+        "predicted": selected["class_name"] if selected else None,
+        "confidence": round(float(selected["confidence"]), 5) if selected else None,
+        "iou": round(float(selected_iou), 5) if selected_iou is not None else None,
+        "outcome": outcome,
+        # 아래 필드는 원본 이미지의 실제 선택 bbox에서 verifier를 재실행하기 위한 감사 정보다.
+        "image_path": str(image_path.resolve()),
+        "expected_class_id": truth["class_id"],
+        "predicted_class_id": int(selected["class_id"]) if selected else None,
+        "bbox": selected_audit["bbox"] if selected_audit else None,
+        "selected_bbox": selected_audit["bbox"] if selected_audit else None,
+        "selected_candidate": selected_audit,
+        "candidates": [audit_candidate(candidate) for candidate in eligible],
+        "selection_rule": "highest_confidence_at_or_above_threshold",
+        "selection_threshold": float(threshold),
+    }
+
+
 def evaluate(
     model_path: Path,
     dataset_dir: Path,
@@ -64,70 +132,83 @@ def evaluate(
     imgsz: int,
     min_iou: float,
 ) -> dict:
-    ground_truth = _load_ground_truth(dataset_dir)
-    model = YOLO(str(model_path))
-    minimum_threshold = min(thresholds)
-    predictions = model.predict(
-        [str(row["image"]) for row in ground_truth],
-        conf=minimum_threshold,
-        iou=0.6,
-        imgsz=imgsz,
-        device=device,
-        batch=batch,
-        verbose=False,
-    )
+    # 지연 import로 pure helper 테스트가 ultralytics 설치/모델 로드에 의존하지 않게 한다.
+    from ultralytics import YOLO
 
-    report = {"model": str(model_path.resolve()), "dataset": str(dataset_dir.resolve()), "thresholds": {}}
+    ground_truth = _load_ground_truth(dataset_dir)
+    model = YOLO(str(model_path), task="detect")
+    minimum_threshold = min(thresholds)
+    sources = [str(row["image"]) for row in ground_truth]
+    exported_backend = model_path.is_dir() or model_path.suffix.lower() != ".pt"
+    if exported_backend:
+        # Ultralytics export backends (notably NCNN) can return a single result
+        # for a source list and then index it as if it were a batch.  Sequential
+        # inference is slower but is required for production-faithful gating.
+        predictions = [
+            model.predict(
+                source,
+                conf=minimum_threshold,
+                iou=0.6,
+                imgsz=imgsz,
+                device=device,
+                batch=1,
+                verbose=False,
+            )[0]
+            for source in sources
+        ]
+    else:
+        predictions = model.predict(
+            sources,
+            conf=minimum_threshold,
+            iou=0.6,
+            imgsz=imgsz,
+            device=device,
+            batch=batch,
+            verbose=False,
+        )
+
+    report = {
+        "model": str(model_path.resolve()),
+        "model_format": "ncnn" if model_path.is_dir() else model_path.suffix.lstrip(".").lower(),
+        "dataset": str(dataset_dir.resolve()),
+        "raw_image_root": str((dataset_dir / "images" / "val").resolve()),
+        "prediction_confidence_floor": float(minimum_threshold),
+        "thresholds": {},
+    }
+    prediction_candidates = []
+    for result in predictions:
+        candidates = []
+        if result.boxes is not None:
+            for box, class_id, confidence in zip(
+                result.boxes.xyxy.cpu().tolist(),
+                result.boxes.cls.cpu().tolist(),
+                result.boxes.conf.cpu().tolist(),
+            ):
+                candidates.append(
+                    {
+                        "bbox": [float(value) for value in box],
+                        "class_id": int(class_id),
+                        "class_name": model.names[int(class_id)],
+                        "confidence": float(confidence),
+                    }
+                )
+        prediction_candidates.append(candidates)
+
     for threshold in thresholds:
         outcomes = Counter()
         per_class = defaultdict(Counter)
         confusion = Counter()
         details = []
-        for truth, result in zip(ground_truth, predictions):
-            candidates = []
-            if result.boxes is not None:
-                for box, class_id, confidence in zip(
-                    result.boxes.xyxy.cpu().tolist(),
-                    result.boxes.cls.cpu().tolist(),
-                    result.boxes.conf.cpu().tolist(),
-                ):
-                    if confidence >= threshold:
-                        candidates.append(
-                            {
-                                "bbox": box,
-                                "class_id": int(class_id),
-                                "class_name": model.names[int(class_id)],
-                                "confidence": float(confidence),
-                            }
-                        )
-            best = max(candidates, key=lambda item: item["confidence"], default=None)
-            expected = truth["class_name"]
+        for truth, candidates in zip(ground_truth, prediction_candidates):
+            detail = build_detection_detail(truth, candidates, threshold, min_iou)
+            expected = detail["expected"]
+            predicted = detail["predicted"]
+            outcome = detail["outcome"]
             per_class[expected]["total"] += 1
-            if truth["class_id"] is None:
-                outcome = "negative_clean" if best is None else "negative_false_positive"
-            elif best is None:
-                outcome = "positive_missed"
-            else:
-                overlap = _iou(truth["bbox"], best["bbox"])
-                if overlap < min_iou:
-                    outcome = "positive_background_false_positive"
-                elif best["class_id"] != truth["class_id"]:
-                    outcome = "positive_wrong_class"
-                else:
-                    outcome = "positive_correct"
             outcomes[outcome] += 1
             per_class[expected][outcome] += 1
-            confusion[(expected, best["class_name"] if best else "none")] += 1
-            details.append(
-                {
-                    "image": truth["image"].name,
-                    "expected": expected,
-                    "predicted": best["class_name"] if best else None,
-                    "confidence": round(best["confidence"], 5) if best else None,
-                    "iou": round(_iou(truth["bbox"], best["bbox"]), 5) if best and truth["bbox"] else None,
-                    "outcome": outcome,
-                }
-            )
+            confusion[(expected, predicted if predicted else "none")] += 1
+            details.append(detail)
 
         positives = sum(1 for row in ground_truth if row["class_id"] is not None)
         negatives = len(ground_truth) - positives

@@ -339,6 +339,30 @@ MobileNetV4/RepViT 채택은 validation macro-F1, 오분류 혼동행렬, ONNX �
   제외했다. 필요하면 `select_curated_yolo_dataset.py`를 유휴 시간에 worker 2 이하로
   실행한다. 중간 생성물만 제거했으며 원본 데이터는 건드리지 않았다.
 
+### 실제 YOLO proposal + background 후보 (2026-08-25)
+
+기존 9종 검증기는 정답 bbox crop에서는 강하지만, 실제 YOLO가 배경이나 물체 일부를
+잘못 잡은 crop에도 반드시 9종 중 하나를 출력한다. 운영 NCNN과 실제 선택 bbox로
+positive 35장·negative 6장을 다시 평가했을 때 범용 교정 정책은 승격 게이트를 통과하지
+못했다. 따라서 기존 YOLO와 현재 제한적 교정은 유지하고 다음 후보를 별도로 학습한다.
+
+- 입력은 정답 crop이 아니라 운영 YOLO가 실제 생성한 proposal bbox만 사용한다.
+- 원본 정답이 0개 또는 1개인 이미지만 허용하고 다중 객체 이미지는 제외한다.
+- proposal IoU가 `0.50` 이상이면 정답 품목, `0.10` 이하면 열 번째 내부 클래스
+  `background`, 그 사이는 애매한 표본으로 제외한다.
+- `background`는 학습·검증기 내부 전용이며 API와 Spring callback에는 절대 반환하지
+  않는다. background 판정으로 기존 저신뢰 결과를 `ALLOWED`로 승격하지 않는다.
+- 9종 체크포인트의 backbone·상태 head·material 첫 9행을 이어받고 background 행만
+  새로 초기화한다. 상태 head 출력 계약은 그대로 유지한다.
+- NAS 자동 체인은 `scripts/nas/watch_proposal_verifier_pipeline.sh`로 proposal 생성과
+  후보 학습까지만 수행한다. 운영 가중치를 자동 교체하지 않는다.
+
+승격 평가는 `scripts/evaluate_hardware_detector.py`가 기록한 운영 NCNN 선택 bbox와
+`scripts/evaluate_hybrid_policy.py`를 사용한다. 정답 bbox crop만으로 만든 결과는 배포
+근거로 인정하지 않는다. 실기기 외부 정확도 `+5%p`, macro-F1 비하락, 품목별 recall
+하락 `1%p` 이내, negative specificity 비하락, harmful correction 0건, negative의
+허용 계열 승격 0건을 모두 만족해야 한다.
+
 ## 6. 단계별 적용 기준
 
 1. 1일차에는 소량 v3 crop과 Qwen teacher 50건으로 끝까지 흐르는 prototype을 만든다.

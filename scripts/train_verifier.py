@@ -3,6 +3,10 @@
 기본 백본은 배포 호환성이 검증된 MobileNetV3-Small이다. 최신 경량 후보는
 `--backbone mobilenetv4_conv_small.e2400_r224_in1k`처럼 timm 이름을 넘겨
 동일 데이터에서 비교한다. 실제 Pi5 ONNX/NCNN 지연시간을 측정한 뒤 채택한다.
+
+기본 material 계약은 기존 9종을 그대로 유지한다. 명시적으로
+`--include-background`를 지정한 학습에서만 열 번째 ``background`` 클래스를
+추가한다.
 """
 
 from __future__ import annotations
@@ -24,10 +28,39 @@ CLASS_NAMES = [
     "can", "pet", "paper", "plastic", "styrofoam",
     "vinyl", "glass", "battery", "fluorescent",
 ]
+BACKGROUND_CLASS_NAME = "background"
+BACKGROUND_CLASS_NAMES = [*CLASS_NAMES, BACKGROUND_CLASS_NAME]
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 TASK_NAMES = ("material", "dent", "label", "foreign_material")
 TASK_CLASSES = {"material": set(range(9)), "dent": {0, 1}, "label": {0, 1}, "foreign_material": {0, 1}}
+
+
+def material_class_names(include_background: bool = False) -> list[str]:
+    """Return a fresh material-class contract for one training run."""
+    return list(BACKGROUND_CLASS_NAMES if include_background else CLASS_NAMES)
+
+
+def task_classes_for(classes: list[str] | tuple[str, ...]) -> dict[str, set[int]]:
+    return {
+        "material": set(range(len(classes))),
+        "dent": {0, 1},
+        "label": {0, 1},
+        "foreign_material": {0, 1},
+    }
+
+
+def validate_task_labels(rows, classes: list[str] | tuple[str, ...]) -> None:
+    """Fail early when a manifest contains a label outside the active contract."""
+    allowed_by_task = task_classes_for(classes)
+    for row_index, row in enumerate(rows, start=1):
+        for task, allowed in allowed_by_task.items():
+            value = row[task]
+            if value >= 0 and value not in allowed:
+                raise ValueError(
+                    f"manifest row {row_index}: {task}={value} is outside "
+                    f"the active classes {sorted(allowed)}"
+                )
 
 
 def read_manifest(
@@ -65,10 +98,14 @@ def read_manifest(
     return rows
 
 
-def enabled_tasks_for(rows) -> list[str]:
+def enabled_tasks_for(
+    rows,
+    classes: list[str] | tuple[str, ...] = CLASS_NAMES,
+) -> list[str]:
     enabled = []
+    task_classes = task_classes_for(classes)
     for task in TASK_NAMES:
-        required = TASK_CLASSES[task]
+        required = task_classes[task]
         train_values = {
             row[task] for row in rows
             if row["split"] == "training" and row[task] >= 0
@@ -118,10 +155,20 @@ def _build_backbone(name: str, pretrained: bool):
 
 
 class CropVerifier(nn.Module):
-    def __init__(self, backbone_name: str, pretrained: bool = True):
+    def __init__(
+        self,
+        backbone_name: str,
+        pretrained: bool = True,
+        material_classes: list[str] | tuple[str, ...] = CLASS_NAMES,
+    ):
         super().__init__()
+        if not material_classes or len(set(material_classes)) != len(material_classes):
+            raise ValueError("material_classes must be non-empty and unique")
+        self.material_classes = tuple(material_classes)
         self.backbone, features = _build_backbone(backbone_name, pretrained)
-        self.material_head = nn.Sequential(nn.Dropout(0.2), nn.Linear(features, len(CLASS_NAMES)))
+        self.material_head = nn.Sequential(
+            nn.Dropout(0.2), nn.Linear(features, len(self.material_classes)),
+        )
         self.dent_head = nn.Sequential(nn.Dropout(0.2), nn.Linear(features, 2))
         self.label_head = nn.Sequential(nn.Dropout(0.2), nn.Linear(features, 2))
         self.foreign_head = nn.Sequential(nn.Dropout(0.2), nn.Linear(features, 2))
@@ -158,14 +205,22 @@ def _masked_loss(logits, target, criterion, sample_weight=None):
     return losses.mean(), correct, mask.sum().item()
 
 
-def run_epoch(model, loader, criteria, task_weights, device, optimizer=None):
+def run_epoch(
+    model,
+    loader,
+    criteria,
+    task_weights,
+    device,
+    optimizer=None,
+    material_classes: list[str] | tuple[str, ...] = CLASS_NAMES,
+):
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
     correct = {name: 0 for name in TASK_NAMES}
     counts = {name: 0 for name in TASK_NAMES}
-    material_correct = [0] * len(CLASS_NAMES)
-    material_counts = [0] * len(CLASS_NAMES)
+    material_correct = [0] * len(material_classes)
+    material_counts = [0] * len(material_classes)
 
     for image, material, dent, label, foreign, label_weight in loader:
         image = image.to(device)
@@ -178,11 +233,11 @@ def run_epoch(model, loader, criteria, task_weights, device, optimizer=None):
                 material_truth = targets[0][material_mask]
                 material_guess = outputs[0][material_mask].argmax(1)
                 batch_counts = torch.bincount(
-                    material_truth, minlength=len(CLASS_NAMES),
+                    material_truth, minlength=len(material_classes),
                 ).detach().cpu().tolist()
                 batch_correct = torch.bincount(
                     material_truth[material_guess == material_truth],
-                    minlength=len(CLASS_NAMES),
+                    minlength=len(material_classes),
                 ).detach().cpu().tolist()
                 material_counts = [
                     total + value for total, value in zip(material_counts, batch_counts)
@@ -213,13 +268,90 @@ def run_epoch(model, loader, criteria, task_weights, device, optimizer=None):
         for task in TASK_NAMES
     }
     material_class_accuracy = {
-        CLASS_NAMES[index]: (
+        material_classes[index]: (
             material_correct[index] / material_counts[index]
             if material_counts[index] else None
         )
-        for index in range(len(CLASS_NAMES))
+        for index in range(len(material_classes))
     }
     return total_loss / max(1, len(loader)), accuracy, counts, material_class_accuracy
+
+
+def load_initial_checkpoint_state(
+    model: CropVerifier,
+    checkpoint: dict,
+    target_classes: list[str] | tuple[str, ...],
+) -> dict:
+    """Load an exact checkpoint or expand the legacy 9-class material head.
+
+    For the opt-in 10-class model, every compatible tensor is transferred from
+    the 9-class checkpoint. The first nine rows of the material classifier are
+    copied and the new background row retains the model's normal initialization.
+    """
+    source_classes = list(checkpoint.get("classes", CLASS_NAMES))
+    target_classes = list(target_classes)
+    source_state = checkpoint.get("state_dict")
+    if not isinstance(source_state, dict):
+        raise RuntimeError("초기 체크포인트에 state_dict가 없습니다.")
+
+    if source_classes == target_classes:
+        model.load_state_dict(source_state)
+        return {"mode": "exact", "source_classes": source_classes}
+
+    expanding_background = (
+        source_classes == CLASS_NAMES
+        and target_classes == BACKGROUND_CLASS_NAMES
+    )
+    if not expanding_background:
+        raise RuntimeError("초기 체크포인트 class 순서가 현재 계약과 다릅니다.")
+
+    target_state = model.state_dict()
+    missing = sorted(set(target_state) - set(source_state))
+    unexpected = sorted(set(source_state) - set(target_state))
+    if missing or unexpected:
+        raise RuntimeError(
+            f"초기 체크포인트 state_dict 키 불일치: missing={missing}, "
+            f"unexpected={unexpected}"
+        )
+
+    material_output = model.material_head[-1]
+    material_output_name = next(
+        name for name, module in model.named_modules() if module is material_output
+    )
+    expanded_keys = {f"{material_output_name}.weight"}
+    if material_output.bias is not None:
+        expanded_keys.add(f"{material_output_name}.bias")
+
+    expanded_state = {}
+    source_count = len(source_classes)
+    target_count = len(target_classes)
+    for key, target_tensor in target_state.items():
+        source_tensor = source_state[key]
+        if key in expanded_keys:
+            if (
+                source_tensor.shape[0] != source_count
+                or target_tensor.shape[0] != target_count
+                or source_tensor.shape[1:] != target_tensor.shape[1:]
+            ):
+                raise RuntimeError(
+                    f"초기 체크포인트 material head shape 불일치: "
+                    f"{key}={tuple(source_tensor.shape)} -> {tuple(target_tensor.shape)}"
+                )
+            expanded = target_tensor.clone()
+            expanded[:source_count].copy_(
+                source_tensor.to(device=expanded.device, dtype=expanded.dtype)
+            )
+            expanded_state[key] = expanded
+        else:
+            if source_tensor.shape != target_tensor.shape:
+                raise RuntimeError(
+                    f"초기 체크포인트 tensor shape 불일치: "
+                    f"{key}={tuple(source_tensor.shape)} -> {tuple(target_tensor.shape)}"
+                )
+            expanded_state[key] = source_tensor
+
+    model.load_state_dict(expanded_state)
+    return {"mode": "expanded_background", "source_classes": source_classes}
 
 
 def _parse_oversample_spec(value: str) -> tuple[str, int]:
@@ -280,6 +412,10 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--init-checkpoint")
     parser.add_argument(
+        "--include-background", action="store_true",
+        help="material head에 열 번째 background 클래스를 명시적으로 추가합니다.",
+    )
+    parser.add_argument(
         "--camera-augmentation", action="store_true",
         help="하드웨어 카메라의 원근·약한 초점 흐림을 모사합니다.",
     )
@@ -294,13 +430,20 @@ def main():
     parser.add_argument("--selection-label-weight", type=float, default=1.0)
     parser.add_argument("--selection-foreign-weight", type=float, default=1.0)
     parser.add_argument(
-        "--selection-material-target", action="append", default=[], choices=CLASS_NAMES,
+        "--selection-material-target", action="append", default=[],
+        choices=BACKGROUND_CLASS_NAMES,
         help="체크포인트 선택에서 별도 평균 재현율을 계산할 품목입니다.",
     )
     parser.add_argument("--selection-material-target-weight", type=float, default=0.0)
     args = parser.parse_args()
     if args.oversample_repeats < 1:
         parser.error("--oversample-repeats must be positive")
+    active_classes = material_class_names(args.include_background)
+    if (
+        BACKGROUND_CLASS_NAME in args.selection_material_target
+        and not args.include_background
+    ):
+        parser.error("background target 사용 시 --include-background가 필요합니다.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -316,6 +459,10 @@ def main():
     val_rows = [row for row in rows if row["split"] == "validation"]
     if not train_rows or not val_rows:
         raise SystemExit("[ERROR] manifest에 training/validation 데이터가 모두 필요합니다.")
+    try:
+        validate_task_labels(rows, active_classes)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device={device} train={len(train_rows):,} val={len(val_rows):,}", flush=True)
@@ -323,7 +470,7 @@ def main():
         task: sum(row[task] >= 0 for row in train_rows)
         for task in TASK_NAMES
     }
-    enabled_tasks = enabled_tasks_for(rows)
+    enabled_tasks = enabled_tasks_for(rows, active_classes)
     print(f"labeled counts={label_counts}", flush=True)
     print(f"enabled tasks={enabled_tasks}", flush=True)
 
@@ -362,7 +509,12 @@ def main():
         shuffle=False, num_workers=args.workers, pin_memory=True,
     )
 
-    model = CropVerifier(args.backbone, pretrained=not bool(args.init_checkpoint))
+    model = CropVerifier(
+        args.backbone,
+        pretrained=not bool(args.init_checkpoint),
+        material_classes=active_classes,
+    )
+    initial_checkpoint_info = None
     if args.init_checkpoint:
         initial = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
         if initial.get("backbone") != args.backbone:
@@ -372,13 +524,19 @@ def main():
             )
         if int(initial.get("input_size", args.size)) != args.size:
             raise RuntimeError("초기 체크포인트 input_size가 요청 size와 다릅니다.")
-        if initial.get("classes", CLASS_NAMES) != CLASS_NAMES:
-            raise RuntimeError("초기 체크포인트 class 순서가 현재 계약과 다릅니다.")
-        model.load_state_dict(initial["state_dict"])
-        print(f"initial checkpoint={args.init_checkpoint}", flush=True)
+        initial_checkpoint_info = load_initial_checkpoint_state(
+            model, initial, active_classes,
+        )
+        print(
+            f"initial checkpoint={args.init_checkpoint} "
+            f"mode={initial_checkpoint_info['mode']}",
+            flush=True,
+        )
     model = model.to(device)
     weight_values = {
-        "material": class_weights([row["material"] for row in train_rows], len(CLASS_NAMES)),
+        "material": class_weights(
+            [row["material"] for row in train_rows], len(active_classes),
+        ),
         "dent": class_weights([row["dent"] for row in train_rows], 2),
         "label": class_weights([row["label"] for row in train_rows], 2),
         "foreign_material": class_weights([row["foreign_material"] for row in train_rows], 2),
@@ -423,9 +581,11 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_loss, train_metrics, _, train_material_classes = run_epoch(
             model, train_loader, criteria, task_weights, device, optimizer,
+            active_classes,
         )
         val_loss, val_metrics, val_counts, val_material_classes = run_epoch(
             model, val_loader, criteria, task_weights, device,
+            material_classes=active_classes,
         )
         scheduler.step()
         available = {
@@ -467,7 +627,12 @@ def main():
                     "state_dict": model.state_dict(),
                     "backbone": args.backbone,
                     "input_size": args.size,
-                    "classes": CLASS_NAMES,
+                    "classes": active_classes,
+                    "include_background": args.include_background,
+                    "background_class_id": (
+                        active_classes.index(BACKGROUND_CLASS_NAME)
+                        if args.include_background else None
+                    ),
                     "epoch": epoch,
                     "selection_score": score,
                     "selection_weights": selection_weights,
@@ -485,7 +650,11 @@ def main():
                 break
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    export_model = CropVerifier(checkpoint["backbone"], pretrained=False)
+    checkpoint_classes = list(checkpoint.get("classes", CLASS_NAMES))
+    export_model = CropVerifier(
+        checkpoint["backbone"], pretrained=False,
+        material_classes=checkpoint_classes,
+    )
     export_model.load_state_dict(checkpoint["state_dict"])
     onnx_path = output_dir / "verifier.onnx"
     export_onnx(export_model, onnx_path, checkpoint["input_size"])
@@ -504,13 +673,20 @@ def main():
     metadata = {
         "backbone": args.backbone,
         "input_size": args.size,
-        "classes": CLASS_NAMES,
+        "classes": checkpoint_classes,
+        "material_class_count": len(checkpoint_classes),
+        "include_background": BACKGROUND_CLASS_NAME in checkpoint_classes,
+        "background_class_id": (
+            checkpoint_classes.index(BACKGROUND_CLASS_NAME)
+            if BACKGROUND_CLASS_NAME in checkpoint_classes else None
+        ),
         "outputs": list(TASK_NAMES),
         "enabled_outputs": enabled_outputs,
         "training_label_counts": label_counts,
         "task_class_counts": task_class_counts,
         "uses_label_proxy": args.use_label_proxy,
         "initial_checkpoint": args.init_checkpoint,
+        "initial_checkpoint_transfer": initial_checkpoint_info,
         "camera_augmentation": args.camera_augmentation,
         "best_epoch": checkpoint.get("epoch"),
         "best_selection_score": checkpoint.get("selection_score"),
