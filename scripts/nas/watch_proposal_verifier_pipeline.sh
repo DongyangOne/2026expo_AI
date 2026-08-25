@@ -52,6 +52,7 @@ $DOCKER_BIN run --rm --gpus all "$ULTRALYTICS_IMAGE" \
 
 if [ ! -s "$WORK/manifest.csv" ]; then
   $DOCKER_BIN run -d --name "$PREP_CONTAINER" --gpus all \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -v "$ROOT:/app" \
     "$ULTRALYTICS_IMAGE" \
     python3 /app/expo_ai_proposal_20260825/scripts/prepare_proposal_verifier_dataset.py \
@@ -59,7 +60,7 @@ if [ ! -s "$WORK/manifest.csv" ]; then
       --data /app/yolo_mixed_replay_v2_20260819/dataset_mixed.yaml \
       --dataset-dir /app/yolo_mixed_replay_v2_20260819 \
       --output-dir /app/proposal_verifier_bg_v1_20260825 \
-      --device 0 --batch 28 --imgsz 640 --conf 0.05 \
+      --device 0 --batch 12 --imgsz 640 --conf 0.05 \
       --positive-iou 0.50 --negative-iou 0.10 \
       --crop-size 320 --padding 0.08 \
       --max-per-class 10000 --val-max-per-class 2000 \

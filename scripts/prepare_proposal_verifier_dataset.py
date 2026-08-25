@@ -503,11 +503,13 @@ def iter_yolo_predictions(
 
     # Export backends such as NCNN do not implement list batching consistently
     # in Ultralytics (some versions index a one-item result with the source-list
-    # index).  They are used for production-faithful evaluation, so keep those
-    # backends sequential while retaining batched GPU inference for .pt models.
+    # index). Keep those backends sequential. For .pt models, hand Ultralytics
+    # exactly one batch at a time: very large source lists can make its predictor
+    # retain oversized intermediate buffers even though ``batch`` is smaller,
+    # which caused repeatable CUDA OOMs on the QNAP 16 GiB GPU.
     exported_backend = model_path.is_dir() or model_path.suffix.lower() != ".pt"
     model = YOLO(str(model_path), task="detect")
-    chunk_size = 1 if exported_backend else max(batch, min(1024, batch * 32))
+    chunk_size = 1 if exported_backend else batch
     started = time.monotonic()
     processed = 0
     for start in range(0, len(records), chunk_size):
