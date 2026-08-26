@@ -58,6 +58,14 @@ for artifact in \
   fi
 done
 
+# The gate evaluates the exported verifier with ONNX Runtime.  Check this
+# before the multi-hour training run so a stale training image fails fast.
+if ! $DOCKER_BIN run --rm "$TRAIN_IMAGE" \
+  python3 -c 'import onnxruntime as ort; print(ort.__version__)'; then
+  printf '%s\n' "training image missing onnxruntime; rebuild Dockerfile.training" > "$CONTROL/failed.txt"
+  exit 124
+fi
+
 if ! $DOCKER_BIN run --rm --gpus all ultralytics/ultralytics:latest \
   python3 -c 'import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))'; then
   printf '%s\n' "GPU preflight failed" > "$CONTROL/failed.txt"
