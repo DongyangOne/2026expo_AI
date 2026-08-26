@@ -72,7 +72,7 @@ fi
 test -s "$WORK/manifest.csv"
 test -s "$WORK/dataset_info.json"
 
-$DOCKER_BIN run -d --name "$TRAIN_CONTAINER" --gpus all \
+$DOCKER_BIN run -d --name "$TRAIN_CONTAINER" --gpus all --shm-size 8g \
   -v "$ROOT:/app" \
   "$TRAIN_IMAGE" \
   python3 /app/expo_ai_proposal_20260825/scripts/train_verifier.py \
