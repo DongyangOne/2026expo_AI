@@ -656,13 +656,15 @@ def evaluate_policy(
     *,
     include_audit: bool = True,
     trust_confidence: float = DEFAULT_TRUST_CONFIDENCE,
+    allow_background_veto: bool = False,
 ) -> dict:
     """하나의 보수적 교정 정책을 평가한다.
 
     margin은 운영 코드와 동일하게 verifier top-1 confidence에서 YOLO confidence를
     뺀 값이다. 검출 실패와 외부 계약상 같은 PET↔plastic은 교정하지 않는다. 실제
     운영에서는 GT localization을 알 수 없으므로 잘못된 bbox도 정책 대상에는 포함하되,
-    정확도 계산에서는 교정으로 고쳐진 것으로 세지 않는다.
+    정확도 계산에서는 교정으로 고쳐진 것으로 세지 않는다. background veto는 명시적으로
+    허용한 경우에만 같은 confidence/margin 조건을 통과한 YOLO 검출을 억제한다.
     """
     baseline_predictions = [row["baseline_external"] for row in rows]
     hybrid_predictions = []
@@ -678,14 +680,27 @@ def evaluate_policy(
             confidence - baseline_confidence
             if confidence is not None and baseline_confidence is not None else None
         )
-        disagreement = baseline is not None and verifier is not None and verifier != baseline
+        background_prediction = row.get("verifier_internal") == "background"
+        disagreement = baseline is not None and (
+            background_prediction or (verifier is not None and verifier != baseline)
+        )
         applied = False
+        background_veto_applied = False
         if baseline is None:
             reason = "no_baseline_detection"
         elif row.get("selected_bbox") is None:
             reason = "missing_selected_bbox"
-        elif row.get("verifier_internal") == "background":
-            reason = "verifier_background_retain_yolo"
+        elif background_prediction:
+            if not allow_background_veto:
+                reason = "verifier_background_retain_yolo"
+            elif confidence is None or confidence < verifier_confidence:
+                reason = "background_veto_below_verifier_confidence"
+            elif score_margin is None or score_margin < verifier_over_yolo_margin:
+                reason = "background_veto_below_verifier_over_yolo_margin"
+            else:
+                reason = "background_veto_applied"
+                applied = True
+                background_veto_applied = True
         elif verifier is None:
             reason = "no_verifier_prediction"
         elif not disagreement:
@@ -699,7 +714,11 @@ def evaluate_policy(
             applied = True
 
         final = verifier if applied else baseline
-        final_confidence = confidence if applied else baseline_confidence
+        final_confidence = (
+            None if background_veto_applied
+            else confidence if applied
+            else baseline_confidence
+        )
         baseline_allowed_like = bool(
             baseline in ALLOWED_LIKE_CLASSES
             and baseline_confidence is not None
@@ -720,7 +739,14 @@ def evaluate_policy(
         )
         if applied:
             corrections["applied"] += 1
-            if negative_to_allowed_like:
+            if background_veto_applied:
+                corrections["background_veto_applied"] += 1
+            if background_veto_applied and not row.get("is_negative"):
+                # positive 검출을 없애는 veto는 baseline이 이미 오답이어도 안전한
+                # 개선으로 간주할 수 없다. 별도 harmful 유형으로 배포 gate에서 막는다.
+                effect = "harmful_positive_suppression"
+                corrections["harmful"] += 1
+            elif negative_to_allowed_like:
                 # 정답이 negative인 물체를 허용 계열로 올리는 전환은 baseline도
                 # 오답이었더라도 운영상 악화이므로 harmful로 센다.
                 effect = "harmful_negative_promotion"
@@ -767,6 +793,14 @@ def evaluate_policy(
                     "verifier_over_yolo_margin": score_margin,
                     "external_disagreement": disagreement,
                     "applied": applied,
+                    "correction_type": (
+                        "background_veto"
+                        if background_veto_applied
+                        else "class_correction" if applied
+                        else None
+                    ),
+                    "background_veto_enabled": allow_background_veto,
+                    "background_veto_applied": background_veto_applied,
                     "reason": reason,
                     "final": final,
                     "final_confidence": final_confidence,
@@ -784,11 +818,14 @@ def evaluate_policy(
     harmful = corrections["harmful"]
     wrong_to_wrong = corrections["wrong_to_wrong"]
     negative_promotions = corrections["negative_to_allowed_like_promotions"]
+    background_vetoes = corrections["background_veto_applied"]
+    harmful_positive_suppressions = corrections["harmful_positive_suppression"]
     return {
         "policy": {
             "verifier_confidence": verifier_confidence,
             "verifier_over_yolo_margin": verifier_over_yolo_margin,
             "trust_confidence": trust_confidence,
+            "allow_background_veto": allow_background_veto,
         },
         "metrics": {
             "baseline": baseline_metrics,
@@ -811,6 +848,8 @@ def evaluate_policy(
             "harmful": harmful,
             "wrong_to_wrong": wrong_to_wrong,
             "negative_to_allowed_like_promotions": negative_promotions,
+            "background_veto_applied": background_vetoes,
+            "harmful_positive_suppression": harmful_positive_suppressions,
             "net_gain": beneficial - harmful,
             "beneficial_fraction": beneficial / applied if applied else None,
         },
@@ -917,6 +956,7 @@ def sweep_policies(
     max_harmful: int = 0,
     max_wrong_to_wrong: int | None = None,
     trust_confidence: float = DEFAULT_TRUST_CONFIDENCE,
+    allow_background_veto: bool = False,
 ) -> dict:
     """grid sweep 후 모든 배포 metric gate를 만족하는 정책만 선택한다."""
     confidences = _validate_thresholds(confidence_thresholds, name="confidence")
@@ -936,6 +976,7 @@ def sweep_policies(
                 margin,
                 include_audit=False,
                 trust_confidence=trust_confidence,
+                allow_background_veto=allow_background_veto,
             )
             corrections = result["corrections"]
             metric_gate = deployment_metric_gate(result)
@@ -1129,6 +1170,7 @@ def build_report(
     max_wrong_to_wrong: int | None = None,
     verifier_prediction_source: str = "ground_truth_manifest_crop",
     trust_confidence: float = DEFAULT_TRUST_CONFIDENCE,
+    allow_background_veto: bool = False,
 ) -> dict:
     rows = combine_predictions(manifest_rows, baseline_details, verifier_predictions)
     policy_search = sweep_policies(
@@ -1138,6 +1180,7 @@ def build_report(
         max_harmful=max_harmful,
         max_wrong_to_wrong=max_wrong_to_wrong,
         trust_confidence=trust_confidence,
+        allow_background_veto=allow_background_veto,
     )
     selected_policy = policy_search["selection"]["policy"]
     if selected_policy is None:
@@ -1147,6 +1190,7 @@ def build_report(
             1.000001,
             include_audit=True,
             trust_confidence=trust_confidence,
+            allow_background_veto=allow_background_veto,
         )
         # confidence=1/margin=1은 선택된 정책이 아니므로 오해하지 않게 명시한다.
         selected["policy"] = None
@@ -1157,6 +1201,7 @@ def build_report(
             selected_policy["verifier_over_yolo_margin"],
             include_audit=True,
             trust_confidence=trust_confidence,
+            allow_background_veto=allow_background_veto,
         )
     metric_gate = deployment_metric_gate(selected)
     ground_truth_crop = verifier_prediction_source == "ground_truth_manifest_crop"
@@ -1200,6 +1245,11 @@ def build_report(
             "normalization": {"pet": "plastic"},
             "margin_definition": "verifier_confidence - yolo_confidence",
             "trust_confidence": trust_confidence,
+            "background_policy": (
+                "veto_at_policy_thresholds"
+                if allow_background_veto
+                else "retain_yolo"
+            ),
             "localization_rule": sorted(LOCALIZED_OUTCOMES),
         },
         "joined_rows": len(rows),
@@ -1284,6 +1334,14 @@ def main() -> None:
     parser.add_argument("--max-harmful", type=int, default=0)
     parser.add_argument("--max-wrong-to-wrong", type=int)
     parser.add_argument("--trust-confidence", type=float, default=DEFAULT_TRUST_CONFIDENCE)
+    parser.add_argument(
+        "--allow-background-veto",
+        action="store_true",
+        help=(
+            "10-class verifier가 background를 confidence/margin 임계값 이상으로 "
+            "예측하면 선택된 YOLO 검출을 NOT_DETECTED로 억제"
+        ),
+    )
     args = parser.parse_args()
 
     baseline_payload = json.loads(args.baseline_report.read_text(encoding="utf-8"))
@@ -1333,6 +1391,7 @@ def main() -> None:
         max_wrong_to_wrong=args.max_wrong_to_wrong,
         verifier_prediction_source=prediction_source,
         trust_confidence=args.trust_confidence,
+        allow_background_veto=args.allow_background_veto,
     )
     report["inputs"] = {
         "manifest": str(args.manifest.resolve()) if args.manifest is not None else None,
@@ -1352,6 +1411,7 @@ def main() -> None:
         ),
         "verifier_input_size": input_size,
         "raw_image_root": str(raw_image_root.resolve()) if raw_image_root else None,
+        "allow_background_veto": args.allow_background_veto,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

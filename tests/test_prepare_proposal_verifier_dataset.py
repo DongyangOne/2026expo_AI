@@ -237,3 +237,164 @@ def test_fake_predictions_write_split_preserving_audit_manifest(tmp_path):
     for row in rows:
         crop = cv2.imread(str(output / row["filepath"]))
         assert crop.shape == (32, 32, 3)
+
+
+def test_runtime_top1_with_no_ground_truth_only_background_policy(tmp_path):
+    dataset = tmp_path / "dataset"
+    for split in ("train", "val"):
+        image_dir = dataset / "images" / split
+        label_dir = dataset / "labels" / split
+        image_dir.mkdir(parents=True)
+        label_dir.mkdir(parents=True)
+        for stem in ("positive", "contaminated", "empty"):
+            image = np.full((100, 120, 3), 200, dtype=np.uint8)
+            assert cv2.imwrite(str(image_dir / f"{stem}.jpg"), image)
+            label_text = "" if stem == "empty" else "2 0.5 0.5 0.5 0.4\n"
+            (label_dir / f"{stem}.txt").write_text(label_text, encoding="utf-8")
+
+    data = tmp_path / "data.yaml"
+    data.write_text(
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "names: [can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent]\n",
+        encoding="utf-8",
+    )
+
+    def fake_predictions(sources):
+        for source in sources:
+            if source.path.stem == "positive":
+                proposals = (
+                    Proposal(3, 0.40, (0.0, 0.0, 10.0, 10.0), "plastic"),
+                    Proposal(4, 0.90, (30.0, 30.0, 90.0, 70.0), "styrofoam"),
+                    Proposal(2, 0.89, (30.0, 30.0, 90.0, 70.0), "paper"),
+                )
+            elif source.path.stem == "contaminated":
+                proposals = (
+                    Proposal(2, 0.80, (30.0, 30.0, 90.0, 70.0), "paper"),
+                    Proposal(3, 0.99, (0.0, 0.0, 10.0, 10.0), "plastic"),
+                )
+            else:
+                proposals = (
+                    Proposal(3, 0.20, (1.0, 1.0, 20.0, 20.0), "plastic"),
+                    Proposal(5, 0.85, (20.0, 20.0, 80.0, 80.0), "vinyl"),
+                    Proposal(2, 0.80, (30.0, 30.0, 70.0, 70.0), "paper"),
+                )
+            yield PredictedFrame(source, 120, 100, proposals)
+
+    output = tmp_path / "runtime-proposal-crops"
+    summary = build_proposal_verifier_dataset(
+        model_path=tmp_path / "not-loaded.pt",
+        data_path=data,
+        dataset_dir=dataset,
+        output_dir=output,
+        device="cpu",
+        batch=1,
+        imgsz=64,
+        conf=0.25,
+        positive_iou=0.5,
+        negative_iou=0.1,
+        crop_size=32,
+        padding=0.0,
+        max_per_class=10,
+        val_max_per_class=10,
+        max_background=10,
+        val_max_background=10,
+        seed=3,
+        min_free_gb=0,
+        max_output_gb=0,
+        jpeg_quality=90,
+        proposal_selection="runtime-top1",
+        background_policy="no-ground-truth-only",
+        prediction_provider=fake_predictions,
+    )
+
+    with (output / "manifest.csv").open(encoding="utf-8", newline="") as file:
+        rows = list(csv.DictReader(file))
+
+    assert summary["written_crops"] == 4
+    assert summary["proposal_policy"] == {
+        "selection_mode": "runtime-top1",
+        "minimum_confidence": 0.25,
+        "background_policy": "no-ground-truth-only",
+    }
+    assert summary["proposal_assignments"] == {
+        "positive_iou": 2,
+        "low_iou": 2,
+        "no_ground_truth": 2,
+    }
+    assert summary["proposal_policy_stats"] == {
+        "frames_seen": 6,
+        "proposals_seen": 16,
+        "discarded_by_runtime_top1": 8,
+        "proposals_selected": 6,
+        "background_rejected_gt_present": 2,
+        "below_min_confidence": 2,
+    }
+    assert {(row["split"], row["category"]) for row in rows} == {
+        ("training", "paper"),
+        ("training", "background"),
+        ("validation", "paper"),
+        ("validation", "background"),
+    }
+    assert {row["proposal_index"] for row in rows} == {"1"}
+    background_rows = [row for row in rows if row["category"] == "background"]
+    assert len(background_rows) == 2
+    assert {row["assignment"] for row in background_rows} == {"no_ground_truth"}
+    assert {row["source_object_count"] for row in background_rows} == {"0"}
+    assert {row["predicted_confidence"] for row in rows} == {
+        "0.90000000",
+        "0.85000000",
+    }
+
+
+def test_cross_split_source_path_is_rejected_before_prediction(tmp_path):
+    dataset = tmp_path / "dataset"
+    image_dir = dataset / "images" / "shared"
+    label_dir = dataset / "labels" / "shared"
+    image_dir.mkdir(parents=True)
+    label_dir.mkdir(parents=True)
+    assert cv2.imwrite(
+        str(image_dir / "same.jpg"), np.full((32, 32, 3), 200, dtype=np.uint8)
+    )
+    (label_dir / "same.txt").write_text(
+        "2 0.5 0.5 0.5 0.5\n", encoding="utf-8"
+    )
+    data = tmp_path / "data.yaml"
+    data.write_text(
+        "path: .\n"
+        "train: images/shared\n"
+        "val: images/shared\n"
+        "names: [can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent]\n",
+        encoding="utf-8",
+    )
+
+    def prediction_must_not_run(_sources):
+        raise AssertionError("prediction must not run after split leakage")
+
+    with pytest.raises(RuntimeError, match="crosses train/validation splits"):
+        build_proposal_verifier_dataset(
+            model_path=tmp_path / "not-loaded.pt",
+            data_path=data,
+            dataset_dir=dataset,
+            output_dir=tmp_path / "output",
+            device="cpu",
+            batch=1,
+            imgsz=32,
+            conf=0.25,
+            positive_iou=0.5,
+            negative_iou=0.1,
+            crop_size=32,
+            padding=0.0,
+            max_per_class=1,
+            val_max_per_class=1,
+            max_background=1,
+            val_max_background=1,
+            seed=1,
+            min_free_gb=0,
+            max_output_gb=0,
+            jpeg_quality=90,
+            proposal_selection="runtime-top1",
+            background_policy="no-ground-truth-only",
+            prediction_provider=prediction_must_not_run,
+        )

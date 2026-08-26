@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 from collections import Counter
 from pathlib import Path
@@ -34,6 +35,8 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 TASK_NAMES = ("material", "dent", "label", "foreign_material")
 TASK_CLASSES = {"material": set(range(9)), "dent": {0, 1}, "label": {0, 1}, "foreign_material": {0, 1}}
+CLASS_WEIGHT_MODES = ("inverse", "none", "effective-number")
+DEFAULT_CLASS_WEIGHT_BETA = 0.9999
 
 
 def material_class_names(include_background: bool = False) -> list[str]:
@@ -183,14 +186,104 @@ class CropVerifier(nn.Module):
         )
 
 
-def class_weights(values, classes: int):
+def class_weights(
+    values,
+    classes: int,
+    mode: str = "inverse",
+    beta: float = DEFAULT_CLASS_WEIGHT_BETA,
+):
+    """Build class weights while preserving the legacy inverse default.
+
+    Effective-number weights follow ``(1 - beta) / (1 - beta**count)`` and
+    are normalized to a mean of one so that changing the mode does not also
+    change the overall loss scale. Missing classes use a count of one, matching
+    the finite fallback used by the legacy inverse implementation.
+    """
+    if classes < 1:
+        raise ValueError("classes must be positive")
+    if mode not in CLASS_WEIGHT_MODES:
+        raise ValueError(f"unsupported class weight mode: {mode}")
+    if not math.isfinite(beta) or not 0 <= beta < 1:
+        raise ValueError("class weight beta must be finite and in [0, 1)")
+    if mode == "none":
+        return None
+
     counts = Counter(value for value in values if value >= 0)
     total = sum(counts.values())
     if total == 0:
         return None
-    return torch.tensor(
-        [total / (classes * max(1, counts.get(index, 0))) for index in range(classes)],
-        dtype=torch.float32,
+    finite_counts = [max(1, counts.get(index, 0)) for index in range(classes)]
+    if mode == "inverse":
+        return torch.tensor(
+            [total / (classes * count) for count in finite_counts],
+            dtype=torch.float32,
+        )
+
+    count_tensor = torch.tensor(finite_counts, dtype=torch.float64)
+    if beta == 0:
+        weights = torch.ones(classes, dtype=torch.float64)
+    else:
+        denominator = -torch.expm1(count_tensor * math.log(beta))
+        weights = (1 - beta) / denominator
+    weights = weights / weights.mean()
+    if not torch.isfinite(weights).all():
+        raise ValueError("effective-number class weights must be finite")
+    return weights.to(dtype=torch.float32)
+
+
+def build_criteria(weight_values, device, label_smoothing: float = 0.0):
+    if not math.isfinite(label_smoothing) or not 0 <= label_smoothing < 1:
+        raise ValueError("label smoothing must be finite and in [0, 1)")
+    return {
+        task: nn.CrossEntropyLoss(
+            weight=(weights.to(device) if weights is not None else None),
+            reduction="none",
+            label_smoothing=label_smoothing,
+        )
+        for task, weights in weight_values.items()
+    }
+
+
+def resolve_learning_rates(
+    lr: float,
+    backbone_lr: float | None = None,
+    head_lr: float | None = None,
+) -> tuple[float, float]:
+    values = {
+        "lr": lr,
+        "backbone_lr": lr if backbone_lr is None else backbone_lr,
+        "head_lr": lr if head_lr is None else head_lr,
+    }
+    for name, value in values.items():
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    return values["backbone_lr"], values["head_lr"]
+
+
+def build_optimizer(
+    model: CropVerifier,
+    lr: float,
+    backbone_lr: float | None = None,
+    head_lr: float | None = None,
+):
+    actual_backbone_lr, actual_head_lr = resolve_learning_rates(
+        lr, backbone_lr, head_lr,
+    )
+    backbone_parameters = list(model.backbone.parameters())
+    backbone_parameter_ids = {id(parameter) for parameter in backbone_parameters}
+    head_parameters = [
+        parameter for parameter in model.parameters()
+        if id(parameter) not in backbone_parameter_ids
+    ]
+    if not backbone_parameters or not head_parameters:
+        raise ValueError("optimizer requires non-empty backbone and head parameters")
+    return torch.optim.AdamW(
+        [
+            {"params": backbone_parameters, "lr": actual_backbone_lr, "name": "backbone"},
+            {"params": head_parameters, "lr": actual_head_lr, "name": "heads"},
+        ],
+        lr=lr,
+        weight_decay=1e-4,
     )
 
 
@@ -410,6 +503,23 @@ def main():
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--backbone-lr", type=float,
+        help="백본 학습률입니다. 생략하면 --lr을 사용합니다.",
+    )
+    parser.add_argument(
+        "--head-lr", type=float,
+        help="분류/상태 head 학습률입니다. 생략하면 --lr을 사용합니다.",
+    )
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument(
+        "--class-weight-mode", choices=CLASS_WEIGHT_MODES, default="inverse",
+        help="클래스 불균형 가중치 방식입니다. 기본 inverse는 기존 동작입니다.",
+    )
+    parser.add_argument(
+        "--class-weight-beta", type=float, default=DEFAULT_CLASS_WEIGHT_BETA,
+        help="effective-number 모드의 beta 값([0, 1))입니다.",
+    )
     parser.add_argument("--init-checkpoint")
     parser.add_argument(
         "--include-background", action="store_true",
@@ -438,6 +548,16 @@ def main():
     args = parser.parse_args()
     if args.oversample_repeats < 1:
         parser.error("--oversample-repeats must be positive")
+    try:
+        actual_backbone_lr, actual_head_lr = resolve_learning_rates(
+            args.lr, args.backbone_lr, args.head_lr,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not math.isfinite(args.label_smoothing) or not 0 <= args.label_smoothing < 1:
+        parser.error("--label-smoothing must be finite and in [0, 1)")
+    if not math.isfinite(args.class_weight_beta) or not 0 <= args.class_weight_beta < 1:
+        parser.error("--class-weight-beta must be finite and in [0, 1)")
     active_classes = material_class_names(args.include_background)
     if (
         BACKGROUND_CLASS_NAME in args.selection_material_target
@@ -536,16 +656,37 @@ def main():
     weight_values = {
         "material": class_weights(
             [row["material"] for row in train_rows], len(active_classes),
+            args.class_weight_mode, args.class_weight_beta,
         ),
-        "dent": class_weights([row["dent"] for row in train_rows], 2),
-        "label": class_weights([row["label"] for row in train_rows], 2),
-        "foreign_material": class_weights([row["foreign_material"] for row in train_rows], 2),
+        "dent": class_weights(
+            [row["dent"] for row in train_rows], 2,
+            args.class_weight_mode, args.class_weight_beta,
+        ),
+        "label": class_weights(
+            [row["label"] for row in train_rows], 2,
+            args.class_weight_mode, args.class_weight_beta,
+        ),
+        "foreign_material": class_weights(
+            [row["foreign_material"] for row in train_rows], 2,
+            args.class_weight_mode, args.class_weight_beta,
+        ),
     }
-    criteria = {
-        task: nn.CrossEntropyLoss(
-            weight=(weights.to(device) if weights is not None else None), reduction="none",
-        )
-        for task, weights in weight_values.items()
+    criteria = build_criteria(weight_values, device, args.label_smoothing)
+    training_config = {
+        "label_smoothing": args.label_smoothing,
+        "learning_rates": {
+            "base": args.lr,
+            "backbone": actual_backbone_lr,
+            "heads": actual_head_lr,
+        },
+        "class_weights": {
+            "mode": args.class_weight_mode,
+            "beta": args.class_weight_beta,
+            "values": {
+                task: (weights.tolist() if weights is not None else None)
+                for task, weights in weight_values.items()
+            },
+        },
     }
     task_weights = {
         "material": args.material_weight,
@@ -572,7 +713,9 @@ def main():
         args.selection_material_target and args.selection_material_target_weight > 0
     ):
         parser.error("at least one enabled selection weight must be positive")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = build_optimizer(
+        model, args.lr, args.backbone_lr, args.head_lr,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
     checkpoint_path = output_dir / "best_verifier.pt"
@@ -640,6 +783,7 @@ def main():
                     "val_counts": val_counts,
                     "val_material_class_accuracy": val_material_classes,
                     "selection_material_targets": args.selection_material_target,
+                    "training_config": training_config,
                 },
                 checkpoint_path,
             )
@@ -688,6 +832,7 @@ def main():
         "initial_checkpoint": args.init_checkpoint,
         "initial_checkpoint_transfer": initial_checkpoint_info,
         "camera_augmentation": args.camera_augmentation,
+        "training_config": checkpoint.get("training_config", training_config),
         "best_epoch": checkpoint.get("epoch"),
         "best_selection_score": checkpoint.get("selection_score"),
         "best_val_metrics": checkpoint.get("val_metrics"),

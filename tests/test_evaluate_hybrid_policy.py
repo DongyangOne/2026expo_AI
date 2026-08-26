@@ -242,10 +242,78 @@ def test_background_verifier_retains_low_confidence_yolo_result():
     audit = report["audit"][0]
 
     assert report["corrections"]["applied"] == 0
+    assert report["policy"]["allow_background_veto"] is False
     assert audit["reason"] == "verifier_background_retain_yolo"
     assert audit["final"] == "plastic"
     assert audit["final_confidence"] == 0.4
     assert audit["final_allowed_like"] is False
+
+
+def test_background_veto_is_opt_in_and_uses_confidence_and_margin_thresholds():
+    rows = [
+        _combined_row(
+            "negative.jpg",
+            truth="negative",
+            baseline="plastic",
+            yolo_confidence=0.40,
+            verifier="background",
+            verifier_confidence=0.89,
+            localized=False,
+            is_negative=True,
+        )
+    ]
+
+    below_confidence = evaluate_policy(
+        rows, 0.90, 0.30, allow_background_veto=True
+    )
+    below_margin = evaluate_policy(
+        rows, 0.80, 0.50, allow_background_veto=True
+    )
+    accepted = evaluate_policy(
+        rows, 0.80, 0.48, allow_background_veto=True
+    )
+
+    assert below_confidence["corrections"]["applied"] == 0
+    assert below_confidence["audit"][0]["reason"] == (
+        "background_veto_below_verifier_confidence"
+    )
+    assert below_margin["corrections"]["applied"] == 0
+    assert below_margin["audit"][0]["reason"] == (
+        "background_veto_below_verifier_over_yolo_margin"
+    )
+
+    audit = accepted["audit"][0]
+    assert accepted["corrections"]["applied"] == 1
+    assert accepted["corrections"]["background_veto_applied"] == 1
+    assert accepted["corrections"]["beneficial"] == 1
+    assert audit["reason"] == "background_veto_applied"
+    assert audit["correction_type"] == "background_veto"
+    assert audit["effect"] == "beneficial"
+    assert audit["final"] is None
+    assert audit["final_confidence"] is None
+
+
+def test_background_veto_wrong_positive_to_none_is_harmful_suppression():
+    rows = [
+        _combined_row(
+            "wrong-positive.jpg",
+            truth="paper",
+            baseline="plastic",
+            yolo_confidence=0.40,
+            verifier="background",
+            verifier_confidence=0.95,
+        )
+    ]
+
+    report = evaluate_policy(rows, 0.80, 0.30, allow_background_veto=True)
+
+    assert report["corrections"]["applied"] == 1
+    assert report["corrections"]["beneficial"] == 0
+    assert report["corrections"]["harmful"] == 1
+    assert report["corrections"]["harmful_positive_suppression"] == 1
+    assert report["corrections"]["wrong_to_wrong"] == 0
+    assert report["audit"][0]["effect"] == "harmful_positive_suppression"
+    assert report["audit"][0]["final"] is None
 
 
 @pytest.mark.parametrize(
@@ -438,6 +506,112 @@ def test_selected_bbox_report_can_pass_but_ground_truth_crop_cannot():
         "not_ground_truth_crop_only"
     ] is False
     assert gt_crop_report["evidence"]["runtime_promotion_authorized"] is False
+
+
+def test_background_veto_can_pass_all_metric_and_selected_bbox_evidence_gates():
+    baseline = {
+        "vinyl.jpg": _baseline_detail(
+            "vinyl.jpg", expected="vinyl", predicted="plastic", confidence=0.4
+        ),
+        "paper.jpg": _baseline_detail(
+            "paper.jpg", expected="paper", predicted="paper", confidence=0.9
+        ),
+        "negative.jpg": _baseline_detail(
+            "negative.jpg", expected="negative", predicted="plastic", confidence=0.35
+        ),
+    }
+    manifest = manifest_rows_from_baseline(baseline)
+    verifier = {
+        "vinyl.jpg": _verifier_prediction(
+            "vinyl", 0.90, [10.0, 10.0, 90.0, 90.0]
+        ),
+        "paper.jpg": _verifier_prediction(
+            "paper", 0.95, [10.0, 10.0, 90.0, 90.0]
+        ),
+        "negative.jpg": _verifier_prediction(
+            "background", 0.95, [10.0, 10.0, 90.0, 90.0]
+        ),
+    }
+
+    report = build_report(
+        manifest,
+        baseline,
+        verifier,
+        [0.80],
+        [0.30],
+        verifier_prediction_source="selected_yolo_bbox_predictions",
+        allow_background_veto=True,
+    )
+
+    negative_audit = next(
+        row for row in report["correction_audit"] if row["image"].endswith("negative.jpg")
+    )
+    assert report["contract"]["background_policy"] == "veto_at_policy_thresholds"
+    assert report["policy_search"]["selection"]["enabled"] is True
+    assert report["selected"]["policy"]["allow_background_veto"] is True
+    assert report["selected"]["corrections"]["background_veto_applied"] == 1
+    assert report["deployment_gate"]["metric_gate"]["passed"] is True
+    assert all(report["deployment_gate"]["evidence_checks"].values())
+    assert report["deployment_gate"]["passed"] is True
+    assert negative_audit["reason"] == "background_veto_applied"
+    assert negative_audit["effect"] == "beneficial"
+    assert negative_audit["final"] is None
+
+
+def test_background_veto_of_correct_positive_is_harmful_and_rejected():
+    rows = [
+        _combined_row(
+            "paper.jpg",
+            truth="paper",
+            baseline="paper",
+            yolo_confidence=0.40,
+            verifier="background",
+            verifier_confidence=0.95,
+        ),
+        _combined_row(
+            "vinyl.jpg",
+            truth="vinyl",
+            baseline="plastic",
+            yolo_confidence=0.40,
+            verifier="vinyl",
+            verifier_confidence=0.95,
+        ),
+        _combined_row(
+            "styrofoam.jpg",
+            truth="styrofoam",
+            baseline="plastic",
+            yolo_confidence=0.40,
+            verifier="styrofoam",
+            verifier_confidence=0.95,
+        ),
+        _combined_row(
+            "negative.jpg",
+            truth="negative",
+            baseline=None,
+            yolo_confidence=None,
+            verifier=None,
+            verifier_confidence=None,
+            localized=False,
+            is_negative=True,
+        ),
+    ]
+
+    evaluation = evaluate_policy(
+        rows, 0.80, 0.30, allow_background_veto=True
+    )
+    gate = deployment_metric_gate(evaluation)
+    paper_audit = evaluation["audit"][0]
+
+    assert gate["checks"]["external_accuracy_gain_at_least_5pp"] is True
+    assert gate["checks"]["negative_specificity_nondecrease"] is True
+    assert gate["checks"]["zero_harmful_corrections"] is False
+    assert gate["checks"]["per_class_recall_drop_within_1pp"] is False
+    assert gate["passed"] is False
+    assert evaluation["corrections"]["harmful"] == 1
+    assert evaluation["corrections"]["harmful_positive_suppression"] == 1
+    assert paper_audit["reason"] == "background_veto_applied"
+    assert paper_audit["effect"] == "harmful_positive_suppression"
+    assert paper_audit["final"] is None
 
 
 def test_load_selected_bbox_predictions_supports_background_and_provenance(tmp_path):

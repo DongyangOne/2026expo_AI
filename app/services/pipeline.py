@@ -173,7 +173,11 @@ async def run(
     )
     verifier_prediction = None
     correction_applied = False
-    if verifier_session is not None and vinyl_candidate is not None:
+    if (
+        verifier_session is not None
+        and vinyl_candidate is not None
+        and not inference.verifier_is_shadow_only(verifier_session)
+    ):
         verifier_prediction = await loop.run_in_executor(
             _executor, inference.run_verifier, verifier_session, img, bbox
         )

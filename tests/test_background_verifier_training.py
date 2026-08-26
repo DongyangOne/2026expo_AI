@@ -212,6 +212,24 @@ def test_background_training_writes_dynamic_checkpoint_and_metadata(
         "mode": "expanded_background",
         "source_classes": trainer.CLASS_NAMES,
     }
+    assert metadata["training_config"] == {
+        "label_smoothing": 0.0,
+        "learning_rates": {
+            "base": 1e-3,
+            "backbone": 1e-3,
+            "heads": 1e-3,
+        },
+        "class_weights": {
+            "mode": "inverse",
+            "beta": trainer.DEFAULT_CLASS_WEIGHT_BETA,
+            "values": {
+                "material": [1.0] * 10,
+                "dent": None,
+                "label": None,
+                "foreign_material": None,
+            },
+        },
+    }
     assert exported["shapes"] == [(1, 10), (1, 2), (1, 2), (1, 2)]
 
 

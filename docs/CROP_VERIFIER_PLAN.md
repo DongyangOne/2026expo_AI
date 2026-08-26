@@ -363,6 +363,44 @@ positive 35장·negative 6장을 다시 평가했을 때 범용 교정 정책은
 하락 `1%p` 이내, negative specificity 비하락, harmful correction 0건, negative의
 허용 계열 승격 0건을 모두 만족해야 한다.
 
+### 1차 proposal 후보 평가와 clean v2 재학습 (2026-08-26)
+
+- 1차 10-class 후보는 proposal validation 정확도 `85.663%`, macro-F1 `88.803%`였지만
+  고정 하드웨어 41장에서는 기존 모델과 동일하게 전체 정확도 `60.98%`, positive 정확도
+  `65.71%`로 개선 폭이 `0%p`였다. 배포 게이트에서 거부했고 운영 모델은 변경하지 않았다.
+- 원인은 학습 background 20,000장 중 19,985장이 GT가 있는 프레임의 low-IoU
+  proposal이어서, 실제 다른 재활용품까지 background로 잘못 가르친 데이터 오염이었다.
+  또한 모든 proposal과 `conf=0.05`를 사용해 운영의 최고 신뢰 bbox 하나와 분포가 달랐다.
+- clean 정책은 `--proposal-selection runtime-top1`, `--conf 0.25`,
+  `--background-policy no-ground-truth-only`다. GT가 있는 프레임의 low-IoU proposal은
+  자동 background 라벨로 쓰지 않는다.
+- 기존 clean manifest에서 상용 선별 폴더에 섞인 하드웨어 복제본 84행도 제거했다.
+  재학습 본체는 AI Hub 9종 단일 객체 crop 89,779장(training 76,463 / validation
+  13,316)이며, 하드웨어는 단일 객체 원본 60장과 실제 runtime proposal hard sample만
+  별도 가중한다. source object가 2개인 비닐 8장은 제외했다.
+- 내부 background는 하드웨어 training 원본 3장을 source 기준으로 2 train / 1
+  validation으로 분리한다. 고정 하드웨어 holdout 41장은 checkpoint 선택과 gradient에
+  모두 사용하지 않는다.
+- 실제 loader는 training 82,315 / validation 13,317이며, 반복 적용된 하드웨어 행은
+  약 `7.1%`다. 소수 이미지를 수백 배로 과적합시키던 초안 비율은 사용하지 않는다.
+- background veto는 실제 positive를 억제하면 기존 YOLO도 오답이었는지와 무관하게
+  항상 harmful로 센다. `confidence=0.90`, verifier-over-YOLO `margin=0.30`을 미리
+  고정하고 harmful 0건, wrong-to-wrong 0건과 기존 배포 지표를 모두 요구한다.
+- 통과해도 `offline_candidate_ready.txt`만 기록한다. 10-class metadata와 선택 정책을
+  함께 보존하고, 실제 런타임 정책 구현 및 독립 end-to-end 하드웨어 검증 전에는 Pi나
+  production 모델을 교체하지 않는다.
+
+현재 AI Hub clean 목록은 이전 cap 적용 proposal manifest 안에서 source별 top-1을 다시
+선택한 빠른 보정본이다. 원본 이미지에 대해 YOLO 전체 후보를 다시 추론한 완전한 runtime
+top-1 목록은 아니므로, 이 후보가 고정 게이트를 통과하지 못하면 원본 source 재추론으로
+다음 데이터 버전을 만든다.
+
+새 운영 쓰레기는 이미지 SHA-256 중복 제거, 동일 실물 `object_group` 분할, tight/context
+teacher 합의와 confidence 기준을 통과한 단일 객체만 다음 hard sample에 추가한다. 이 구조는
+기존 9종의 새 모양·브랜드·조명 변화에는 대응하지만, 처음 보는 새 재질을 즉시 자동 학습해
+보장하는 구조는 아니다. 새 클래스와 저신뢰·미분류는 안전한 비허용 경로로 유지하고 충분한
+고유 표본과 독립 검증셋이 쌓인 뒤에만 학습 계약을 확장한다.
+
 ## 6. 단계별 적용 기준
 
 1. 1일차에는 소량 v3 crop과 Qwen teacher 50건으로 끝까지 흐르는 prototype을 만든다.

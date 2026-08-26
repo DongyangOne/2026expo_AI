@@ -8,7 +8,12 @@ when the image has no GT or its IoU is at most ``negative_iou``.  Proposals in
 between are deliberately skipped rather than pseudo-labelled.
 
 The train/validation split from the supplied YOLO data YAML is preserved.  The
-output is selected deterministically before crops are written, so class caps do
+optional ``runtime-top1`` mode keeps only the highest-confidence proposal above
+the configured confidence floor, matching the production selection rule.  The
+optional ``no-ground-truth-only`` policy prevents low-IoU proposals from a
+labelled frame from becoming noisy background pseudo-labels.
+
+Output is selected deterministically before crops are written, so class caps do
 not depend on filesystem or inference order.  Ultralytics is imported only
 after all output and input preflight checks pass, which keeps the pure helpers
 and safety checks unit-testable without loading YOLO.
@@ -41,6 +46,11 @@ CLASS_NAMES = (
 )
 BACKGROUND_CLASS_ID = len(CLASS_NAMES)
 OUTPUT_CLASS_NAMES = CLASS_NAMES + ("background",)
+PROPOSAL_SELECTION_MODES = ("all", "runtime-top1")
+BACKGROUND_POLICIES = (
+    "low-iou-or-no-ground-truth",
+    "no-ground-truth-only",
+)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 GIB = 1024 ** 3
 
@@ -576,13 +586,50 @@ def candidates_from_frames(
     *,
     positive_iou: float,
     negative_iou: float,
+    proposal_selection: str = "all",
+    background_policy: str = "low-iou-or-no-ground-truth",
+    min_confidence: float = 0.0,
     stats: Counter | None = None,
+    policy_stats: Counter | None = None,
 ) -> Iterator[Candidate]:
     stats = stats if stats is not None else Counter()
+    policy_stats = policy_stats if policy_stats is not None else Counter()
+    if proposal_selection not in PROPOSAL_SELECTION_MODES:
+        raise ValueError(f"unsupported proposal selection: {proposal_selection}")
+    if background_policy not in BACKGROUND_POLICIES:
+        raise ValueError(f"unsupported background policy: {background_policy}")
+    if not 0 <= min_confidence <= 1:
+        raise ValueError("min_confidence must be in [0, 1]")
+
     for frame in frames:
         gt = frame.source.ground_truth
         gt_bbox = gt.xyxy(frame.width, frame.height) if gt is not None else None
-        for proposal_index, proposal in enumerate(frame.proposals):
+        indexed_proposals = list(enumerate(frame.proposals))
+        policy_stats["frames_seen"] += 1
+        policy_stats["proposals_seen"] += len(indexed_proposals)
+        if proposal_selection == "runtime-top1":
+            eligible = []
+            for proposal_index, proposal in indexed_proposals:
+                if not math.isfinite(proposal.confidence):
+                    policy_stats["invalid_proposal_confidence"] += 1
+                    continue
+                if proposal.confidence < min_confidence:
+                    policy_stats["below_min_confidence"] += 1
+                    continue
+                eligible.append((proposal_index, proposal))
+            if not eligible:
+                policy_stats["frames_without_eligible_proposal"] += 1
+                continue
+            # Match the runtime rule: take exactly one highest-confidence bbox.
+            # The original proposal order is the deterministic tie-breaker.
+            indexed_proposals = [max(
+                eligible,
+                key=lambda item: (item[1].confidence, -item[0]),
+            )]
+            policy_stats["discarded_by_runtime_top1"] += len(eligible) - 1
+        policy_stats["proposals_selected"] += len(indexed_proposals)
+
+        for proposal_index, proposal in indexed_proposals:
             if (
                 len(proposal.bbox) != 4
                 or not all(math.isfinite(value) for value in proposal.bbox)
@@ -600,6 +647,15 @@ def candidates_from_frames(
             )
             stats[assignment] += 1
             if material is None:
+                continue
+            if (
+                material == BACKGROUND_CLASS_ID
+                and background_policy == "no-ground-truth-only"
+                and gt is not None
+            ):
+                # A low-IoU proposal in a labelled frame can be another valid,
+                # unlabelled object. It is not safe automatic background data.
+                policy_stats["background_rejected_gt_present"] += 1
                 continue
             yield Candidate(
                 source=frame.source,
@@ -767,6 +823,8 @@ def build_proposal_verifier_dataset(
     min_free_gb: float,
     max_output_gb: float,
     jpeg_quality: int,
+    proposal_selection: str = "all",
+    background_policy: str = "low-iou-or-no-ground-truth",
     prediction_provider: PredictionProvider | None = None,
 ) -> dict:
     # This must remain the first preflight: a bad invocation can never load a
@@ -778,6 +836,10 @@ def build_proposal_verifier_dataset(
         raise ValueError("batch, imgsz and crop-size must be positive")
     if not 0 <= conf <= 1 or padding < 0 or not 1 <= jpeg_quality <= 100:
         raise ValueError("conf, padding or jpeg-quality is outside its valid range")
+    if proposal_selection not in PROPOSAL_SELECTION_MODES:
+        raise ValueError(f"unsupported proposal selection: {proposal_selection}")
+    if background_policy not in BACKGROUND_POLICIES:
+        raise ValueError(f"unsupported background policy: {background_policy}")
     check_storage_limits(
         output_dir,
         written_bytes=0,
@@ -800,11 +862,16 @@ def build_proposal_verifier_dataset(
             conf=conf,
         )
     proposal_stats = Counter()
+    proposal_policy_stats = Counter()
     candidates = candidates_from_frames(
         prediction_provider(sources),
         positive_iou=positive_iou,
         negative_iou=negative_iou,
+        proposal_selection=proposal_selection,
+        background_policy=background_policy,
+        min_confidence=conf,
         stats=proposal_stats,
+        policy_stats=proposal_policy_stats,
     )
     selected = select_deterministic_candidates(
         candidates,
@@ -854,6 +921,14 @@ def build_proposal_verifier_dataset(
         "eligible_sources": len(sources),
         "source_rejections": dict(source_rejections),
         "proposal_assignments": dict(proposal_stats),
+        "proposal_policy": {
+            "selection_mode": proposal_selection,
+            "minimum_confidence": (
+                conf if proposal_selection == "runtime-top1" else None
+            ),
+            "background_policy": background_policy,
+        },
+        "proposal_policy_stats": dict(proposal_policy_stats),
         "selected_before_write": len(selected),
         "written_crops": len(rows),
         "written_bytes": written_bytes,
@@ -919,6 +994,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-free-gb", type=float, default=100.0)
     parser.add_argument("--max-output-gb", type=float, default=30.0)
     parser.add_argument("--jpeg-quality", type=int, default=92)
+    parser.add_argument(
+        "--proposal-selection",
+        choices=PROPOSAL_SELECTION_MODES,
+        default="all",
+        help=(
+            "all은 모든 proposal을 사용하고, runtime-top1은 conf 이상 중 "
+            "최고 confidence bbox 하나만 사용합니다."
+        ),
+    )
+    parser.add_argument(
+        "--background-policy",
+        choices=BACKGROUND_POLICIES,
+        default="low-iou-or-no-ground-truth",
+        help=(
+            "no-ground-truth-only는 GT가 없는 source의 proposal만 "
+            "background로 허용합니다."
+        ),
+    )
     args = parser.parse_args()
     if not 0 <= args.negative_iou < args.positive_iou <= 1:
         parser.error("IoU thresholds must satisfy 0 <= negative < positive <= 1")
@@ -964,6 +1057,8 @@ def main() -> None:
         min_free_gb=args.min_free_gb,
         max_output_gb=args.max_output_gb,
         jpeg_quality=args.jpeg_quality,
+        proposal_selection=args.proposal_selection,
+        background_policy=args.background_policy,
     )
 
 

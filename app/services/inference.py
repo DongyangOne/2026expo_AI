@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 
 from app.core.config import settings
-from app.models.registry import ModelRegistry
+from app.models.registry import ModelRegistry, VerifierRuntime
 from app.schemas.enums import WasteClass
 from app.schemas.response import Conditions
 
@@ -143,10 +143,25 @@ def _confidence(logits: np.ndarray) -> tuple[int, float]:
     return class_id, float(probabilities[class_id])
 
 
+def verifier_is_shadow_only(session) -> bool:
+    """metadata로 명시된 후보는 검증 전까지 운영 판정을 바꾸지 않는다."""
+    return isinstance(session, VerifierRuntime)
+
+
 def run_verifier(session, img: np.ndarray, bbox: list[float]) -> dict | None:
     """YOLO bbox를 임시 320px 검증기로 재판정한다. 운영 응답에는 직접 사용하지 않는다."""
     if session is None:
         return None
+
+    if isinstance(session, VerifierRuntime):
+        runtime_session = session.session
+        class_names = session.class_names
+        enabled_outputs: frozenset[str] | None = session.enabled_outputs
+    else:
+        # metadata sidecar가 없는 기존 9-class 모델의 동작을 보존한다.
+        runtime_session = session
+        class_names = VERIFIER_CLASS_NAMES
+        enabled_outputs = None
 
     height, width = img.shape[:2]
     x1, y1, x2, y2 = bbox
@@ -159,7 +174,7 @@ def run_verifier(session, img: np.ndarray, bbox: list[float]) -> dict | None:
     if x2 <= x1 or y2 <= y1:
         return None
 
-    model_input = session.get_inputs()[0]
+    model_input = runtime_session.get_inputs()[0]
     input_size = model_input.shape[-1]
     if not isinstance(input_size, int):
         input_size = 320
@@ -168,19 +183,29 @@ def run_verifier(session, img: np.ndarray, bbox: list[float]) -> dict | None:
     array = ((rgb - _MEAN) / _STD).transpose(2, 0, 1)[None]
 
     output_names = ("material", "dent", "label", "foreign_material")
-    available = {output.name for output in session.get_outputs()}
-    missing = set(output_names) - available
+    available = {output.name for output in runtime_session.get_outputs()}
+    requested_outputs = (
+        list(output_names)
+        if enabled_outputs is None
+        else [name for name in output_names if name in enabled_outputs]
+    )
+    missing = set(requested_outputs) - available
     if missing:
         raise RuntimeError(f"crop verifier outputs missing: {sorted(missing)}")
-    values = session.run(list(output_names), {model_input.name: array})
+    values = runtime_session.run(requested_outputs, {model_input.name: array})
     predictions = {
-        name: _confidence(value) for name, value in zip(output_names, values)
+        name: _confidence(value) for name, value in zip(requested_outputs, values)
     }
     material_id, material_confidence = predictions["material"]
+    material_name = (
+        class_names[material_id] if 0 <= material_id < len(class_names) else None
+    )
     return {
         "material": {
             "class_id": material_id,
-            "class_name": VERIFIER_CLASS_NAMES[material_id],
+            # metadata가 없거나 손상되어 알려지지 않은 class id면 shadow
+            # 로그에 명시적 null을 남기고 운영 요청을 실패시키지 않는다.
+            "class_name": material_name,
             "confidence": round(material_confidence, 6),
         },
         "heads": {

@@ -3,6 +3,7 @@
 import asyncio
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 
@@ -10,6 +11,7 @@ os.environ.setdefault("API_KEY", "test-key")
 
 from app.schemas.enums import DetectionStatus, GuidanceCode, WasteClass
 from app.schemas.response import Conditions
+from app.models.registry import VerifierRuntime
 from app.services import inference, pipeline
 from app.services import verifier_shadow
 
@@ -147,6 +149,55 @@ def test_저신뢰_pet에_동일_bbox_vinyl후보와_검증기합의가_있으�
     assert captured["class_id"] == 1
     assert captured["confidence"] == 0.307
     assert captured["correction_applied"] is True
+
+
+def test_metadata_candidate는_비닐후보가_있어도_shadow만_수행(monkeypatch):
+    candidate = VerifierRuntime(
+        session=object(),
+        class_names=(*inference.VERIFIER_CLASS_NAMES, "background"),
+        enabled_outputs=frozenset({"material"}),
+        metadata_path=Path("verifier_metadata.json"),
+    )
+    captured = {}
+
+    class _CandidateRegistry(_Registry):
+        def verifier(self):
+            return candidate
+
+    def fail_if_verifier_runs(*_args, **_kwargs):
+        raise AssertionError("metadata 후보는 운영 교정 경로에서 실행하면 안 됩니다.")
+
+    def fake_submit(session, _img, _bbox, class_id, confidence, client_id):
+        captured.update(
+            {
+                "session": session,
+                "class_id": class_id,
+                "confidence": confidence,
+                "client_id": client_id,
+            }
+        )
+
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_ambiguous_vinyl_detection)
+    monkeypatch.setattr(inference, "run_verifier", fail_if_verifier_runs)
+    monkeypatch.setattr(verifier_shadow, "submit", fake_submit)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, None, "candidate-shadow-001", _CandidateRegistry())
+        )
+
+    assert result.status is DetectionStatus.GENERAL_WASTE
+    assert result.classification is not None
+    assert result.classification.class_id == 3
+    assert result.classification.confidence == 0.307
+    assert captured == {
+        "session": candidate,
+        "class_id": 1,
+        "confidence": 0.307,
+        "client_id": "candidate-shadow-001",
+    }
 
 
 def test_비닐보조후보가_없는_저신뢰_pet은_plastic_low_confidence를_유지(monkeypatch):
