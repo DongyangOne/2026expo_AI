@@ -148,6 +148,22 @@ def test_multi_object_source_is_excluded_but_empty_negative_is_valid():
     assert reason is None
 
 
+def test_collect_sources_rejects_missing_label_sidecar(tmp_path):
+    dataset = tmp_path / "dataset"
+    image_path = dataset / "images" / "train" / "unlabelled.jpg"
+    image_path.parent.mkdir(parents=True)
+    assert cv2.imwrite(
+        str(image_path), np.full((24, 24, 3), 127, dtype=np.uint8)
+    )
+
+    records, rejected = collect_sources(
+        {"training": [image_path], "validation": []}, dataset
+    )
+
+    assert records == []
+    assert rejected == {"missing_label_file": 1}
+
+
 def test_no_ground_truth_proposal_is_background():
     material, overlap, reason = assign_proposal(
         (10.0, 20.0, 80.0, 100.0),
@@ -205,6 +221,42 @@ def test_strict_background_policy_uses_final_padded_crop_and_gt_margin():
     assert candidates[0].material == BACKGROUND_CLASS_ID
     assert policy_stats["background_accepted_zero_intersection"] == 1
     assert policy_stats["background_rejected_gt_intersection"] == 1
+
+
+def test_hard_negative_manifest_distinguishes_source_and_crop_object_counts(
+    tmp_path,
+):
+    image_path = tmp_path / "source.jpg"
+    assert cv2.imwrite(
+        str(image_path), np.full((100, 100, 3), 180, dtype=np.uint8)
+    )
+    gt = GroundTruth(2, (0.5, 0.5, 0.2, 0.2))
+    source = SourceRecord(image_path, "training", "source-with-object", gt)
+    candidate = Candidate(
+        source=source,
+        proposal_index=0,
+        proposal=Proposal(3, 0.9, (0.0, 0.0, 20.0, 20.0), "plastic"),
+        material=BACKGROUND_CLASS_ID,
+        category="background",
+        matched_iou=0.0,
+        assignment="low_iou",
+        gt_bbox=gt.xyxy(100, 100),
+    )
+
+    rows, _, rejected = proposal_dataset.write_selected_crops(
+        [candidate],
+        tmp_path / "crops",
+        crop_size=32,
+        padding=0.08,
+        jpeg_quality=90,
+        min_free_gb=0,
+        max_output_gb=0,
+    )
+
+    assert rejected == {}
+    assert len(rows) == 1
+    assert rows[0]["source_object_count"] == 1
+    assert rows[0]["crop_object_count"] == 0
 
 
 def _candidate(index: int, material: int, split: str = "training") -> Candidate:
@@ -363,6 +415,8 @@ def test_fake_predictions_write_split_preserving_audit_manifest(tmp_path, monkey
     assert {row["predicted_class_id"] for row in rows} == {"4"}
     assert {row["predicted_class_name"] for row in rows} == {"styrofoam"}
     assert {row["matched_iou"] for row in rows} == {"1.00000000"}
+    assert {row["source_object_count"] for row in rows} == {"1"}
+    assert {row["crop_object_count"] for row in rows} == {"1"}
     for row in rows:
         crop = cv2.imread(str(output / row["filepath"]))
         assert crop.shape == (32, 32, 3)
@@ -531,6 +585,7 @@ def test_runtime_top1_with_no_ground_truth_only_background_policy(tmp_path):
     assert len(background_rows) == 2
     assert {row["assignment"] for row in background_rows} == {"no_ground_truth"}
     assert {row["source_object_count"] for row in background_rows} == {"0"}
+    assert {row["crop_object_count"] for row in background_rows} == {"0"}
     assert {row["predicted_confidence"] for row in rows} == {
         "0.90000000",
         "0.85000000",

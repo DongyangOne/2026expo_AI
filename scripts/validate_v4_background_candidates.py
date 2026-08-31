@@ -1,0 +1,833 @@
+"""Freeze and validate v4 proposal crops before lineage upgrade or training.
+
+The v4 background miner can deliberately take a detector proposal from a
+single-object source frame when the *final padded verifier crop* is completely
+outside the annotated object plus a safety margin.  Such a crop has two
+different object counts:
+
+* ``source_object_count`` describes the complete source frame;
+* ``crop_object_count`` describes the verifier crop used for training.
+
+This validator preserves that distinction and rescues an already generated
+legacy-shaped proposal manifest without mutating it.  It also rejects missing
+YOLO label files (missing annotation is not evidence of an empty scene),
+recomputes every geometry decision, binds the detector/spec/source/crop bytes,
+and publishes an immutable validated CSV plus a report.  The result remains a
+development candidate and can never serve as blind-test truth or deployment
+authorization.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+import tempfile
+from collections import Counter
+from pathlib import Path
+from typing import Callable, Iterable, Mapping, Sequence
+
+import cv2
+import numpy as np
+
+try:
+    from scripts.prepare_proposal_verifier_dataset import (
+        BACKGROUND_CLASS_ID,
+        CLASS_NAMES,
+        PredictedFrame,
+        Proposal,
+        SourceRecord,
+        _label_path,
+        assign_proposal,
+        bbox_iou,
+        boxes_intersect,
+        expanded_clipped_bbox,
+        iter_yolo_predictions,
+        parse_yolo_label_text,
+    )
+    from scripts.verifier_preprocessing_contract import (
+        CONTRACT_VERSION,
+        crop_and_letterbox_bgr,
+        padded_clipped_bbox,
+        validate_crop_preprocessing_spec,
+    )
+except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
+    from prepare_proposal_verifier_dataset import (  # type: ignore[no-redef]
+        BACKGROUND_CLASS_ID,
+        CLASS_NAMES,
+        PredictedFrame,
+        Proposal,
+        SourceRecord,
+        _label_path,
+        assign_proposal,
+        bbox_iou,
+        boxes_intersect,
+        expanded_clipped_bbox,
+        iter_yolo_predictions,
+        parse_yolo_label_text,
+    )
+    from verifier_preprocessing_contract import (  # type: ignore[no-redef]
+        CONTRACT_VERSION,
+        crop_and_letterbox_bgr,
+        padded_clipped_bbox,
+        validate_crop_preprocessing_spec,
+    )
+
+
+SCHEMA_VERSION = "proposal_verifier.v4.bgfix.v1"
+EXPECTED_BACKGROUND_POLICY = "strict-zero-intersection"
+EXPECTED_BACKGROUND_MARGIN = 0.10
+EXPECTED_SELECTION_MODE = "runtime-top1"
+EXPECTED_CONFIDENCE = 0.10
+EXPECTED_NMS_IOU = 0.70
+EXPECTED_CROP_SIZE = 320
+EXPECTED_PADDING = 0.08
+EXPECTED_LETTERBOX_FILL = 114
+EXPECTED_JPEG_QUALITY = 92
+EXPECTED_POSITIVE_IOU = 0.50
+EXPECTED_NEGATIVE_IOU = 0.10
+REPLAY_CONFIDENCE_ABS_TOLERANCE = 1e-6
+REPLAY_BBOX_ABS_TOLERANCE = 1e-4
+ADDED_FIELDS = (
+    "manifest_schema_version",
+    "crop_object_count",
+    "background_exclusion_policy",
+    "background_gt_margin",
+    "crop_transform_version",
+    "detector_model_sha256",
+    "inference_spec_sha256",
+    "source_annotation_sha256",
+    "source_sha256",
+    "image_sha256",
+    "blind_test_eligible",
+    "ground_truth_authority",
+)
+PredictionProvider = Callable[[Sequence[SourceRecord]], Iterable[PredictedFrame]]
+
+
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _finite(value: object, *, field: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be a finite number") from error
+    if not math.isfinite(result):
+        raise ValueError(f"{field} must be a finite number")
+    return result
+
+
+def _integer(value: object, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    try:
+        result = int(str(value).strip())
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must be an integer") from error
+    return result
+
+
+def _decode_source_path(value: str, *, location: str) -> Path:
+    try:
+        raw = base64.urlsafe_b64decode(value.encode("ascii"))
+        return Path(os.fsdecode(raw)).resolve()
+    except (UnicodeError, ValueError, binascii.Error) as error:
+        raise ValueError(f"{location}: invalid source_path_b64") from error
+
+
+def _read_json(path: Path, *, description: str) -> tuple[dict, bytes]:
+    raw = path.read_bytes()
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{path}: invalid {description} JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: {description} must be a JSON object")
+    return value, raw
+
+
+def _read_manifest(path: Path) -> tuple[list[str], list[dict[str, str]], bytes]:
+    raw = path.read_bytes()
+    try:
+        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""))
+        fields = list(reader.fieldnames or ())
+        rows = list(reader)
+    except (UnicodeError, csv.Error) as error:
+        raise ValueError(f"{path}: invalid UTF-8 CSV") from error
+    if not fields or any(not field for field in fields) or len(fields) != len(set(fields)):
+        raise ValueError(f"{path}: manifest has empty or duplicate columns")
+    required = {
+        "filepath", "split", "source_id", "source_path_b64", "material",
+        "category", "source_object_count", "assignment", "gt_class_id",
+        "gt_class_name",
+        "gt_bbox_x1", "gt_bbox_y1", "gt_bbox_x2", "gt_bbox_y2",
+        "predicted_bbox_x1", "predicted_bbox_y1", "predicted_bbox_x2",
+        "predicted_bbox_y2", "crop_x1", "crop_y1", "crop_x2", "crop_y2",
+        "source_width", "source_height", "matched_iou", "proposal_index",
+        "predicted_class_id", "predicted_class_name", "predicted_confidence",
+        "crop_bytes",
+    }
+    missing = sorted(required - set(fields))
+    if missing:
+        raise ValueError(f"{path}: manifest is missing fields {missing}")
+    if not rows:
+        raise ValueError(f"{path}: manifest is empty")
+    if any(None in row for row in rows):
+        raise ValueError(f"{path}: manifest contains an unnamed extra CSV column")
+    return fields, [
+        {field: "" if row.get(field) is None else str(row[field]) for field in fields}
+        for row in rows
+    ], raw
+
+
+def _validate_dataset_contract(info: Mapping[str, object], spec: Mapping[str, object]) -> None:
+    policy = info.get("proposal_policy")
+    inference = info.get("inference")
+    crop = info.get("crop")
+    if not isinstance(policy, Mapping) or not isinstance(inference, Mapping):
+        raise ValueError("dataset_info is missing proposal_policy/inference")
+    if not isinstance(crop, Mapping):
+        raise ValueError("dataset_info is missing crop")
+    expected = {
+        "selection_mode": EXPECTED_SELECTION_MODE,
+        "background_policy": EXPECTED_BACKGROUND_POLICY,
+    }
+    for field, value in expected.items():
+        if policy.get(field) != value:
+            raise ValueError(f"dataset_info proposal_policy.{field} must be {value!r}")
+    if _finite(policy.get("background_gt_margin"), field="background_gt_margin") != EXPECTED_BACKGROUND_MARGIN:
+        raise ValueError("dataset_info background_gt_margin must be 0.10")
+    if _finite(inference.get("conf"), field="inference.conf") != EXPECTED_CONFIDENCE:
+        raise ValueError("dataset_info inference.conf must be 0.10")
+    if _finite(inference.get("nms_iou"), field="inference.nms_iou") != EXPECTED_NMS_IOU:
+        raise ValueError("dataset_info inference.nms_iou must be 0.70")
+    if _integer(inference.get("imgsz"), field="inference.imgsz") != 640:
+        raise ValueError("dataset_info inference.imgsz must be 640")
+    if _integer(crop.get("size"), field="crop.size") != EXPECTED_CROP_SIZE:
+        raise ValueError("dataset_info crop.size must be 320")
+    if _finite(crop.get("padding"), field="crop.padding") != EXPECTED_PADDING:
+        raise ValueError("dataset_info crop.padding must be 0.08")
+    if _integer(crop.get("jpeg_quality"), field="crop.jpeg_quality") != EXPECTED_JPEG_QUALITY:
+        raise ValueError("dataset_info crop.jpeg_quality must be 92")
+    assignment = info.get("assignment")
+    if not isinstance(assignment, Mapping):
+        raise ValueError("dataset_info is missing assignment")
+    if (
+        _finite(
+            assignment.get("positive_iou_inclusive"),
+            field="assignment.positive_iou_inclusive",
+        )
+        != EXPECTED_POSITIVE_IOU
+    ):
+        raise ValueError("dataset_info positive IoU must be 0.50")
+    if (
+        _finite(
+            assignment.get("negative_iou_inclusive"),
+            field="assignment.negative_iou_inclusive",
+        )
+        != EXPECTED_NEGATIVE_IOU
+    ):
+        raise ValueError("dataset_info negative IoU must be 0.10")
+    if assignment.get("ambiguous_iou_skipped") is not True:
+        raise ValueError("dataset_info must skip ambiguous IoU proposals")
+
+    contract = validate_crop_preprocessing_spec(spec)
+    if (
+        contract.size != EXPECTED_CROP_SIZE
+        or contract.padding_ratio != EXPECTED_PADDING
+        or contract.fill != EXPECTED_LETTERBOX_FILL
+    ):
+        raise ValueError(
+            "inference spec crop size/padding/fill does not match v4 generation"
+        )
+    detector = spec.get("detector")
+    if not isinstance(detector, Mapping):
+        raise ValueError("inference spec is missing detector")
+    if _finite(detector.get("candidate_confidence"), field="detector confidence") != EXPECTED_CONFIDENCE:
+        raise ValueError("inference spec detector confidence does not match v4 generation")
+    if _finite(detector.get("nms_iou"), field="detector nms_iou") != EXPECTED_NMS_IOU:
+        raise ValueError("inference spec detector nms_iou does not match v4 generation")
+    if _integer(detector.get("input_size"), field="detector input_size") != 640:
+        raise ValueError("inference spec detector input size must be 640")
+    if detector.get("proposal_selection") != "highest_confidence_then_original_order":
+        raise ValueError("inference spec proposal selection is not runtime top1")
+
+
+def _xyxy(row: Mapping[str, str], prefix: str, *, location: str) -> tuple[float, float, float, float]:
+    return tuple(
+        _finite(row[f"{prefix}_{axis}"], field=f"{location} {prefix}_{axis}")
+        for axis in ("x1", "y1", "x2", "y2")
+    )  # type: ignore[return-value]
+
+
+def _resolve_crop(manifest: Path, value: str, *, location: str) -> Path:
+    raw = value.strip()
+    if not raw:
+        raise ValueError(f"{location}: filepath is empty")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = manifest.parent / path
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"{location}: crop does not exist: {path}")
+    return path
+
+
+def _replay_source_records(
+    manifest_path: Path,
+    rows: Sequence[Mapping[str, str]],
+) -> list[SourceRecord]:
+    records: list[SourceRecord] = []
+    seen_paths: set[Path] = set()
+    for line, row in enumerate(rows, start=2):
+        location = f"{manifest_path}:{line}"
+        source_path = _decode_source_path(row["source_path_b64"], location=location)
+        if source_path in seen_paths:
+            raise ValueError(
+                f"{location}: runtime-top1 manifest contains duplicate source rows"
+            )
+        seen_paths.add(source_path)
+        if not source_path.is_file():
+            raise FileNotFoundError(
+                f"{location}: source image does not exist: {source_path}"
+            )
+        label_path = _label_path(source_path)
+        if not label_path.is_file():
+            raise ValueError(
+                f"{location}: explicit YOLO label file is required for detector replay"
+            )
+        try:
+            label_text = label_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise ValueError(f"{location}: YOLO label file is unreadable") from error
+        ground_truth, reason = parse_yolo_label_text(label_text)
+        if reason is not None:
+            raise ValueError(f"{location}: unsupported YOLO annotation: {reason}")
+        split = row["split"].strip()
+        if split not in {"training", "validation"}:
+            raise ValueError(f"{location}: split must be training or validation")
+        records.append(
+            SourceRecord(
+                path=source_path,
+                split=split,
+                source_id=row["source_id"].strip(),
+                ground_truth=ground_truth,
+            )
+        )
+    return records
+
+
+def validate_detector_replay(
+    manifest_path: Path,
+    rows: Sequence[Mapping[str, str]],
+    *,
+    prediction_provider: PredictionProvider,
+) -> dict[str, object]:
+    """Replay frozen detector top1 and require every emitted proposal to match."""
+
+    records = _replay_source_records(manifest_path, rows)
+    expected = {record.path.resolve(): row for record, row in zip(records, rows, strict=True)}
+    observed: set[Path] = set()
+    for frame in prediction_provider(records):
+        source_path = frame.source.path.resolve()
+        if source_path not in expected:
+            raise ValueError(
+                f"detector replay returned an unexpected source: {source_path}"
+            )
+        if source_path in observed:
+            raise ValueError(
+                f"detector replay returned duplicate results for: {source_path}"
+            )
+        observed.add(source_path)
+        row = expected[source_path]
+        location = f"{manifest_path} source {source_path}"
+        if frame.width != _integer(row["source_width"], field=f"{location} width"):
+            raise ValueError(f"{location}: detector replay width differs from manifest")
+        if frame.height != _integer(row["source_height"], field=f"{location} height"):
+            raise ValueError(f"{location}: detector replay height differs from manifest")
+        eligible = [
+            (index, proposal)
+            for index, proposal in enumerate(frame.proposals)
+            if math.isfinite(proposal.confidence)
+            and proposal.confidence >= EXPECTED_CONFIDENCE
+        ]
+        if not eligible:
+            raise ValueError(f"{location}: detector replay has no eligible proposal")
+        replay_index, replay = max(
+            eligible, key=lambda item: (item[1].confidence, -item[0])
+        )
+        if replay_index != _integer(
+            row["proposal_index"], field=f"{location} proposal_index"
+        ):
+            raise ValueError(f"{location}: detector replay proposal_index mismatch")
+        if replay.class_id != _integer(
+            row["predicted_class_id"], field=f"{location} predicted_class_id"
+        ):
+            raise ValueError(f"{location}: detector replay class mismatch")
+        if replay.class_name != row["predicted_class_name"].strip():
+            raise ValueError(f"{location}: detector replay class name mismatch")
+        declared_confidence = _finite(
+            row["predicted_confidence"], field=f"{location} predicted_confidence"
+        )
+        if not math.isclose(
+            replay.confidence,
+            declared_confidence,
+            rel_tol=0.0,
+            abs_tol=REPLAY_CONFIDENCE_ABS_TOLERANCE,
+        ):
+            raise ValueError(f"{location}: detector replay confidence mismatch")
+        declared_bbox = _xyxy(row, "predicted_bbox", location=location)
+        if any(
+            not math.isclose(
+                left,
+                right,
+                rel_tol=0.0,
+                abs_tol=REPLAY_BBOX_ABS_TOLERANCE,
+            )
+            for left, right in zip(replay.bbox, declared_bbox)
+        ):
+            raise ValueError(f"{location}: detector replay bbox mismatch")
+    missing = sorted(str(path) for path in set(expected) - observed)
+    if missing:
+        raise ValueError(
+            f"detector replay omitted {len(missing)} manifest source(s): {missing[:3]}"
+        )
+    return {
+        "sources": len(records),
+        "runtime_top1_replayed": True,
+        "proposal_class_confidence_bbox_matched": True,
+        "confidence_abs_tolerance": REPLAY_CONFIDENCE_ABS_TOLERANCE,
+        "bbox_abs_tolerance": REPLAY_BBOX_ABS_TOLERANCE,
+        "original_generation_event_cryptographically_attested": False,
+        "authority": "development_only_current_detector_reproduction",
+    }
+
+
+def validate_rows(
+    manifest_path: Path,
+    rows: Sequence[Mapping[str, str]],
+    *,
+    detector_sha256: str,
+    spec_sha256: str,
+) -> tuple[list[dict[str, str]], Counter]:
+    validated: list[dict[str, str]] = []
+    counts: Counter = Counter()
+    for line, raw in enumerate(rows, start=2):
+        location = f"{manifest_path}:{line}"
+        row = dict(raw)
+        material = _integer(row["material"], field=f"{location} material")
+        if material not in range(BACKGROUND_CLASS_ID + 1):
+            raise ValueError(f"{location}: material must be 0..{BACKGROUND_CLASS_ID}")
+        expected_category = "background" if material == BACKGROUND_CLASS_ID else CLASS_NAMES[material]
+        if row["category"].strip() != expected_category:
+            raise ValueError(f"{location}: category does not match material")
+
+        source_path = _decode_source_path(row["source_path_b64"], location=location)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"{location}: source image does not exist: {source_path}")
+        label_path = _label_path(source_path)
+        if not label_path.is_file():
+            raise ValueError(
+                f"{location}: explicit YOLO label file is required; missing annotation "
+                "is not an empty-scene ground truth"
+            )
+        try:
+            annotation_bytes = label_path.read_bytes()
+            label_text = annotation_bytes.decode("utf-8")
+        except (OSError, UnicodeError) as error:
+            raise ValueError(f"{location}: YOLO label file is unreadable") from error
+        ground_truth, reason = parse_yolo_label_text(label_text)
+        if reason is not None:
+            raise ValueError(f"{location}: unsupported YOLO annotation: {reason}")
+        source_object_count = 1 if ground_truth is not None else 0
+        if _integer(row["source_object_count"], field=f"{location} source_object_count") != source_object_count:
+            raise ValueError(f"{location}: source_object_count disagrees with explicit annotation")
+
+        source_bytes = source_path.read_bytes()
+        source_image = cv2.imdecode(
+            np.frombuffer(source_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
+        if source_image is None:
+            raise ValueError(f"{location}: source image cannot be decoded")
+        height, width = source_image.shape[:2]
+        if _integer(row["source_width"], field=f"{location} source_width") != width:
+            raise ValueError(f"{location}: source_width does not match source pixels")
+        if _integer(row["source_height"], field=f"{location} source_height") != height:
+            raise ValueError(f"{location}: source_height does not match source pixels")
+
+        proposal_index = _integer(
+            row["proposal_index"], field=f"{location} proposal_index"
+        )
+        if proposal_index < 0:
+            raise ValueError(f"{location}: proposal_index must be non-negative")
+        predicted_class_id = _integer(
+            row["predicted_class_id"], field=f"{location} predicted_class_id"
+        )
+        if predicted_class_id not in range(len(CLASS_NAMES)):
+            raise ValueError(f"{location}: predicted_class_id must be 0..8")
+        if row["predicted_class_name"].strip() != CLASS_NAMES[predicted_class_id]:
+            raise ValueError(
+                f"{location}: predicted_class_name disagrees with predicted_class_id"
+            )
+        predicted_confidence = _finite(
+            row["predicted_confidence"], field=f"{location} predicted_confidence"
+        )
+        if not EXPECTED_CONFIDENCE <= predicted_confidence <= 1.0:
+            raise ValueError(
+                f"{location}: predicted_confidence is outside the frozen detector range"
+            )
+
+        predicted_bbox = _xyxy(row, "predicted_bbox", location=location)
+        expected_crop_image, expected_crop = crop_and_letterbox_bgr(
+            source_image,
+            predicted_bbox,
+            padding=EXPECTED_PADDING,
+            size=EXPECTED_CROP_SIZE,
+            fill=EXPECTED_LETTERBOX_FILL,
+        )
+        recorded_crop = tuple(
+            _integer(row[f"crop_{axis}"], field=f"{location} crop_{axis}")
+            for axis in ("x1", "y1", "x2", "y2")
+        )
+        if recorded_crop != expected_crop:
+            raise ValueError(f"{location}: crop bounds do not match frozen transform")
+
+        if ground_truth is not None:
+            gt_bbox = _xyxy(row, "gt_bbox", location=location)
+            expected_gt_bbox = ground_truth.xyxy(width, height)
+            if any(
+                abs(left - right) > 1e-6
+                for left, right in zip(gt_bbox, expected_gt_bbox)
+            ):
+                raise ValueError(f"{location}: GT bbox disagrees with annotation")
+            if row["gt_class_id"].strip() != str(ground_truth.class_id):
+                raise ValueError(f"{location}: gt_class_id disagrees with annotation")
+            if row["gt_class_name"].strip() != CLASS_NAMES[ground_truth.class_id]:
+                raise ValueError(f"{location}: gt_class_name disagrees with annotation")
+            direct_iou = bbox_iou(predicted_bbox, expected_gt_bbox)
+        else:
+            gt_bbox = None
+            direct_iou = 0.0
+            gt_fields = (
+                "gt_class_id", "gt_class_name", "gt_bbox_x1", "gt_bbox_y1",
+                "gt_bbox_x2", "gt_bbox_y2",
+            )
+            if any(row[name].strip() for name in gt_fields):
+                raise ValueError(f"{location}: empty annotation row contains GT evidence")
+
+        assigned_material, assigned_iou, assigned_reason = assign_proposal(
+            predicted_bbox,
+            gt_bbox=gt_bbox,
+            gt_class_id=ground_truth.class_id if ground_truth is not None else None,
+            positive_iou=EXPECTED_POSITIVE_IOU,
+            negative_iou=EXPECTED_NEGATIVE_IOU,
+        )
+        if not math.isclose(
+            assigned_iou, direct_iou, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise RuntimeError(f"{location}: frozen IoU implementations disagree")
+        declared_iou = _finite(row["matched_iou"], field=f"{location} matched_iou")
+        if not math.isclose(
+            declared_iou, assigned_iou, rel_tol=0.0, abs_tol=1e-8
+        ):
+            raise ValueError(f"{location}: matched_iou disagrees with frozen geometry")
+        if assigned_material is None:
+            raise ValueError(f"{location}: ambiguous-IoU proposal must not be emitted")
+        if assigned_material != material or row["assignment"].strip() != assigned_reason:
+            raise ValueError(
+                f"{location}: material/assignment disagrees with frozen IoU policy"
+            )
+
+        if material == BACKGROUND_CLASS_ID:
+            crop_object_count = 0
+            if ground_truth is not None:
+                exclusion = expanded_clipped_bbox(
+                    expected_gt_bbox,
+                    width=width,
+                    height=height,
+                    margin=EXPECTED_BACKGROUND_MARGIN,
+                )
+                if boxes_intersect(recorded_crop, exclusion):
+                    raise ValueError(
+                        f"{location}: background crop intersects expanded ground truth"
+                    )
+        else:
+            if ground_truth is None:
+                raise ValueError(f"{location}: positive crop has no source ground truth")
+            crop_object_count = 1
+
+        crop_path = _resolve_crop(manifest_path, row["filepath"], location=location)
+        crop_bytes = crop_path.read_bytes()
+        crop_image = cv2.imdecode(
+            np.frombuffer(crop_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
+        if crop_image is None or crop_image.shape[:2] != (EXPECTED_CROP_SIZE, EXPECTED_CROP_SIZE):
+            raise ValueError(f"{location}: crop is not a decodable 320x320 image")
+        encoded_ok, expected_encoded = cv2.imencode(
+            ".jpg",
+            expected_crop_image,
+            [cv2.IMWRITE_JPEG_QUALITY, EXPECTED_JPEG_QUALITY],
+        )
+        if not encoded_ok:
+            raise RuntimeError(f"{location}: failed to encode deterministic crop")
+        expected_crop_bytes = expected_encoded.tobytes()
+        if crop_bytes != expected_crop_bytes:
+            raise ValueError(
+                f"{location}: crop bytes do not match the frozen source/bbox transform"
+            )
+        declared_crop_bytes = _integer(
+            row["crop_bytes"], field=f"{location} crop_bytes"
+        )
+        if declared_crop_bytes != len(crop_bytes):
+            raise ValueError(f"{location}: crop_bytes disagrees with actual crop")
+        source_sha = _sha256_bytes(source_bytes)
+        annotation_sha = _sha256_bytes(annotation_bytes)
+        image_sha = _sha256_bytes(crop_bytes)
+        if row["source_id"].strip().casefold() != source_sha:
+            raise ValueError(
+                f"{location}: source_id is not bound to the source image SHA-256"
+            )
+        additions = {
+            "manifest_schema_version": SCHEMA_VERSION,
+            "crop_object_count": str(crop_object_count),
+            "background_exclusion_policy": EXPECTED_BACKGROUND_POLICY,
+            "background_gt_margin": f"{EXPECTED_BACKGROUND_MARGIN:.2f}",
+            "crop_transform_version": CONTRACT_VERSION,
+            "detector_model_sha256": detector_sha256,
+            "inference_spec_sha256": spec_sha256,
+            "source_annotation_sha256": annotation_sha,
+            "source_sha256": source_sha,
+            "image_sha256": image_sha,
+            "blind_test_eligible": "false",
+            "ground_truth_authority": "aihub_annotation_geometry_development_only",
+        }
+        for field, value in additions.items():
+            existing = row.get(field, "").strip()
+            if existing and existing != value:
+                raise ValueError(f"{location}: declared {field} conflicts with recomputed value")
+            row[field] = value
+        counts[(row["split"].strip(), expected_category)] += 1
+        validated.append(row)
+    return validated, counts
+
+
+def _render_csv(fields: Sequence[str], rows: Sequence[Mapping[str, str]]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: row.get(field, "") for field in fields})
+    return output.getvalue().encode("utf-8")
+
+
+def _json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _stage(path: Path, content: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        return temporary
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _publish_pair(output: Path, output_bytes: bytes, report: Path, report_bytes: bytes) -> None:
+    if output.resolve(strict=False) == report.resolve(strict=False):
+        raise ValueError("validated manifest and report paths must differ")
+    existing = [path for path in (output, report) if path.exists()]
+    if existing:
+        raise FileExistsError(f"refusing to overwrite existing artifacts: {existing}")
+    output_temp = _stage(output, output_bytes)
+    report_temp = _stage(report, report_bytes)
+    output_digest = _sha256_bytes(output_bytes)
+    published_output = False
+    try:
+        os.link(output_temp, output)
+        published_output = True
+        os.link(report_temp, report)
+    except BaseException:
+        if published_output and output.is_file() and _sha256_file(output) == output_digest:
+            output.unlink()
+        raise
+    finally:
+        output_temp.unlink(missing_ok=True)
+        report_temp.unlink(missing_ok=True)
+
+
+def validate_manifest(
+    *,
+    input_manifest: Path,
+    dataset_info: Path,
+    detector_model: Path,
+    inference_spec: Path,
+    output_manifest: Path,
+    output_report: Path,
+    prediction_provider: PredictionProvider | None = None,
+) -> dict:
+    paths = [input_manifest, dataset_info, detector_model, inference_spec]
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"required input does not exist: {path}")
+    if output_manifest.parent.resolve() != input_manifest.parent.resolve():
+        raise ValueError("validated manifest must be adjacent to its source manifest")
+    if dataset_info.parent.resolve() != input_manifest.parent.resolve():
+        raise ValueError("dataset_info must be adjacent to its source manifest")
+    fields, rows, manifest_bytes = _read_manifest(input_manifest)
+    info, info_bytes = _read_json(dataset_info, description="dataset info")
+    spec, spec_bytes = _read_json(inference_spec, description="inference spec")
+    _validate_dataset_contract(info, spec)
+    declared_model = str(info.get("model", "")).strip()
+    if not declared_model:
+        raise ValueError("dataset_info must declare the detector model path")
+    if Path(declared_model).resolve() != detector_model.resolve():
+        raise ValueError("dataset_info model path does not match supplied detector model")
+    declared_manifest = str(info.get("manifest", "")).strip()
+    if not declared_manifest:
+        raise ValueError("dataset_info must declare the generated manifest path")
+    if Path(declared_manifest).resolve() != input_manifest.resolve():
+        raise ValueError("dataset_info manifest path does not match supplied manifest")
+    detector_sha = _sha256_file(detector_model)
+    spec_sha = _sha256_bytes(spec_bytes)
+    detector_spec = spec.get("detector")
+    assert isinstance(detector_spec, Mapping)
+    model_reference = str(detector_spec.get("model_reference", "")).strip()
+    if not model_reference or Path(model_reference).name != detector_model.name:
+        raise ValueError(
+            "inference spec detector model reference does not name the supplied model"
+        )
+    optional_bindings = {
+        "model_sha256": detector_sha,
+        "manifest_sha256": _sha256_bytes(manifest_bytes),
+        "inference_spec_sha256": spec_sha,
+    }
+    for field, actual in optional_bindings.items():
+        declared = str(info.get(field, "")).strip().casefold()
+        if declared and declared != actual:
+            raise ValueError(f"dataset_info {field} conflicts with supplied artifact")
+    validated, counts = validate_rows(
+        input_manifest, rows, detector_sha256=detector_sha, spec_sha256=spec_sha
+    )
+    if prediction_provider is None:
+        inference = info["inference"]
+        assert isinstance(inference, Mapping)
+        device = str(inference.get("device", "")).strip()
+        if not device:
+            raise ValueError("dataset_info inference.device is required for replay")
+        batch = _integer(inference.get("batch"), field="inference.batch")
+        if batch <= 0:
+            raise ValueError("dataset_info inference.batch must be positive")
+
+        def prediction_provider(records: Sequence[SourceRecord]) -> Iterable[PredictedFrame]:
+            return iter_yolo_predictions(
+                records,
+                model_path=detector_model,
+                device=device,
+                batch=batch,
+                imgsz=640,
+                conf=EXPECTED_CONFIDENCE,
+                nms_iou=EXPECTED_NMS_IOU,
+            )
+
+    detector_replay = validate_detector_replay(
+        input_manifest,
+        rows,
+        prediction_provider=prediction_provider,
+    )
+    output_fields = [*fields, *(field for field in ADDED_FIELDS if field not in fields)]
+    output_bytes = _render_csv(output_fields, validated)
+    report = {
+        "schema_version": 1,
+        "artifact_role": "v4_development_candidates_not_blind_or_deployment_authority",
+        "ready_for_lineage_upgrade": True,
+        "blind_test_eligible": False,
+        "production_deployment_authorized": False,
+        "rows": len(validated),
+        "counts": {
+            f"{split}/{category}": count
+            for (split, category), count in sorted(counts.items())
+        },
+        "contract": {
+            "manifest_schema_version": SCHEMA_VERSION,
+            "background_policy": EXPECTED_BACKGROUND_POLICY,
+            "background_gt_margin": EXPECTED_BACKGROUND_MARGIN,
+            "explicit_label_file_required": True,
+            "source_object_count_semantics": "complete_source_frame",
+            "crop_object_count_semantics": "final_padded_verifier_crop",
+            "visual_judge_still_required": True,
+            "proposal_provenance": {
+                **detector_replay,
+                "detector_artifact_bytes_bound": True,
+                "inference_spec_bytes_bound": True,
+                "dataset_info_bytes_bound": True,
+                "source_bbox_crop_bytes_recomputed": True,
+                "production_or_blind_authority": False,
+            },
+        },
+        "bindings": {
+            "input_manifest_sha256": _sha256_bytes(manifest_bytes),
+            "dataset_info_sha256": _sha256_bytes(info_bytes),
+            "detector_model_sha256": detector_sha,
+            "inference_spec_sha256": spec_sha,
+            "validated_manifest_sha256": _sha256_bytes(output_bytes),
+        },
+    }
+    report_bytes = _json_bytes(report)
+    _publish_pair(output_manifest, output_bytes, output_report, report_bytes)
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-manifest", required=True, type=Path)
+    parser.add_argument("--dataset-info", required=True, type=Path)
+    parser.add_argument("--detector-model", required=True, type=Path)
+    parser.add_argument("--inference-spec", required=True, type=Path)
+    parser.add_argument("--output-manifest", required=True, type=Path)
+    parser.add_argument("--output-report", required=True, type=Path)
+    args = parser.parse_args()
+    report = validate_manifest(
+        input_manifest=args.input_manifest,
+        dataset_info=args.dataset_info,
+        detector_model=args.detector_model,
+        inference_spec=args.inference_spec,
+        output_manifest=args.output_manifest,
+        output_report=args.output_report,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -535,8 +535,14 @@ def collect_sources(
             except ValueError:
                 rejected["unresolved_label_path"] += 1
                 continue
+            if not label_path.is_file():
+                # Only an existing, intentionally empty YOLO label file is
+                # authoritative evidence that the source frame is empty.  A
+                # missing sidecar is unknown annotation state, not a negative.
+                rejected["missing_label_file"] += 1
+                continue
             try:
-                text = label_path.read_text(encoding="utf-8") if label_path.is_file() else ""
+                text = label_path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 rejected["unreadable_label"] += 1
                 continue
@@ -831,6 +837,7 @@ def _crop_bounds(
 MANIFEST_FIELDS = (
     "filepath", "split", "source_id", "material", "category",
     "dent", "label", "foreign_material", "source_object_count",
+    "crop_object_count",
     "source_path_b64", "proposal_index", "assignment", "matched_iou",
     "gt_class_id", "gt_class_name", "gt_bbox_x1", "gt_bbox_y1",
     "gt_bbox_x2", "gt_bbox_y2", "predicted_class_id",
@@ -909,6 +916,13 @@ def write_selected_crops(
                     "label": -1,
                     "foreign_material": -1,
                     "source_object_count": 1 if gt is not None else 0,
+                    # Objectness describes the final verifier crop, while the
+                    # source count truthfully retains whether the full frame
+                    # contained its single annotated object.  A v4 hard
+                    # negative is therefore source=1, crop=0.
+                    "crop_object_count": (
+                        0 if candidate.material == BACKGROUND_CLASS_ID else 1
+                    ),
                     "source_path_b64": _encode_path(source_path),
                     "proposal_index": candidate.proposal_index,
                     "assignment": candidate.assignment,
