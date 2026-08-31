@@ -9,13 +9,14 @@ crop.  The visual judges have veto-only
 authority: they may quarantine a suspicious background crop, but they can never
 change ground truth, repair a candidate prediction, or relax a metric gate.
 
-A frozen policy supplied independently of the candidate pins the approved
-baseline, strict manifests and lineage, visual prompt/runner, and every visual
-judge model/server identity.  The visual inputs are the canonical report and
-evidence JSONL written by ``run_independent_visual_judges.py``.  The gate
-recomputes their report/evidence/vote/raw-response hashes and exact coverage;
-only unanimous ``background`` passes.  Truth, prediction, confidence, and
-logit fields anywhere in a canonical raw response fail closed.
+A frozen policy bundled at a fixed repository-relative path and pinned by a
+code-reviewed SHA-256 pins the approved baseline, strict manifests and lineage,
+visual prompt/runner, and every visual judge model/server identity.  The visual
+inputs are the canonical report and evidence JSONL written by
+``run_independent_visual_judges.py``.  The gate recomputes their
+report/evidence/vote/raw-response hashes and exact coverage; only unanimous
+``background`` passes.  Truth, prediction, confidence, and logit fields
+anywhere in a canonical raw response fail closed.
 
 The report and pass marker are opened with exclusive-create semantics.  A run
 can never overwrite earlier evidence.  A pass marker is an *offline judge gate*
@@ -51,6 +52,12 @@ REPORT_NAME = "v4_candidate_judge_report.json"
 READY_MARKER_NAME = "v4_candidate_judge_ready.txt"
 SHA256_LENGTH = 64
 TRUSTED_POLICY_SCHEMA = "v4_candidate_judge_trusted_policy.v1"
+TRUSTED_POLICY_RELATIVE_PATH = Path(
+    "configs/v4_candidate_judge_trusted_policy.json"
+)
+APPROVED_TRUSTED_POLICY_SHA256 = "UNCONFIGURED"
+TRUST_ROOT_METHOD = "git_bundled_code_sha256_pin"
+UNCONFIGURED_TRUST_ROOT = "UNCONFIGURED"
 VISUAL_REPORT_SCHEMA = "independent_visual_judge_report.v1"
 VISUAL_EVIDENCE_SCHEMA = "independent_visual_judge_evidence.v1"
 VISUAL_VOTE_SCHEMA = "independent_visual_judge_vote.v1"
@@ -408,6 +415,55 @@ def _canonical_family(value: object, *, field: str) -> str:
     if not canonical:
         raise ValueError(f"{field} must contain an ASCII letter or digit")
     return canonical
+
+
+def _audit_trusted_policy_trust_root(
+    path: Path,
+    *,
+    actual_sha256: object | None = None,
+) -> dict[str, object]:
+    """Bind the policy to the repository path and code-reviewed digest pin."""
+
+    relative = TRUSTED_POLICY_RELATIVE_PATH
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise ValueError("trusted policy code path must be a safe relative path")
+    repository = REPO_ROOT.resolve(strict=False)
+    expected_path = (repository / relative).resolve(strict=False)
+    if expected_path == repository or not expected_path.is_relative_to(repository):
+        raise ValueError("trusted policy code path must stay inside the repository")
+    supplied_path = path.resolve(strict=False)
+    if supplied_path != expected_path:
+        raise ValueError(
+            "trusted policy path differs from the repository-pinned trust root"
+        )
+
+    approved_sha256 = APPROVED_TRUSTED_POLICY_SHA256.strip().casefold()
+    if approved_sha256 == UNCONFIGURED_TRUST_ROOT.casefold():
+        raise ValueError("trusted policy trust root is UNCONFIGURED")
+    if not _is_sha256(approved_sha256):
+        raise ValueError("approved trusted policy code pin is not a SHA-256 digest")
+
+    verified = False
+    if actual_sha256 is not None:
+        actual = str(actual_sha256).strip().casefold()
+        if not _is_sha256(actual):
+            raise ValueError("trusted policy snapshot SHA-256 is invalid")
+        if actual != approved_sha256:
+            raise ValueError(
+                "trusted policy SHA-256 differs from the repository-pinned trust root"
+            )
+        verified = True
+    return {
+        "trust_root_method": TRUST_ROOT_METHOD,
+        "verified": verified,
+        "repository_relative_policy_path": relative.as_posix(),
+        "approved_policy_sha256": approved_sha256,
+        "actual_policy_sha256": (
+            str(actual_sha256).strip().casefold()
+            if actual_sha256 is not None
+            else None
+        ),
+    }
 
 
 def load_trusted_policy(path: Path) -> tuple[dict[str, object], str]:
@@ -2520,6 +2576,10 @@ def evaluate_v4_candidate(
     """Evaluate all fixed gates, write one immutable report, and mark only passes."""
 
     thresholds.validate()
+    original_trusted_policy_path = trusted_policy_path
+    trust_root_evidence = _audit_trusted_policy_trust_root(
+        original_trusted_policy_path
+    )
     for field, name in (
         ("report_name", report_name),
         ("ready_marker_name", ready_marker_name),
@@ -2626,6 +2686,13 @@ def evaluate_v4_candidate(
         )
         artifacts.append(artifact)
         snapshot_manifest_paths.append(snapshot)
+    policy_artifact = next(
+        artifact for artifact in artifacts if artifact["kind"] == "trusted_policy"
+    )
+    trust_root_evidence = _audit_trusted_policy_trust_root(
+        original_trusted_policy_path,
+        actual_sha256=policy_artifact["sha256"],
+    )
     validation_image_snapshots: dict[str, Path] = {}
     validation_image_inventory: list[dict[str, object]] = []
     try:
@@ -2673,9 +2740,6 @@ def evaluate_v4_candidate(
     try:
         trusted_policy, trusted_policy_sha256 = load_trusted_policy(
             trusted_policy_path
-        )
-        policy_artifact = next(
-            artifact for artifact in artifacts if artifact["kind"] == "trusted_policy"
         )
         if policy_artifact["sha256"] != trusted_policy_sha256:
             problems.append("trusted policy changed while it was being loaded")
@@ -2746,6 +2810,20 @@ def evaluate_v4_candidate(
                         lineage_evidence.get("calculated_lineage_sha256", "")
                     ),
                 )
+            )
+            trusted_policy_evidence.update(
+                {
+                    "trust_root_method": trust_root_evidence[
+                        "trust_root_method"
+                    ],
+                    "verified": trust_root_evidence["verified"],
+                    "repository_relative_policy_path": trust_root_evidence[
+                        "repository_relative_policy_path"
+                    ],
+                    "approved_policy_sha256": trust_root_evidence[
+                        "approved_policy_sha256"
+                    ],
+                }
             )
             problems.extend(trusted_policy_problems)
         except (OSError, ValueError, KeyError) as error:
@@ -2911,6 +2989,8 @@ def evaluate_v4_candidate(
         "status": "passed" if passed else "rejected",
         "candidate_ready": passed,
         "trusted_policy_sha256": trusted_policy_sha256 or None,
+        "trust_root_method": trust_root_evidence["trust_root_method"],
+        "trust_root_verified": trust_root_evidence["verified"],
         "production_deployment_authorized": False,
         "requires_independent_blind_hardware_evidence": True,
         "authority_contract": {
@@ -2951,6 +3031,8 @@ def evaluate_v4_candidate(
             "report": str(report_path.resolve()),
             "report_sha256": _sha256_bytes(report_bytes),
             "trusted_policy_sha256": trusted_policy_sha256,
+            "trust_root_method": trust_root_evidence["trust_root_method"],
+            "trust_root_verified": trust_root_evidence["verified"],
             "production_deployment_authorized": False,
             "requires_independent_blind_hardware_evidence": True,
         }

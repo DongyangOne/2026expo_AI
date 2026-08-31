@@ -10,6 +10,7 @@ import onnx
 import pytest
 from onnx import TensorProto, helper, numpy_helper
 
+from scripts import evaluate_v4_candidate_judge as candidate_judge
 from scripts.evaluate_v4_candidate_judge import (
     GateThresholds,
     READY_MARKER_NAME,
@@ -818,8 +819,29 @@ def _write_trusted_policy(
     path.write_bytes(_canonical(policy))
 
 
+def _pin_test_trusted_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    repository_root: Path,
+    policy_path: Path,
+) -> None:
+    monkeypatch.setattr(candidate_judge, "REPO_ROOT", repository_root)
+    monkeypatch.setattr(
+        candidate_judge,
+        "TRUSTED_POLICY_RELATIVE_PATH",
+        policy_path.relative_to(repository_root),
+    )
+    monkeypatch.setattr(
+        candidate_judge,
+        "APPROVED_TRUSTED_POLICY_SHA256",
+        hashlib.sha256(policy_path.read_bytes()).hexdigest(),
+    )
+
+
 @pytest.fixture
-def candidate(tmp_path: Path) -> dict[str, object]:
+def candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, object]:
     rows = [_row("train", material, 0) for material in range(10)]
     rows.extend(_row("model_validation", material, 0) for material in range(9))
     rows.extend(_row("model_validation", 9, index) for index in range(200))
@@ -865,6 +887,11 @@ def candidate(tmp_path: Path) -> dict[str, object]:
         baseline_model=baseline_onnx,
         baseline_metadata=baseline_metadata,
     )
+    _pin_test_trusted_policy(
+        monkeypatch,
+        repository_root=tmp_path,
+        policy_path=trusted_policy,
+    )
     return {
         "rows": rows,
         "manifest": manifest,
@@ -878,6 +905,7 @@ def candidate(tmp_path: Path) -> dict[str, object]:
         "baseline_replay_predictions": baseline_replay_predictions,
         "baseline_replay_attestation": baseline_replay_attestation,
         "trusted_policy": trusted_policy,
+        "trust_root_repository": tmp_path,
         "visual_report": visual_report,
         "visual_evidence": visual_evidence,
         "thresholds": GateThresholds(),
@@ -948,6 +976,8 @@ def test_pass_is_hash_bound_immutable_and_never_authorizes_production(
 
     assert report["status"] == "passed"
     assert report["candidate_ready"] is True
+    assert report["trust_root_method"] == "git_bundled_code_sha256_pin"
+    assert report["trust_root_verified"] is True
     assert report["production_deployment_authorized"] is False
     assert report["gates"]["visual_judges"]["judge_count"] == 2
     assert report["gates"]["visual_judges"]["truth_relabels"] == 0
@@ -958,6 +988,8 @@ def test_pass_is_hash_bound_immutable_and_never_authorizes_production(
     assert marker["trusted_policy_sha256"] == hashlib.sha256(
         candidate["trusted_policy"].read_bytes()
     ).hexdigest()
+    assert marker["trust_root_method"] == "git_bundled_code_sha256_pin"
+    assert marker["trust_root_verified"] is True
     assert marker["report_sha256"] == hashlib.sha256(
         (output_dir / REPORT_NAME).read_bytes()
     ).hexdigest()
@@ -965,12 +997,28 @@ def test_pass_is_hash_bound_immutable_and_never_authorizes_production(
         _evaluate(candidate, output_dir)
 
 
-def test_authoritative_cli_subprocess_passes_with_real_tiny_onnx(candidate, tmp_path):
+def test_configured_cli_subprocess_passes_with_real_tiny_onnx(candidate, tmp_path):
     output_dir = tmp_path / "subprocess-output"
+    policy_sha256 = hashlib.sha256(candidate["trusted_policy"].read_bytes()).hexdigest()
+    bootstrap = "\n".join(
+        (
+            "import sys",
+            "from pathlib import Path",
+            "from scripts import evaluate_v4_candidate_judge as gate",
+            f"gate.REPO_ROOT = Path({str(candidate['trust_root_repository'])!r})",
+            (
+                "gate.TRUSTED_POLICY_RELATIVE_PATH = "
+                f"Path({candidate['trusted_policy'].name!r})"
+            ),
+            f"gate.APPROVED_TRUSTED_POLICY_SHA256 = {policy_sha256!r}",
+            "raise SystemExit(gate.main(sys.argv[1:]))",
+        )
+    )
     result = subprocess.run(
         [
             sys.executable,
-            "scripts/evaluate_v4_candidate_judge.py",
+            "-c",
+            bootstrap,
             *_cli_args(candidate, output_dir),
         ],
         cwd=Path(__file__).parents[1],
@@ -981,6 +1029,96 @@ def test_authoritative_cli_subprocess_passes_with_real_tiny_onnx(candidate, tmp_
 
     assert result.returncode == 0, result.stderr
     assert (output_dir / READY_MARKER_NAME).is_file()
+
+
+def test_stock_cli_unconfigured_pin_exits_two_without_artifacts(candidate, tmp_path):
+    output_dir = tmp_path / "stock-unconfigured-output"
+    args = _cli_args(candidate, output_dir)
+    policy_index = args.index("--trusted-policy") + 1
+    args[policy_index] = str(
+        Path(__file__).parents[1]
+        / "configs/v4_candidate_judge_trusted_policy.json"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/evaluate_v4_candidate_judge.py",
+            *args,
+        ],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "UNCONFIGURED" in result.stderr
+    assert not (output_dir / REPORT_NAME).exists()
+    assert not (output_dir / READY_MARKER_NAME).exists()
+
+
+def test_unconfigured_code_pin_fails_closed_without_artifacts(
+    candidate, tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "unconfigured-trust-root-output"
+    monkeypatch.setattr(
+        candidate_judge,
+        "APPROVED_TRUSTED_POLICY_SHA256",
+        candidate_judge.UNCONFIGURED_TRUST_ROOT,
+    )
+
+    with pytest.raises(ValueError, match="UNCONFIGURED"):
+        _evaluate(candidate, output_dir)
+
+    assert not (output_dir / REPORT_NAME).exists()
+    assert not (output_dir / READY_MARKER_NAME).exists()
+
+
+def test_caller_cannot_select_another_trusted_policy_path(candidate, tmp_path):
+    output_dir = tmp_path / "wrong-policy-path-output"
+    caller_policy = tmp_path / "caller-policy.json"
+    caller_policy.write_bytes(candidate["trusted_policy"].read_bytes())
+
+    with pytest.raises(ValueError, match="repository-pinned trust root"):
+        _evaluate(
+            candidate,
+            output_dir,
+            trusted_policy_path=caller_policy,
+        )
+
+    assert not (output_dir / REPORT_NAME).exists()
+    assert not (output_dir / READY_MARKER_NAME).exists()
+
+
+def test_wrong_code_pinned_policy_hash_fails_closed(
+    candidate, tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "wrong-policy-hash-output"
+    monkeypatch.setattr(
+        candidate_judge,
+        "APPROVED_TRUSTED_POLICY_SHA256",
+        _sha("different-reviewed-policy"),
+    )
+
+    with pytest.raises(ValueError, match="SHA-256 differs"):
+        _evaluate(candidate, output_dir)
+
+    assert not (output_dir / REPORT_NAME).exists()
+    assert not (output_dir / READY_MARKER_NAME).exists()
+
+
+def test_caller_crafted_policy_at_fixed_path_cannot_self_root(candidate, tmp_path):
+    output_dir = tmp_path / "caller-crafted-policy-output"
+    crafted = json.loads(candidate["trusted_policy"].read_text())
+    crafted["approved_baseline"]["model_sha256"] = _sha("caller-baseline")
+    candidate["trusted_policy"].write_bytes(_canonical(crafted))
+
+    with pytest.raises(ValueError, match="SHA-256 differs"):
+        _evaluate(candidate, output_dir)
+
+    assert not (output_dir / REPORT_NAME).exists()
+    assert not (output_dir / READY_MARKER_NAME).exists()
 
 
 def test_invalid_onnx_cannot_pass_with_stale_replay(candidate, tmp_path):
@@ -1075,7 +1213,9 @@ def test_metadata_metrics_are_recomputed_not_trusted(candidate, tmp_path):
     assert any("metadata best_metrics differ" in p for p in report["problems"])
 
 
-def test_v4_hard_negative_source_one_crop_zero_is_valid(candidate, tmp_path):
+def test_v4_hard_negative_source_one_crop_zero_is_valid(
+    candidate, tmp_path, monkeypatch
+):
     hard_negative = next(
         row
         for row in candidate["rows"]
@@ -1101,16 +1241,26 @@ def test_v4_hard_negative_source_one_crop_zero_is_valid(candidate, tmp_path):
         baseline_model=candidate["baseline_onnx"],
         baseline_metadata=candidate["baseline_metadata"],
     )
+    _pin_test_trusted_policy(
+        monkeypatch,
+        repository_root=candidate["trust_root_repository"],
+        policy_path=candidate["trusted_policy"],
+    )
 
     report = _evaluate(candidate, tmp_path / "hard-negative-output")
 
     assert report["status"] == "passed"
 
 
-def test_trusted_policy_pins_baseline_identity(candidate, tmp_path):
+def test_trusted_policy_pins_baseline_identity(candidate, tmp_path, monkeypatch):
     policy = json.loads(candidate["trusted_policy"].read_text())
     policy["approved_baseline"]["model_sha256"] = _sha("unapproved-baseline")
     candidate["trusted_policy"].write_bytes(_canonical(policy))
+    _pin_test_trusted_policy(
+        monkeypatch,
+        repository_root=candidate["trust_root_repository"],
+        policy_path=candidate["trusted_policy"],
+    )
 
     report = _evaluate(candidate, tmp_path / "policy-output")
 
@@ -1118,12 +1268,19 @@ def test_trusted_policy_pins_baseline_identity(candidate, tmp_path):
     assert any("baseline model SHA-256 differs" in p for p in report["problems"])
 
 
-def test_trusted_policy_rejects_shared_judge_weight_layer(candidate, tmp_path):
+def test_trusted_policy_rejects_shared_judge_weight_layer(
+    candidate, tmp_path, monkeypatch
+):
     policy = json.loads(candidate["trusted_policy"].read_text())
     policy["visual_judges"]["judges"][1]["model_weight_layer_sha256"] = policy[
         "visual_judges"
     ]["judges"][0]["model_weight_layer_sha256"]
     candidate["trusted_policy"].write_bytes(_canonical(policy))
+    _pin_test_trusted_policy(
+        monkeypatch,
+        repository_root=candidate["trust_root_repository"],
+        policy_path=candidate["trusted_policy"],
+    )
 
     report = _evaluate(candidate, tmp_path / "shared-weight-output")
 
@@ -1239,10 +1396,15 @@ def test_candidate_cannot_be_reused_as_its_own_baseline(candidate, tmp_path):
     assert any("baseline model must be distinct" in p for p in report["problems"])
 
 
-def test_policy_pins_visual_prompt_and_runner(candidate, tmp_path):
+def test_policy_pins_visual_prompt_and_runner(candidate, tmp_path, monkeypatch):
     policy = json.loads(candidate["trusted_policy"].read_text())
     policy["visual_judges"]["runner_script_sha256"] = _sha("other-runner")
     candidate["trusted_policy"].write_bytes(_canonical(policy))
+    _pin_test_trusted_policy(
+        monkeypatch,
+        repository_root=candidate["trust_root_repository"],
+        policy_path=candidate["trusted_policy"],
+    )
 
     report = _evaluate(candidate, tmp_path / "runner-policy-output")
 

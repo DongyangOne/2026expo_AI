@@ -30,6 +30,7 @@ import math
 import os
 import tempfile
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -47,6 +48,7 @@ try:
         assign_proposal,
         bbox_iou,
         boxes_intersect,
+        eager_initialize_cuda_context,
         expanded_clipped_bbox,
         iter_yolo_predictions,
         parse_yolo_label_text,
@@ -68,6 +70,7 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
         assign_proposal,
         bbox_iou,
         boxes_intersect,
+        eager_initialize_cuda_context,
         expanded_clipped_bbox,
         iter_yolo_predictions,
         parse_yolo_label_text,
@@ -81,6 +84,12 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
 
 
 SCHEMA_VERSION = "proposal_verifier.v4.bgfix.v1"
+AUTHORITATIVE_ARTIFACT_ROLE = (
+    "v4_development_candidates_not_blind_or_deployment_authority"
+)
+CUSTOM_PROVIDER_ARTIFACT_ROLE = (
+    "v4_custom_provider_diagnostics_not_lineage_blind_or_deployment_authority"
+)
 EXPECTED_BACKGROUND_POLICY = "strict-zero-intersection"
 EXPECTED_BACKGROUND_MARGIN = 0.10
 EXPECTED_SELECTION_MODE = "runtime-top1"
@@ -121,6 +130,55 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stable_read_bytes(path: Path, *, description: str) -> bytes:
+    """Read one file descriptor and reject replacement or mutation while reading."""
+
+    with path.open("rb") as file:
+        before = os.fstat(file.fileno())
+        content = file.read()
+        after = os.fstat(file.fileno())
+    path_after = path.stat()
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    path_identity = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+    )
+    if os.name != "nt":
+        before_identity += (before.st_ctime_ns,)
+        after_identity += (after.st_ctime_ns,)
+        path_identity += (path_after.st_ctime_ns,)
+    if before_identity != after_identity or after_identity != path_identity:
+        raise ValueError(f"{description} changed while being read: {path}")
+    if len(content) != before.st_size:
+        raise ValueError(f"{description} size changed while being read: {path}")
+    return content
+
+
+def _write_snapshot(path: Path, content: bytes) -> None:
+    """Create one private replay snapshot without permitting overwrite.
+
+    These files are ephemeral same-process replay inputs, so closing the file is
+    sufficient visibility and avoids two fsync calls per source on the QNAP.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as file:
+        file.write(content)
 
 
 def _finite(value: object, *, field: str) -> float:
@@ -340,10 +398,16 @@ def validate_detector_replay(
     rows: Sequence[Mapping[str, str]],
     *,
     prediction_provider: PredictionProvider,
+    records: Sequence[SourceRecord] | None = None,
+    provider_kind: str,
+    runtime_detector_executed: bool,
 ) -> dict[str, object]:
     """Replay frozen detector top1 and require every emitted proposal to match."""
 
-    records = _replay_source_records(manifest_path, rows)
+    if records is None:
+        records = _replay_source_records(manifest_path, rows)
+    elif len(records) != len(rows):
+        raise ValueError("detector replay snapshot count differs from manifest rows")
     expected = {record.path.resolve(): row for record, row in zip(records, rows, strict=True)}
     observed: set[Path] = set()
     for frame in prediction_provider(records):
@@ -412,12 +476,19 @@ def validate_detector_replay(
         )
     return {
         "sources": len(records),
-        "runtime_top1_replayed": True,
+        "provider_kind": provider_kind,
+        "runtime_detector_executed": runtime_detector_executed,
+        "runtime_top1_replayed": runtime_detector_executed,
+        "provided_top1_predictions_matched": True,
         "proposal_class_confidence_bbox_matched": True,
         "confidence_abs_tolerance": REPLAY_CONFIDENCE_ABS_TOLERANCE,
         "bbox_abs_tolerance": REPLAY_BBOX_ABS_TOLERANCE,
         "original_generation_event_cryptographically_attested": False,
-        "authority": "development_only_current_detector_reproduction",
+        "authority": (
+            "development_only_current_detector_reproduction"
+            if runtime_detector_executed
+            else "custom_provider_diagnostics_only"
+        ),
     }
 
 
@@ -427,9 +498,13 @@ def validate_rows(
     *,
     detector_sha256: str,
     spec_sha256: str,
-) -> tuple[list[dict[str, str]], Counter]:
+    replay_snapshot_dir: Path | None = None,
+) -> tuple[list[dict[str, str]], Counter, list[SourceRecord] | None]:
     validated: list[dict[str, str]] = []
     counts: Counter = Counter()
+    replay_records: list[SourceRecord] | None = (
+        [] if replay_snapshot_dir is not None else None
+    )
     for line, raw in enumerate(rows, start=2):
         location = f"{manifest_path}:{line}"
         row = dict(raw)
@@ -624,9 +699,51 @@ def validate_rows(
             if existing and existing != value:
                 raise ValueError(f"{location}: declared {field} conflicts with recomputed value")
             row[field] = value
+        if replay_records is not None:
+            source_suffix = source_path.suffix
+            snapshot_stem = f"source-{line - 1:08d}-{source_sha[:16]}"
+            snapshot_shard = source_sha[:2]
+            snapshot_source = (
+                replay_snapshot_dir
+                / "images"
+                / snapshot_shard
+                / f"{snapshot_stem}{source_suffix}"
+            )
+            snapshot_label = (
+                replay_snapshot_dir
+                / "labels"
+                / snapshot_shard
+                / f"{snapshot_stem}.txt"
+            )
+            _write_snapshot(snapshot_source, source_bytes)
+            _write_snapshot(snapshot_label, annotation_bytes)
+            replay_records.append(
+                SourceRecord(
+                    path=snapshot_source,
+                    split=row["split"].strip(),
+                    source_id=source_sha,
+                    ground_truth=ground_truth,
+                )
+            )
         counts[(row["split"].strip(), expected_category)] += 1
         validated.append(row)
-    return validated, counts
+    return validated, counts, replay_records
+
+
+def _verify_replay_snapshot_bytes(
+    records: Sequence[SourceRecord],
+    rows: Sequence[Mapping[str, str]],
+) -> None:
+    """Verify that the private bytes replayed by YOLO stayed hash-bound."""
+
+    if len(records) != len(rows):
+        raise ValueError("detector replay snapshot count differs from validated rows")
+    for record, row in zip(records, rows, strict=True):
+        if _sha256_file(record.path) != row["source_sha256"]:
+            raise ValueError(f"detector replay source snapshot changed: {record.path}")
+        label_path = _label_path(record.path)
+        if _sha256_file(label_path) != row["source_annotation_sha256"]:
+            raise ValueError(f"detector replay label snapshot changed: {label_path}")
 
 
 def _render_csv(fields: Sequence[str], rows: Sequence[Mapping[str, str]]) -> bytes:
@@ -719,7 +836,6 @@ def validate_manifest(
         raise ValueError("dataset_info must declare the generated manifest path")
     if Path(declared_manifest).resolve() != input_manifest.resolve():
         raise ValueError("dataset_info manifest path does not match supplied manifest")
-    detector_sha = _sha256_file(detector_model)
     spec_sha = _sha256_bytes(spec_bytes)
     detector_spec = spec.get("detector")
     assert isinstance(detector_spec, Mapping)
@@ -728,84 +844,162 @@ def validate_manifest(
         raise ValueError(
             "inference spec detector model reference does not name the supplied model"
         )
-    optional_bindings = {
-        "model_sha256": detector_sha,
-        "manifest_sha256": _sha256_bytes(manifest_bytes),
-        "inference_spec_sha256": spec_sha,
-    }
-    for field, actual in optional_bindings.items():
-        declared = str(info.get(field, "")).strip().casefold()
-        if declared and declared != actual:
-            raise ValueError(f"dataset_info {field} conflicts with supplied artifact")
-    validated, counts = validate_rows(
-        input_manifest, rows, detector_sha256=detector_sha, spec_sha256=spec_sha
-    )
-    if prediction_provider is None:
-        inference = info["inference"]
-        assert isinstance(inference, Mapping)
-        device = str(inference.get("device", "")).strip()
+    inference = info["inference"]
+    assert isinstance(inference, Mapping)
+    device = str(inference.get("device", "")).strip()
+    authoritative = prediction_provider is None
+    batch = 0
+    if authoritative:
         if not device:
             raise ValueError("dataset_info inference.device is required for replay")
         batch = _integer(inference.get("batch"), field="inference.batch")
         if batch <= 0:
             raise ValueError("dataset_info inference.batch must be positive")
 
-        def prediction_provider(records: Sequence[SourceRecord]) -> Iterable[PredictedFrame]:
-            return iter_yolo_predictions(
-                records,
-                model_path=detector_model,
-                device=device,
-                batch=batch,
-                imgsz=640,
-                conf=EXPECTED_CONFIDENCE,
-                nms_iou=EXPECTED_NMS_IOU,
+    with ExitStack() as stack:
+        accelerator_guard = (
+            eager_initialize_cuda_context(device) if authoritative else None
+        )
+        detector_snapshot: Path | None = None
+        replay_snapshot_dir: Path | None = None
+        if authoritative:
+            replay_root = Path(
+                stack.enter_context(
+                    tempfile.TemporaryDirectory(
+                        prefix=".v4-detector-replay-",
+                        dir=input_manifest.parent,
+                    )
+                )
             )
+            detector_content = _stable_read_bytes(
+                detector_model, description="detector model"
+            )
+            detector_sha = _sha256_bytes(detector_content)
+            detector_snapshot = replay_root / "detector" / detector_model.name
+            _write_snapshot(detector_snapshot, detector_content)
+            if _sha256_file(detector_snapshot) != detector_sha:
+                raise ValueError("detector snapshot differs from stable source bytes")
+            replay_snapshot_dir = replay_root / "sources"
+        else:
+            detector_sha = _sha256_file(detector_model)
 
-    detector_replay = validate_detector_replay(
-        input_manifest,
-        rows,
-        prediction_provider=prediction_provider,
-    )
-    output_fields = [*fields, *(field for field in ADDED_FIELDS if field not in fields)]
-    output_bytes = _render_csv(output_fields, validated)
-    report = {
-        "schema_version": 1,
-        "artifact_role": "v4_development_candidates_not_blind_or_deployment_authority",
-        "ready_for_lineage_upgrade": True,
-        "blind_test_eligible": False,
-        "production_deployment_authorized": False,
-        "rows": len(validated),
-        "counts": {
-            f"{split}/{category}": count
-            for (split, category), count in sorted(counts.items())
-        },
-        "contract": {
-            "manifest_schema_version": SCHEMA_VERSION,
-            "background_policy": EXPECTED_BACKGROUND_POLICY,
-            "background_gt_margin": EXPECTED_BACKGROUND_MARGIN,
-            "explicit_label_file_required": True,
-            "source_object_count_semantics": "complete_source_frame",
-            "crop_object_count_semantics": "final_padded_verifier_crop",
-            "visual_judge_still_required": True,
-            "proposal_provenance": {
-                **detector_replay,
-                "detector_artifact_bytes_bound": True,
-                "inference_spec_bytes_bound": True,
-                "dataset_info_bytes_bound": True,
-                "source_bbox_crop_bytes_recomputed": True,
-                "production_or_blind_authority": False,
-            },
-        },
-        "bindings": {
-            "input_manifest_sha256": _sha256_bytes(manifest_bytes),
-            "dataset_info_sha256": _sha256_bytes(info_bytes),
-            "detector_model_sha256": detector_sha,
+        optional_bindings = {
+            "model_sha256": detector_sha,
+            "manifest_sha256": _sha256_bytes(manifest_bytes),
             "inference_spec_sha256": spec_sha,
-            "validated_manifest_sha256": _sha256_bytes(output_bytes),
-        },
-    }
-    report_bytes = _json_bytes(report)
-    _publish_pair(output_manifest, output_bytes, output_report, report_bytes)
+        }
+        for field, actual in optional_bindings.items():
+            declared = str(info.get(field, "")).strip().casefold()
+            if declared and declared != actual:
+                raise ValueError(f"dataset_info {field} conflicts with supplied artifact")
+
+        validated, counts, replay_records = validate_rows(
+            input_manifest,
+            rows,
+            detector_sha256=detector_sha,
+            spec_sha256=spec_sha,
+            replay_snapshot_dir=replay_snapshot_dir,
+        )
+        if authoritative:
+            assert detector_snapshot is not None
+            assert replay_records is not None
+
+            def frozen_yolo_provider(
+                records: Sequence[SourceRecord],
+            ) -> Iterable[PredictedFrame]:
+                # Retain the QNAP CUDA client through the complete replay.
+                _ = accelerator_guard
+                return iter_yolo_predictions(
+                    records,
+                    model_path=detector_snapshot,
+                    device=device,
+                    batch=batch,
+                    imgsz=640,
+                    conf=EXPECTED_CONFIDENCE,
+                    nms_iou=EXPECTED_NMS_IOU,
+                )
+
+            replay_provider = frozen_yolo_provider
+            provider_kind = "frozen_yolo_runtime"
+        else:
+            assert prediction_provider is not None
+            replay_provider = prediction_provider
+            provider_kind = "custom_non_authoritative"
+
+        detector_replay = validate_detector_replay(
+            input_manifest,
+            rows,
+            prediction_provider=replay_provider,
+            records=replay_records,
+            provider_kind=provider_kind,
+            runtime_detector_executed=authoritative,
+        )
+        if authoritative:
+            assert replay_records is not None
+            assert detector_snapshot is not None
+            _verify_replay_snapshot_bytes(replay_records, validated)
+            if _sha256_file(detector_snapshot) != detector_sha:
+                raise ValueError("detector replay snapshot changed during validation")
+            detector_original_end = _stable_read_bytes(
+                detector_model, description="detector model final rehash"
+            )
+            if _sha256_bytes(detector_original_end) != detector_sha:
+                raise ValueError("original detector model changed during validation")
+
+        output_fields = [
+            *fields,
+            *(field for field in ADDED_FIELDS if field not in fields),
+        ]
+        output_bytes = _render_csv(output_fields, validated)
+        report = {
+            "schema_version": 1,
+            "artifact_role": (
+                AUTHORITATIVE_ARTIFACT_ROLE
+                if authoritative
+                else CUSTOM_PROVIDER_ARTIFACT_ROLE
+            ),
+            "ready_for_lineage_upgrade": authoritative,
+            "blind_test_eligible": False,
+            "production_deployment_authorized": False,
+            "rows": len(validated),
+            "counts": {
+                f"{split}/{category}": count
+                for (split, category), count in sorted(counts.items())
+            },
+            "contract": {
+                "manifest_schema_version": SCHEMA_VERSION,
+                "background_policy": EXPECTED_BACKGROUND_POLICY,
+                "background_gt_margin": EXPECTED_BACKGROUND_MARGIN,
+                "explicit_label_file_required": True,
+                "source_object_count_semantics": "complete_source_frame",
+                "crop_object_count_semantics": "final_padded_verifier_crop",
+                "visual_judge_still_required": True,
+                "proposal_provenance": {
+                    **detector_replay,
+                    "cuda_client_initialized_before_source_crop_scan": (
+                        accelerator_guard is not None
+                    ),
+                    "detector_artifact_bytes_bound": authoritative,
+                    "detector_replay_used_unique_snapshot": authoritative,
+                    "source_and_label_replay_used_unique_snapshots": authoritative,
+                    "replay_snapshots_verified_after_inference": authoritative,
+                    "original_detector_bytes_unchanged_through_validation": authoritative,
+                    "inference_spec_bytes_bound": True,
+                    "dataset_info_bytes_bound": True,
+                    "source_bbox_crop_bytes_recomputed": True,
+                    "production_or_blind_authority": False,
+                },
+            },
+            "bindings": {
+                "input_manifest_sha256": _sha256_bytes(manifest_bytes),
+                "dataset_info_sha256": _sha256_bytes(info_bytes),
+                "detector_model_sha256": detector_sha,
+                "inference_spec_sha256": spec_sha,
+                "validated_manifest_sha256": _sha256_bytes(output_bytes),
+            },
+        }
+        report_bytes = _json_bytes(report)
+        _publish_pair(output_manifest, output_bytes, output_report, report_bytes)
     return report
 
 

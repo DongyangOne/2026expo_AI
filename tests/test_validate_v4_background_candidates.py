@@ -3,12 +3,15 @@ import csv
 import hashlib
 import json
 import os
+import weakref
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 import pytest
 
+import scripts.validate_v4_background_candidates as validator_module
 from scripts.prepare_proposal_verifier_dataset import (
     MANIFEST_FIELDS,
     PredictedFrame,
@@ -23,6 +26,7 @@ from scripts.verifier_preprocessing_contract import crop_and_letterbox_bgr
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPEC_PATH = REPO_ROOT / "configs" / "detector_inference_v3.json"
+_AUTHORITATIVE_RUNTIME = object()
 
 
 def _write_jpeg(path: Path, size: tuple[int, int]) -> None:
@@ -165,14 +169,67 @@ def _fixture(tmp_path: Path) -> dict[str, object]:
 def _validate(
     fixture: dict[str, object],
     *,
-    prediction_provider=None,
+    prediction_provider=_AUTHORITATIVE_RUNTIME,
 ) -> dict:
-    if prediction_provider is None:
+    if prediction_provider is _AUTHORITATIVE_RUNTIME:
         proposal = fixture["detector_proposal"]
+        replay_roots: list[Path] = []
 
-        def prediction_provider(records):
+        def frozen_predictions(
+            records,
+            *,
+            model_path,
+            device,
+            batch,
+            imgsz,
+            conf,
+            nms_iou,
+        ):
+            detector = fixture["detector"]
+            source = fixture["source"]
+            label = fixture["label"]
+            events = fixture.get("_events")
+            if isinstance(events, list):
+                events.append("replay")
+            guard_ref = fixture.get("_guard_ref")
+            if callable(guard_ref):
+                assert guard_ref() is not None
+            replay_root = model_path.parents[1]
+            replay_roots.append(replay_root)
+            assert model_path.name == detector.name
+            assert model_path.resolve() != detector.resolve()
+            assert model_path.read_bytes() == detector.read_bytes()
+            expected_info = json.loads(fixture["info"].read_text(encoding="utf-8"))
+            assert device == expected_info["inference"]["device"]
+            assert batch == 1
+            assert imgsz == 640
+            assert conf == 0.10
+            assert nms_iou == 0.70
             for record in records:
+                assert record.path.read_bytes() == source.read_bytes()
+                snapshot_label = validator_module._label_path(record.path)
+                assert snapshot_label.read_bytes() == label.read_bytes()
+                assert record.path.parents[3] == replay_root
+                if fixture.get("_mutate_replay_source"):
+                    record.path.write_bytes(b"mutated replay snapshot")
+                if fixture.get("_mutate_original_detector"):
+                    detector.write_bytes(b"changed original detector")
                 yield PredictedFrame(record, 100, 100, (proposal,))
+
+        with patch.object(
+            validator_module, "iter_yolo_predictions", frozen_predictions
+        ):
+            report = validate_manifest(
+                input_manifest=fixture["manifest"],
+                dataset_info=fixture["info"],
+                detector_model=fixture["detector"],
+                inference_spec=SPEC_PATH,
+                output_manifest=fixture["output"],
+                output_report=fixture["report"],
+            )
+        assert replay_roots
+        assert all(not root.exists() for root in replay_roots)
+        return report
 
     return validate_manifest(
         input_manifest=fixture["manifest"],
@@ -194,7 +251,12 @@ def test_rescues_current_manifest_and_preserves_two_object_count_semantics(tmp_p
     assert report["blind_test_eligible"] is False
     assert report["production_deployment_authorized"] is False
     provenance = report["contract"]["proposal_provenance"]
+    assert provenance["provider_kind"] == "frozen_yolo_runtime"
+    assert provenance["runtime_detector_executed"] is True
     assert provenance["runtime_top1_replayed"] is True
+    assert provenance["detector_replay_used_unique_snapshot"] is True
+    assert provenance["source_and_label_replay_used_unique_snapshots"] is True
+    assert provenance["replay_snapshots_verified_after_inference"] is True
     assert provenance["original_generation_event_cryptographically_attested"] is False
     assert provenance["production_or_blind_authority"] is False
     with fixture["output"].open(encoding="utf-8", newline="") as file:
@@ -206,6 +268,101 @@ def test_rescues_current_manifest_and_preserves_two_object_count_semantics(tmp_p
     assert row["blind_test_eligible"] == "false"
     stored = json.loads(fixture["report"].read_text(encoding="utf-8"))
     assert stored == report
+
+
+def test_cuda_guard_precedes_scan_and_survives_runtime_replay(tmp_path):
+    fixture = _fixture(tmp_path)
+    info = json.loads(fixture["info"].read_text(encoding="utf-8"))
+    info["inference"]["device"] = "0"
+    fixture["info"].write_text(json.dumps(info), encoding="utf-8")
+    events: list[str] = []
+    fixture["_events"] = events
+
+    class Guard:
+        pass
+
+    def initialize(device):
+        assert device == "0"
+        guard = Guard()
+        fixture["_guard_ref"] = weakref.ref(guard)
+        events.append("init")
+        return guard
+
+    original_validate_rows = validator_module.validate_rows
+
+    def validate_rows_after_guard(*args, **kwargs):
+        assert fixture["_guard_ref"]() is not None
+        events.append("scan")
+        return original_validate_rows(*args, **kwargs)
+
+    with (
+        patch.object(
+            validator_module,
+            "eager_initialize_cuda_context",
+            initialize,
+        ),
+        patch.object(validator_module, "validate_rows", validate_rows_after_guard),
+    ):
+        report = _validate(fixture)
+
+    assert events == ["init", "scan", "replay"]
+    assert fixture["_guard_ref"]() is None
+    provenance = report["contract"]["proposal_provenance"]
+    assert provenance["cuda_client_initialized_before_source_crop_scan"] is True
+
+
+def test_custom_prediction_provider_is_non_authoritative_and_not_lineage_ready(tmp_path):
+    fixture = _fixture(tmp_path)
+    proposal = fixture["detector_proposal"]
+    info = json.loads(fixture["info"].read_text(encoding="utf-8"))
+    info["inference"]["batch"] = "unused-by-custom-provider"
+    fixture["info"].write_text(json.dumps(info), encoding="utf-8")
+
+    def custom_provider(records):
+        for record in records:
+            yield PredictedFrame(record, 100, 100, (proposal,))
+
+    with patch.object(
+        validator_module,
+        "eager_initialize_cuda_context",
+        side_effect=AssertionError("custom provider must not initialize CUDA"),
+    ):
+        report = _validate(fixture, prediction_provider=custom_provider)
+
+    assert report["artifact_role"].startswith("v4_custom_provider_diagnostics")
+    assert report["ready_for_lineage_upgrade"] is False
+    provenance = report["contract"]["proposal_provenance"]
+    assert provenance["provider_kind"] == "custom_non_authoritative"
+    assert provenance["runtime_detector_executed"] is False
+    assert provenance["runtime_top1_replayed"] is False
+    assert provenance["provided_top1_predictions_matched"] is True
+    assert provenance["detector_artifact_bytes_bound"] is False
+    assert provenance["detector_replay_used_unique_snapshot"] is False
+    assert provenance["source_and_label_replay_used_unique_snapshots"] is False
+
+
+def test_original_detector_is_rehashed_after_runtime_replay(tmp_path):
+    fixture = _fixture(tmp_path)
+    fixture["_mutate_original_detector"] = True
+
+    with pytest.raises(ValueError, match="original detector model changed"):
+        _validate(fixture)
+
+    assert not fixture["output"].exists()
+    assert not fixture["report"].exists()
+    assert not list(fixture["manifest"].parent.glob(".v4-detector-replay-*"))
+
+
+def test_mutated_private_source_snapshot_cannot_publish_report(tmp_path):
+    fixture = _fixture(tmp_path)
+    fixture["_mutate_replay_source"] = True
+
+    with pytest.raises(ValueError, match="detector replay source snapshot changed"):
+        _validate(fixture)
+
+    assert not fixture["output"].exists()
+    assert not fixture["report"].exists()
+    assert not list(fixture["manifest"].parent.glob(".v4-detector-replay-*"))
 
 
 def test_missing_label_is_not_treated_as_empty_scene_and_publishes_nothing(tmp_path):
