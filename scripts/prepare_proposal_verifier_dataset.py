@@ -11,7 +11,11 @@ The train/validation split from the supplied YOLO data YAML is preserved.  The
 optional ``runtime-top1`` mode keeps only the highest-confidence proposal above
 the configured confidence floor, matching the production selection rule.  The
 optional ``no-ground-truth-only`` policy prevents low-IoU proposals from a
-labelled frame from becoming noisy background pseudo-labels.
+labelled frame from becoming noisy background pseudo-labels.  The stricter
+``strict-zero-intersection`` policy also accepts a labelled frame only when the
+*final padded verifier crop* has no intersection with the GT box expanded by a
+frozen safety margin.  This produces useful hard negatives without teaching a
+partially visible recyclable object as background.
 
 Output is selected deterministically before crops are written, so class caps do
 not depend on filesystem or inference order.  Ultralytics is imported only
@@ -39,6 +43,17 @@ from typing import Callable, Iterable, Iterator, Sequence
 import cv2
 import numpy as np
 
+try:
+    from scripts.verifier_preprocessing_contract import (
+        letterbox_bgr as _contract_letterbox_bgr,
+        padded_clipped_bbox as _contract_padded_clipped_bbox,
+    )
+except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
+    from verifier_preprocessing_contract import (  # type: ignore[no-redef]
+        letterbox_bgr as _contract_letterbox_bgr,
+        padded_clipped_bbox as _contract_padded_clipped_bbox,
+    )
+
 
 CLASS_NAMES = (
     "can", "pet", "paper", "plastic", "styrofoam",
@@ -50,6 +65,7 @@ PROPOSAL_SELECTION_MODES = ("all", "runtime-top1")
 BACKGROUND_POLICIES = (
     "low-iou-or-no-ground-truth",
     "no-ground-truth-only",
+    "strict-zero-intersection",
 )
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 GIB = 1024 ** 3
@@ -132,6 +148,47 @@ def bbox_iou(
     intersection = intersection_w * intersection_h
     union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def boxes_intersect(first: Sequence[float], second: Sequence[float]) -> bool:
+    """Return whether two valid ``xyxy`` boxes overlap with positive area."""
+
+    if len(first) != 4 or len(second) != 4:
+        raise ValueError("bbox must contain four coordinates")
+    values = tuple(float(value) for value in (*first, *second))
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("bbox coordinates must be finite")
+    ax1, ay1, ax2, ay2, bx1, by1, bx2, by2 = values
+    if ax2 <= ax1 or ay2 <= ay1 or bx2 <= bx1 or by2 <= by1:
+        return False
+    return min(ax2, bx2) > max(ax1, bx1) and min(ay2, by2) > max(ay1, by1)
+
+
+def expanded_clipped_bbox(
+    bbox: Sequence[float],
+    *,
+    width: int,
+    height: int,
+    margin: float,
+) -> tuple[float, float, float, float]:
+    """Expand a GT box by a per-side ratio and clip it to the source image."""
+
+    if len(bbox) != 4:
+        raise ValueError("bbox must contain four coordinates")
+    x1, y1, x2, y2 = (float(value) for value in bbox)
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+        raise ValueError("bbox coordinates must be finite")
+    if width <= 0 or height <= 0 or x2 <= x1 or y2 <= y1:
+        raise ValueError("source dimensions and bbox must have positive area")
+    if not math.isfinite(margin) or not 0 <= margin <= 1:
+        raise ValueError("margin must be between zero and one")
+    box_width, box_height = x2 - x1, y2 - y1
+    return (
+        max(0.0, x1 - box_width * margin),
+        max(0.0, y1 - box_height * margin),
+        min(float(width), x2 + box_width * margin),
+        min(float(height), y2 + box_height * margin),
+    )
 
 
 def assign_proposal(
@@ -308,18 +365,7 @@ def check_storage_limits(
 
 
 def letterbox(image: np.ndarray, size: int) -> np.ndarray:
-    if image.size == 0 or size < 1:
-        raise ValueError("letterbox requires a nonempty image and positive size")
-    height, width = image.shape[:2]
-    scale = size / max(height, width)
-    resized_width = max(1, round(width * scale))
-    resized_height = max(1, round(height * scale))
-    interpolation = cv2.INTER_AREA if scale <= 1 else cv2.INTER_LINEAR
-    resized = cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
-    canvas = np.full((size, size, 3), 114, dtype=np.uint8)
-    left = (size - resized_width) // 2
-    top = (size - resized_height) // 2
-    canvas[top:top + resized_height, left:left + resized_width] = resized
+    canvas, *_ = _contract_letterbox_bgr(image, size=size, fill=114)
     return canvas
 
 
@@ -340,15 +386,13 @@ def _label_path(image_path: Path) -> Path:
 
 
 def _source_id(split: str, path: Path, dataset_dir: Path) -> str:
-    try:
-        relative = path.resolve(strict=False).relative_to(dataset_dir.resolve(strict=False))
-        key = relative.as_posix()
-    except ValueError:
-        key = path.resolve(strict=False).as_posix()
-    digest = hashlib.sha1(
-        f"{split}|{key}".encode("utf-8", errors="surrogateescape")
-    ).hexdigest()
-    return digest[:24]
+    """Return a split/path-independent identity for the source image bytes."""
+    del split, dataset_dir
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_yaml(path: Path) -> dict:
@@ -467,13 +511,25 @@ def collect_sources(
     records = []
     rejected = Counter()
     source_splits: dict[str, str] = {}
+    canonical_sources: dict[str, SourceRecord] = {}
+    conflicted_sources: set[str] = set()
+    cross_split_sources: set[str] = set()
     for split in ("training", "validation"):
         for image_path in split_images.get(split, []):
-            canonical = image_path.resolve(strict=False).as_posix()
-            previous_split = source_splits.get(canonical)
+            source_id = _source_id(split, image_path, dataset_dir)
+            if source_id in cross_split_sources:
+                rejected["duplicate_source_content_cross_split"] += 1
+                continue
+            previous_split = source_splits.get(source_id)
             if previous_split is not None and previous_split != split:
-                raise RuntimeError(f"source image crosses train/validation splits: {image_path}")
-            source_splits[canonical] = split
+                # Quarantine both sides instead of allowing a copied image to
+                # contaminate validation.  Cleaning a large source collection
+                # is safe; emitting either copy across roles would not be.
+                cross_split_sources.add(source_id)
+                canonical_sources.pop(source_id, None)
+                rejected["duplicate_source_content_cross_split"] += 2
+                continue
+            source_splits[source_id] = split
             try:
                 label_path = _label_path(image_path)
             except ValueError:
@@ -488,14 +544,37 @@ def collect_sources(
             if reason is not None:
                 rejected[reason] += 1
                 continue
-            records.append(
-                SourceRecord(
-                    path=image_path,
-                    split=split,
-                    source_id=_source_id(split, image_path, dataset_dir),
-                    ground_truth=ground_truth,
-                )
+            record = SourceRecord(
+                path=image_path,
+                split=split,
+                source_id=source_id,
+                ground_truth=ground_truth,
             )
+            if source_id in conflicted_sources:
+                rejected["duplicate_source_content_conflicting_ground_truth"] += 1
+                continue
+            previous = canonical_sources.get(source_id)
+            if previous is not None:
+                if previous.ground_truth != record.ground_truth:
+                    # Neither label has enough authority to win automatically.
+                    # Quarantine every byte-identical copy of this source and
+                    # keep the rest of a large preparation run usable.
+                    conflicted_sources.add(source_id)
+                    canonical_sources.pop(source_id, None)
+                    rejected["duplicate_source_content_conflicting_ground_truth"] += 2
+                    continue
+                # Mixed replay lists can contain renamed byte-identical copies.
+                # Infer a content identity once so duplicates cannot waste GPU
+                # time or silently increase one object's sampling weight.
+                rejected["duplicate_source_content_same_split"] += 1
+                continue
+            canonical_sources[source_id] = record
+            records.append(record)
+    quarantined_sources = conflicted_sources | cross_split_sources
+    if quarantined_sources:
+        records = [
+            record for record in records if record.source_id not in quarantined_sources
+        ]
     return records, rejected
 
 
@@ -507,6 +586,7 @@ def iter_yolo_predictions(
     batch: int,
     imgsz: int,
     conf: float,
+    nms_iou: float,
 ) -> Iterator[PredictedFrame]:
     """Run YOLO lazily and expose only its actual proposal boxes."""
     from ultralytics import YOLO
@@ -534,6 +614,7 @@ def iter_yolo_predictions(
             batch=1 if exported_backend else batch,
             imgsz=imgsz,
             conf=conf,
+            iou=nms_iou,
             stream=True,
             save=False,
             verbose=False,
@@ -581,6 +662,46 @@ def iter_yolo_predictions(
             )
 
 
+def eager_initialize_cuda_context(device: str) -> object | None:
+    """Open CUDA in this long-lived process before source hashing can fragment RAM.
+
+    QNAP's NVIDIA 575 driver allocates a per-client fault buffer when the first
+    real CUDA tensor is created.  Merely observing ``device_count`` (or probing
+    CUDA in another short-lived process) does not reserve that buffer for the
+    process that will later run YOLO.
+
+    The production NAS preparation command uses logical GPU 0.  CPU and custom
+    prediction-provider paths deliberately bypass this helper so unit tests and
+    offline CPU use do not acquire PyTorch/CUDA as an incidental dependency.
+    """
+
+    normalized = str(device).strip().lower()
+    if normalized not in {"0", "cuda", "cuda:0"}:
+        return None
+
+    import torch
+
+    try:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "torch.cuda.is_available() is false "
+                f"(device_count={torch.cuda.device_count()})"
+            )
+        guard = torch.ones(1, device="cuda:0") + 1
+        torch.cuda.synchronize(0)
+        if guard.item() != 2:
+            raise RuntimeError("CUDA tensor smoke result was not 2")
+        print(
+            "eager CUDA context ready: " + torch.cuda.get_device_name(0),
+            flush=True,
+        )
+        return guard
+    except Exception as exc:
+        raise RuntimeError(
+            "failed to eagerly initialize CUDA in the YOLO preparation process"
+        ) from exc
+
+
 def candidates_from_frames(
     frames: Iterable[PredictedFrame],
     *,
@@ -589,6 +710,8 @@ def candidates_from_frames(
     proposal_selection: str = "all",
     background_policy: str = "low-iou-or-no-ground-truth",
     min_confidence: float = 0.0,
+    verifier_crop_padding: float = 0.08,
+    background_gt_margin: float = 0.10,
     stats: Counter | None = None,
     policy_stats: Counter | None = None,
 ) -> Iterator[Candidate]:
@@ -600,6 +723,10 @@ def candidates_from_frames(
         raise ValueError(f"unsupported background policy: {background_policy}")
     if not 0 <= min_confidence <= 1:
         raise ValueError("min_confidence must be in [0, 1]")
+    if not 0 <= verifier_crop_padding <= 1:
+        raise ValueError("verifier_crop_padding must be in [0, 1]")
+    if not 0 <= background_gt_margin <= 1:
+        raise ValueError("background_gt_margin must be in [0, 1]")
 
     for frame in frames:
         gt = frame.source.ground_truth
@@ -648,15 +775,32 @@ def candidates_from_frames(
             stats[assignment] += 1
             if material is None:
                 continue
-            if (
-                material == BACKGROUND_CLASS_ID
-                and background_policy == "no-ground-truth-only"
-                and gt is not None
-            ):
-                # A low-IoU proposal in a labelled frame can be another valid,
-                # unlabelled object. It is not safe automatic background data.
-                policy_stats["background_rejected_gt_present"] += 1
-                continue
+            if material == BACKGROUND_CLASS_ID and gt is not None:
+                if background_policy == "no-ground-truth-only":
+                    # A low-IoU proposal in a labelled frame can be another
+                    # valid, unlabelled object. It is not safe automatic data.
+                    policy_stats["background_rejected_gt_present"] += 1
+                    continue
+                if background_policy == "strict-zero-intersection":
+                    crop_bounds = _crop_bounds(
+                        proposal.bbox,
+                        frame.width,
+                        frame.height,
+                        verifier_crop_padding,
+                    )
+                    if crop_bounds is None:
+                        policy_stats["background_rejected_invalid_crop"] += 1
+                        continue
+                    exclusion = expanded_clipped_bbox(
+                        gt_bbox,
+                        width=frame.width,
+                        height=frame.height,
+                        margin=background_gt_margin,
+                    )
+                    if boxes_intersect(crop_bounds, exclusion):
+                        policy_stats["background_rejected_gt_intersection"] += 1
+                        continue
+                    policy_stats["background_accepted_zero_intersection"] += 1
             yield Candidate(
                 source=frame.source,
                 proposal_index=proposal_index,
@@ -676,15 +820,12 @@ def _encode_path(path: Path) -> str:
 def _crop_bounds(
     bbox: Sequence[float], width: int, height: int, padding: float
 ) -> tuple[int, int, int, int] | None:
-    x1, y1, x2, y2 = (float(value) for value in bbox)
-    box_w, box_h = x2 - x1, y2 - y1
-    left = max(0, math.floor(x1 - box_w * padding))
-    top = max(0, math.floor(y1 - box_h * padding))
-    right = min(width, math.ceil(x2 + box_w * padding))
-    bottom = min(height, math.ceil(y2 + box_h * padding))
-    if right <= left or bottom <= top:
+    try:
+        return _contract_padded_clipped_bbox(
+            bbox, width=width, height=height, padding=padding
+        )
+    except ValueError:
         return None
-    return left, top, right, bottom
 
 
 MANIFEST_FIELDS = (
@@ -825,6 +966,8 @@ def build_proposal_verifier_dataset(
     jpeg_quality: int,
     proposal_selection: str = "all",
     background_policy: str = "low-iou-or-no-ground-truth",
+    background_gt_margin: float = 0.10,
+    nms_iou: float = 0.70,
     prediction_provider: PredictionProvider | None = None,
 ) -> dict:
     # This must remain the first preflight: a bad invocation can never load a
@@ -834,7 +977,13 @@ def build_proposal_verifier_dataset(
         raise ValueError("IoU thresholds must satisfy 0 <= negative < positive <= 1")
     if batch < 1 or imgsz < 1 or crop_size < 1:
         raise ValueError("batch, imgsz and crop-size must be positive")
-    if not 0 <= conf <= 1 or padding < 0 or not 1 <= jpeg_quality <= 100:
+    if (
+        not 0 <= conf <= 1
+        or not 0 <= nms_iou <= 1
+        or padding < 0
+        or not 0 <= background_gt_margin <= 1
+        or not 1 <= jpeg_quality <= 100
+    ):
         raise ValueError("conf, padding or jpeg-quality is outside its valid range")
     if proposal_selection not in PROPOSAL_SELECTION_MODES:
         raise ValueError(f"unsupported proposal selection: {proposal_selection}")
@@ -845,6 +994,15 @@ def build_proposal_verifier_dataset(
         written_bytes=0,
         min_free_gb=min_free_gb,
         max_output_gb=max_output_gb,
+    )
+
+    # Keep this tensor referenced in the build frame through all source hashing
+    # and crop writing.  On QNAP this reserves the same process's fault buffer;
+    # a separate docker/preflight process is not an equivalent guarantee.
+    _cuda_context_guard = (
+        eager_initialize_cuda_context(device)
+        if prediction_provider is None
+        else None
     )
 
     split_images = resolve_split_images(data_path, dataset_dir)
@@ -860,6 +1018,7 @@ def build_proposal_verifier_dataset(
             batch=batch,
             imgsz=imgsz,
             conf=conf,
+            nms_iou=nms_iou,
         )
     proposal_stats = Counter()
     proposal_policy_stats = Counter()
@@ -870,6 +1029,8 @@ def build_proposal_verifier_dataset(
         proposal_selection=proposal_selection,
         background_policy=background_policy,
         min_confidence=conf,
+        verifier_crop_padding=padding,
+        background_gt_margin=background_gt_margin,
         stats=proposal_stats,
         policy_stats=proposal_policy_stats,
     )
@@ -927,6 +1088,16 @@ def build_proposal_verifier_dataset(
                 conf if proposal_selection == "runtime-top1" else None
             ),
             "background_policy": background_policy,
+            **(
+                {
+                    "background_gt_margin": background_gt_margin,
+                    "background_intersection_basis": (
+                        "final_padded_verifier_crop_vs_expanded_gt"
+                    ),
+                }
+                if background_policy == "strict-zero-intersection"
+                else {}
+            ),
         },
         "proposal_policy_stats": dict(proposal_policy_stats),
         "selected_before_write": len(selected),
@@ -942,6 +1113,7 @@ def build_proposal_verifier_dataset(
             "batch": batch,
             "imgsz": imgsz,
             "conf": conf,
+            "nms_iou": nms_iou,
         },
         "assignment": {
             "positive_iou_inclusive": positive_iou,
@@ -982,6 +1154,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.10)
+    parser.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.70,
+        help="운영 run_main과 동일한 YOLO NMS IoU",
+    )
     parser.add_argument("--positive-iou", type=float, default=0.50)
     parser.add_argument("--negative-iou", type=float, default=0.10)
     parser.add_argument("--crop-size", type=int, default=320)
@@ -1009,8 +1187,15 @@ def parse_args() -> argparse.Namespace:
         default="low-iou-or-no-ground-truth",
         help=(
             "no-ground-truth-only는 GT가 없는 source의 proposal만 "
-            "background로 허용합니다."
+            "background로 허용하고, strict-zero-intersection은 최종 padded "
+            "crop이 확장 GT와 전혀 겹치지 않을 때만 허용합니다."
         ),
+    )
+    parser.add_argument(
+        "--background-gt-margin",
+        type=float,
+        default=0.10,
+        help="strict-zero-intersection에서 GT 각 변에 추가하는 안전 여백 비율",
     )
     args = parser.parse_args()
     if not 0 <= args.negative_iou < args.positive_iou <= 1:
@@ -1025,7 +1210,12 @@ def parse_args() -> argparse.Namespace:
         args.val_max_background,
     ) < 1:
         parser.error("batch, sizes and caps must be positive")
-    if not 0 <= args.conf <= 1 or args.padding < 0:
+    if (
+        not 0 <= args.conf <= 1
+        or not 0 <= args.nms_iou <= 1
+        or args.padding < 0
+        or not 0 <= args.background_gt_margin <= 1
+    ):
         parser.error("conf must be in [0, 1] and padding must be non-negative")
     if not 1 <= args.jpeg_quality <= 100:
         parser.error("jpeg-quality must be in [1, 100]")
@@ -1045,6 +1235,7 @@ def main() -> None:
         batch=args.batch,
         imgsz=args.imgsz,
         conf=args.conf,
+        nms_iou=args.nms_iou,
         positive_iou=args.positive_iou,
         negative_iou=args.negative_iou,
         crop_size=args.crop_size,
@@ -1059,6 +1250,7 @@ def main() -> None:
         jpeg_quality=args.jpeg_quality,
         proposal_selection=args.proposal_selection,
         background_policy=args.background_policy,
+        background_gt_margin=args.background_gt_margin,
     )
 
 

@@ -1,0 +1,70 @@
+{
+  "format_version": 1,
+  "artifact_role": "offline_candidate_spec_not_production_authorization",
+  "detector": {
+    "task": "detect",
+    "model_reference": "runs/trash_v2_full-2/weights/best.pt",
+    "input_size": 640,
+    "candidate_confidence": 0.1,
+    "legacy_acceptance_confidence": 0.25,
+    "nms_iou": 0.7,
+    "proposal_selection": "highest_confidence_then_original_order"
+  },
+  "crop": {
+    "source": "selected_detector_bbox",
+    "padding_ratio": 0.08,
+    "clip_to_source": true,
+    "preprocessing_contract_version": "offline_verifier_crop.v1",
+    "bbox_rounding": {
+      "min_edges": "floor",
+      "max_edges": "ceil"
+    },
+    "resize": "aspect_preserving_letterbox",
+    "resize_rounding": "nearest_ties_to_even",
+    "resize_interpolation": {
+      "downscale": "INTER_AREA",
+      "upscale": "INTER_LINEAR",
+      "equal": "identity"
+    },
+    "letterbox_size": 320,
+    "letterbox_fill": 114,
+    "letterbox_alignment": {
+      "horizontal": "center_floor",
+      "vertical": "center_floor"
+    },
+    "color_conversion": "BGR_TO_RGB",
+    "normalization": {
+      "input_scale": 255.0,
+      "mean": [0.485, 0.456, 0.406],
+      "std": [0.229, 0.224, 0.225],
+      "layout": "NCHW",
+      "dtype": "float32"
+    },
+    "jpeg_quality": 92
+  },
+  "detector_classes": [
+    "can",
+    "pet",
+    "paper",
+    "plastic",
+    "styrofoam",
+    "vinyl",
+    "glass",
+    "battery",
+    "fluorescent"
+  ],
+  "external_class_aliases": {
+    "pet": "plastic"
+  },
+  "verifier_contract": {
+    "objectness": "binary_material_vs_background",
+    "material": "positive_only_9_class_softmax",
+    "threshold_source": "calibration_partition_only",
+    "blind_gate_threshold_overrides": false
+  },
+  "safety": {
+    "background_is_internal_only": true,
+    "low_confidence_never_auto_allowed_without_frozen_policy": true,
+    "production_model_replacement": false
+  }
+}

@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 import pytest
 
+import scripts.prepare_proposal_verifier_dataset as proposal_dataset
+
 from scripts.prepare_proposal_verifier_dataset import (
     BACKGROUND_CLASS_ID,
     Candidate,
@@ -17,9 +19,82 @@ from scripts.prepare_proposal_verifier_dataset import (
     assign_proposal,
     bbox_iou,
     build_proposal_verifier_dataset,
+    collect_sources,
+    eager_initialize_cuda_context,
     parse_yolo_label_text,
     select_deterministic_candidates,
 )
+
+
+def test_eager_cuda_context_creates_real_tensor_and_synchronizes(monkeypatch):
+    events = []
+
+    class FakeTensor:
+        def __add__(self, value):
+            events.append(("add", value))
+            return self
+
+        def item(self):
+            return 2
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            events.append("available")
+            return True
+
+        @staticmethod
+        def device_count():
+            return 1
+
+        @staticmethod
+        def synchronize(device):
+            events.append(("synchronize", device))
+
+        @staticmethod
+        def get_device_name(device):
+            events.append(("name", device))
+            return "fake-gpu"
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+        @staticmethod
+        def ones(size, *, device):
+            events.append(("ones", size, device))
+            return FakeTensor()
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "torch":
+            return FakeTorch()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    guard = eager_initialize_cuda_context("0")
+
+    assert isinstance(guard, FakeTensor)
+    assert events == [
+        "available",
+        ("ones", 1, "cuda:0"),
+        ("add", 1),
+        ("synchronize", 0),
+        ("name", 0),
+    ]
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps", "1", "0,1"])
+def test_eager_cuda_context_ignores_non_qnap_gpu0_devices(device, monkeypatch):
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "torch":
+            raise AssertionError("non-QNAP-GPU0 path must not import torch")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    assert eager_initialize_cuda_context(device) is None
 
 
 def test_iou_assignment_boundaries_are_inclusive():
@@ -84,6 +159,52 @@ def test_no_ground_truth_proposal_is_background():
     assert material == BACKGROUND_CLASS_ID
     assert overlap == 0.0
     assert reason == "no_ground_truth"
+
+
+def test_strict_background_policy_uses_final_padded_crop_and_gt_margin():
+    gt = GroundTruth(2, (0.5, 0.5, 0.2, 0.2))  # pixel bbox 40..60
+    accepted_source = SourceRecord(
+        Path("accepted.jpg"), "training", "accepted-source", gt
+    )
+    rejected_source = SourceRecord(
+        Path("rejected.jpg"), "training", "rejected-source", gt
+    )
+    frames = (
+        PredictedFrame(
+            accepted_source,
+            100,
+            100,
+            (Proposal(3, 0.8, (0.0, 0.0, 20.0, 20.0), "plastic"),),
+        ),
+        PredictedFrame(
+            rejected_source,
+            100,
+            100,
+            # Raw IoU is low, but the final padded crop reaches the GT safety
+            # margin and therefore must not become an automatic background.
+            (Proposal(3, 0.8, (20.0, 20.0, 42.0, 42.0), "plastic"),),
+        ),
+    )
+    policy_stats = proposal_dataset.Counter()
+
+    candidates = list(
+        proposal_dataset.candidates_from_frames(
+            frames,
+            positive_iou=0.5,
+            negative_iou=0.1,
+            background_policy="strict-zero-intersection",
+            verifier_crop_padding=0.08,
+            background_gt_margin=0.10,
+            policy_stats=policy_stats,
+        )
+    )
+
+    assert [candidate.source.source_id for candidate in candidates] == [
+        "accepted-source"
+    ]
+    assert candidates[0].material == BACKGROUND_CLASS_ID
+    assert policy_stats["background_accepted_zero_intersection"] == 1
+    assert policy_stats["background_rejected_gt_intersection"] == 1
 
 
 def _candidate(index: int, material: int, split: str = "training") -> Candidate:
@@ -167,14 +288,14 @@ def test_nonempty_output_refuses_before_loading_yolo(tmp_path, monkeypatch):
     assert marker.read_text(encoding="utf-8") == "do not overwrite"
 
 
-def test_fake_predictions_write_split_preserving_audit_manifest(tmp_path):
+def test_fake_predictions_write_split_preserving_audit_manifest(tmp_path, monkeypatch):
     dataset = tmp_path / "dataset"
-    for split in ("train", "val"):
+    for split_index, split in enumerate(("train", "val")):
         image_dir = dataset / "images" / split
         label_dir = dataset / "labels" / split
         image_dir.mkdir(parents=True)
         label_dir.mkdir(parents=True)
-        image = np.full((100, 120, 3), 200, dtype=np.uint8)
+        image = np.full((100, 120, 3), 200 + split_index, dtype=np.uint8)
         assert cv2.imwrite(str(image_dir / f"{split}.jpg"), image)
         (label_dir / f"{split}.txt").write_text(
             "2 0.5 0.5 0.5 0.4\n", encoding="utf-8"
@@ -200,13 +321,21 @@ def test_fake_predictions_write_split_preserving_audit_manifest(tmp_path):
                 proposals=(Proposal(4, 0.91, (30.0, 30.0, 90.0, 70.0), "styrofoam"),),
             )
 
+    def cuda_must_not_initialize(_device):
+        raise AssertionError("injected prediction provider must bypass CUDA init")
+
+    monkeypatch.setattr(
+        proposal_dataset,
+        "eager_initialize_cuda_context",
+        cuda_must_not_initialize,
+    )
     output = tmp_path / "proposal-crops"
     summary = build_proposal_verifier_dataset(
         model_path=tmp_path / "not-loaded.pt",
         data_path=data,
         dataset_dir=dataset,
         output_dir=output,
-        device="cpu",
+        device="0",
         batch=1,
         imgsz=64,
         conf=0.25,
@@ -239,15 +368,75 @@ def test_fake_predictions_write_split_preserving_audit_manifest(tmp_path):
         assert crop.shape == (32, 32, 3)
 
 
+def test_real_gpu0_eager_init_runs_after_preflight_before_source_collection(
+    tmp_path, monkeypatch
+):
+    events = []
+
+    class StopAfterCollection(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        proposal_dataset,
+        "check_storage_limits",
+        lambda *args, **kwargs: events.append("storage"),
+    )
+    monkeypatch.setattr(
+        proposal_dataset,
+        "eager_initialize_cuda_context",
+        lambda device: events.append(("eager", device)) or object(),
+    )
+    monkeypatch.setattr(
+        proposal_dataset,
+        "resolve_split_images",
+        lambda *args, **kwargs: events.append("resolve")
+        or {"training": [], "validation": []},
+    )
+
+    def stop_collection(*args, **kwargs):
+        events.append("collect")
+        raise StopAfterCollection
+
+    monkeypatch.setattr(proposal_dataset, "collect_sources", stop_collection)
+
+    with pytest.raises(StopAfterCollection):
+        build_proposal_verifier_dataset(
+            model_path=tmp_path / "model.pt",
+            data_path=tmp_path / "data.yaml",
+            dataset_dir=tmp_path / "dataset",
+            output_dir=tmp_path / "output",
+            device="0",
+            batch=1,
+            imgsz=32,
+            conf=0.10,
+            positive_iou=0.50,
+            negative_iou=0.10,
+            crop_size=32,
+            padding=0.08,
+            max_per_class=1,
+            val_max_per_class=1,
+            max_background=1,
+            val_max_background=1,
+            seed=1,
+            min_free_gb=0,
+            max_output_gb=0,
+            jpeg_quality=90,
+        )
+
+    assert events == ["storage", ("eager", "0"), "resolve", "collect"]
+
+
 def test_runtime_top1_with_no_ground_truth_only_background_policy(tmp_path):
     dataset = tmp_path / "dataset"
-    for split in ("train", "val"):
+    for split_index, split in enumerate(("train", "val")):
         image_dir = dataset / "images" / split
         label_dir = dataset / "labels" / split
         image_dir.mkdir(parents=True)
         label_dir.mkdir(parents=True)
-        for stem in ("positive", "contaminated", "empty"):
-            image = np.full((100, 120, 3), 200, dtype=np.uint8)
+        for stem_index, stem in enumerate(("positive", "contaminated", "empty")):
+            image = np.full(
+                (100, 120, 3), 190 + split_index * 10 + stem_index, dtype=np.uint8
+            )
             assert cv2.imwrite(str(image_dir / f"{stem}.jpg"), image)
             label_text = "" if stem == "empty" else "2 0.5 0.5 0.5 0.4\n"
             (label_dir / f"{stem}.txt").write_text(label_text, encoding="utf-8")
@@ -348,7 +537,7 @@ def test_runtime_top1_with_no_ground_truth_only_background_policy(tmp_path):
     }
 
 
-def test_cross_split_source_path_is_rejected_before_prediction(tmp_path):
+def test_cross_split_source_path_is_quarantined_before_prediction(tmp_path):
     dataset = tmp_path / "dataset"
     image_dir = dataset / "images" / "shared"
     label_dir = dataset / "labels" / "shared"
@@ -372,7 +561,7 @@ def test_cross_split_source_path_is_rejected_before_prediction(tmp_path):
     def prediction_must_not_run(_sources):
         raise AssertionError("prediction must not run after split leakage")
 
-    with pytest.raises(RuntimeError, match="crosses train/validation splits"):
+    with pytest.raises(RuntimeError, match="no valid zero-or-one-object"):
         build_proposal_verifier_dataset(
             model_path=tmp_path / "not-loaded.pt",
             data_path=data,
@@ -398,3 +587,102 @@ def test_cross_split_source_path_is_rejected_before_prediction(tmp_path):
             background_policy="no-ground-truth-only",
             prediction_provider=prediction_must_not_run,
         )
+
+
+def test_copied_source_bytes_across_splits_are_quarantined(tmp_path):
+    dataset = tmp_path / "dataset"
+    train_images = dataset / "images" / "train"
+    val_images = dataset / "images" / "val"
+    train_labels = dataset / "labels" / "train"
+    val_labels = dataset / "labels" / "val"
+    for directory in (train_images, val_images, train_labels, val_labels):
+        directory.mkdir(parents=True)
+    source = train_images / "original.jpg"
+    assert cv2.imwrite(str(source), np.full((32, 32, 3), 160, dtype=np.uint8))
+    (val_images / "renamed-copy.jpg").write_bytes(source.read_bytes())
+    for label in (train_labels / "original.txt", val_labels / "renamed-copy.txt"):
+        label.write_text("2 0.5 0.5 0.5 0.5\n", encoding="utf-8")
+    data = tmp_path / "data.yaml"
+    data.write_text(
+        "path: .\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        "names: [can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="no valid zero-or-one-object"):
+        build_proposal_verifier_dataset(
+            model_path=tmp_path / "not-loaded.pt",
+            data_path=data,
+            dataset_dir=dataset,
+            output_dir=tmp_path / "output",
+            device="cpu",
+            batch=1,
+            imgsz=32,
+            conf=0.25,
+            positive_iou=0.5,
+            negative_iou=0.1,
+            crop_size=32,
+            padding=0.0,
+            max_per_class=1,
+            val_max_per_class=1,
+            max_background=1,
+            val_max_background=1,
+            seed=1,
+            min_free_gb=0,
+            max_output_gb=0,
+            jpeg_quality=90,
+            proposal_selection="runtime-top1",
+            background_policy="no-ground-truth-only",
+            prediction_provider=lambda _sources: (),
+        )
+
+
+def test_copied_source_bytes_within_split_are_inferred_once(tmp_path):
+    dataset = tmp_path / "dataset"
+    train_images = dataset / "images" / "train"
+    train_labels = dataset / "labels" / "train"
+    train_images.mkdir(parents=True)
+    train_labels.mkdir(parents=True)
+    original = train_images / "original.jpg"
+    duplicate = train_images / "renamed-copy.jpg"
+    assert cv2.imwrite(str(original), np.full((32, 32, 3), 80, dtype=np.uint8))
+    duplicate.write_bytes(original.read_bytes())
+    for label in (train_labels / "original.txt", train_labels / "renamed-copy.txt"):
+        label.write_text("2 0.5 0.5 0.5 0.5\n", encoding="utf-8")
+
+    records, rejected = collect_sources(
+        {"training": [duplicate, original], "validation": []}, dataset
+    )
+
+    assert len(records) == 1
+    assert records[0].source_id == __import__("hashlib").sha256(
+        original.read_bytes()
+    ).hexdigest()
+    assert rejected == {"duplicate_source_content_same_split": 1}
+
+
+def test_copied_source_bytes_with_conflicting_labels_are_quarantined(tmp_path):
+    dataset = tmp_path / "dataset"
+    train_images = dataset / "images" / "train"
+    train_labels = dataset / "labels" / "train"
+    train_images.mkdir(parents=True)
+    train_labels.mkdir(parents=True)
+    original = train_images / "original.jpg"
+    duplicate = train_images / "renamed-copy.jpg"
+    assert cv2.imwrite(str(original), np.full((32, 32, 3), 80, dtype=np.uint8))
+    duplicate.write_bytes(original.read_bytes())
+    (train_labels / "original.txt").write_text(
+        "2 0.5 0.5 0.5 0.5\n", encoding="utf-8"
+    )
+    (train_labels / "renamed-copy.txt").write_text(
+        "3 0.5 0.5 0.5 0.5\n", encoding="utf-8"
+    )
+
+    records, rejected = collect_sources(
+        {"training": [original, duplicate], "validation": []}, dataset
+    )
+
+    assert records == []
+    assert rejected == {"duplicate_source_content_conflicting_ground_truth": 2}
