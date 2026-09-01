@@ -1,0 +1,2 @@
+# Keep POSIX entrypoints executable by /bin/sh in exported source archives.
+*.sh text eol=lf
