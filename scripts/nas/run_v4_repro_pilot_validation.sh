@@ -223,7 +223,11 @@ for row in rows:
         opened_after = os.fstat(handle.fileno())
     after = path.stat()
     identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
-    if identity(opened_before) != identity(opened_after) or identity(opened_after) != identity(after):
+    if (
+        identity(before) != identity(opened_before)
+        or identity(opened_before) != identity(opened_after)
+        or identity(opened_after) != identity(after)
+    ):
         raise RuntimeError(f"raw artifact changed while hashing: {relative}")
     if after.st_size != row.get("size") or digest.hexdigest() != row.get("sha256"):
         raise ValueError(f"raw inventory artifact changed: {relative}")
@@ -273,7 +277,10 @@ role = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
     "not_training_blind_or_deployment_authority"
 )
-contract = "v4_repro_pilot_inputs.label_stratified_blake2b.v1"
+contract = (
+    "v4_repro_pilot_inputs."
+    "gt_stratified_historical_background_probe_blake2b.v2"
+)
 materials = (
     "can", "pet", "paper", "plastic", "styrofoam", "vinyl", "glass",
     "battery", "fluorescent",
@@ -320,12 +327,35 @@ if inventory.get("quota_per_stratum") != {"training": 250, "validation": 100}:
     raise ValueError("pilot inventory quota contract mismatch")
 if inventory.get("classes") != list(materials) or inventory.get("strata") != list(strata):
     raise ValueError("pilot inventory strata mismatch")
+source_contract = inventory.get("source_contract")
+if not isinstance(source_contract, dict):
+    raise ValueError("pilot source contract is missing")
+for field in (
+    "explicit_label_file_required",
+    "background_prefers_current_explicit_empty_label",
+    "historical_background_probe_requires_current_single_object_label",
+    "historical_background_category_is_selection_only",
+    "historical_background_category_is_not_ground_truth",
+    "current_batch1_replay_decides_emitted_category",
+    "material_requires_exactly_one_valid_yolo_label",
+    "multi_object_excluded",
+    "cross_split_content_duplicates_quarantined",
+    "same_split_conflicting_ground_truth_quarantined",
+):
+    if source_contract.get(field) is not True:
+        raise ValueError(f"pilot source contract does not require {field}")
 if inventory.get("selected_counts") != expected_counts:
     raise ValueError("pilot inventory selected counts do not meet exact quotas")
 if inventory.get("quota_shortages") != expected_shortages:
     raise ValueError("pilot inventory has a quota shortage")
 if inventory.get("full_quota_met") is not True:
     raise ValueError("pilot inventory does not attest full quota")
+for field in (
+    "selected_current_gt_counts", "selected_cohort_counts",
+    "background_quota_composition",
+):
+    if ready.get(field) != inventory.get(field):
+        raise ValueError(f"pilot ready and inventory differ for {field}")
 authority = inventory.get("authority")
 if not isinstance(authority, dict):
     raise ValueError("pilot inventory authority is missing")
@@ -381,25 +411,137 @@ selected = inventory.get("selected_sources")
 if not isinstance(selected, list) or len(selected) != 3500:
     raise ValueError("pilot selection inventory must contain 3500 rows")
 actual_counts = Counter()
+actual_current_gt_counts = Counter()
+actual_cohort_counts = Counter()
+actual_background_composition = {
+    "training": Counter(
+        {"current_explicit_empty_label": 0, "historical_background_probe": 0}
+    ),
+    "validation": Counter(
+        {"current_explicit_empty_label": 0, "historical_background_probe": 0}
+    ),
+}
 listed = {"training": [], "validation": []}
 seen_paths = set()
+seen_source_hashes = set()
 for row in selected:
     if not isinstance(row, dict):
         raise ValueError("pilot selected source row must be an object")
     split = row.get("split")
     stratum = row.get("stratum")
+    selection_stratum = row.get("selection_stratum")
+    current_gt_stratum = row.get("current_gt_stratum")
+    cohort = row.get("selection_cohort")
     path_text = row.get("path")
-    if split not in listed or stratum not in strata:
+    if (
+        split not in listed
+        or stratum not in strata
+        or selection_stratum != stratum
+        or current_gt_stratum not in strata
+    ):
         raise ValueError("pilot selected source split or stratum is invalid")
     if not isinstance(path_text, str) or not Path(path_text).is_absolute():
         raise ValueError("pilot selected source path must be absolute")
     if path_text in seen_paths:
         raise ValueError("pilot selected source path is duplicated")
     seen_paths.add(path_text)
+    source_sha = row.get("source_sha256")
+    if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", source_sha):
+        raise ValueError("pilot selected source SHA is invalid")
+    if source_sha in seen_source_hashes:
+        raise ValueError("pilot selected source SHA is duplicated")
+    seen_source_hashes.add(source_sha)
+    categories = row.get("historical_categories_selection_only")
+    explicit = row.get("explicit_empty_label")
+    probe = row.get("historical_background_probe_selection_only")
+    if not isinstance(categories, list) or any(
+        category not in strata for category in categories
+    ):
+        raise ValueError("pilot selected historical categories are invalid")
+    if probe is True:
+        if (
+            stratum != "background"
+            or current_gt_stratum == "background"
+            or explicit is not False
+            or cohort != "historical_background_probe"
+            or "background" not in categories
+            or not isinstance(row.get("gt_class_id"), int)
+            or not isinstance(row.get("gt_xywhn"), list)
+            or len(row["gt_xywhn"]) != 4
+        ):
+            raise ValueError("pilot historical background probe semantics are invalid")
+        if row.get("selection_reason") not in {
+            "historical_background_probe_blake2", "drift_anchor_priority",
+        }:
+            raise ValueError("pilot historical background probe reason is invalid")
+        actual_background_composition[split]["historical_background_probe"] += 1
+    else:
+        if (
+            probe is not False
+            or cohort != "current_yolo_ground_truth"
+            or current_gt_stratum != stratum
+            or explicit is not (current_gt_stratum == "background")
+        ):
+            raise ValueError("pilot current GT selection semantics are invalid")
+        if stratum == "background":
+            if row.get("selection_reason") != "current_explicit_empty_label":
+                raise ValueError("pilot explicit background reason is invalid")
+            actual_background_composition[split]["current_explicit_empty_label"] += 1
     actual_counts[f"{split}/{stratum}"] += 1
+    actual_current_gt_counts[f"{split}/{current_gt_stratum}"] += 1
+    actual_cohort_counts[f"{split}/{cohort}"] += 1
     listed[split].append(path_text)
 if dict(actual_counts) != expected_counts:
     raise ValueError("pilot selected rows do not meet exact quotas")
+if dict(actual_current_gt_counts) != inventory.get("selected_current_gt_counts"):
+    raise ValueError("pilot selected current GT counts mismatch")
+if dict(actual_cohort_counts) != inventory.get("selected_cohort_counts"):
+    raise ValueError("pilot selected cohort counts mismatch")
+historical = inventory.get("historical_selection_evidence")
+if not isinstance(historical, dict):
+    raise ValueError("pilot historical selection evidence is missing")
+if historical.get("ground_truth_authority") is not False:
+    raise ValueError("pilot historical evidence grants ground-truth authority")
+if historical.get("replay_validation_authority") is not False:
+    raise ValueError("pilot historical evidence grants replay authority")
+if historical.get("background_category_authority") is not False:
+    raise ValueError("pilot historical evidence grants background authority")
+eligible_empty = historical.get("eligible_current_explicit_empty_counts")
+eligible_probe = historical.get("eligible_historical_background_probe_counts")
+declared_composition = inventory.get("background_quota_composition")
+if not all(isinstance(value, dict) for value in (eligible_empty, eligible_probe, declared_composition)):
+    raise ValueError("pilot background selection evidence is missing")
+expected_composition = {}
+for split, quota in (("training", 250), ("validation", 100)):
+    available_empty = eligible_empty.get(split)
+    available_probe = eligible_probe.get(split)
+    if (
+        not isinstance(available_empty, int)
+        or isinstance(available_empty, bool)
+        or available_empty < 0
+        or not isinstance(available_probe, int)
+        or isinstance(available_probe, bool)
+        or available_probe < 0
+    ):
+        raise ValueError("pilot eligible background counts are invalid")
+    selected_empty = min(quota, available_empty)
+    selected_probe = quota - selected_empty
+    if available_probe < selected_probe:
+        raise ValueError("pilot historical background probe supply is below quota")
+    expected_composition[split] = {
+        "current_explicit_empty_label": selected_empty,
+        "historical_background_probe": selected_probe,
+        "total": quota,
+    }
+    actual_background_composition[split]["total"] = sum(
+        actual_background_composition[split].values()
+    )
+if declared_composition != expected_composition:
+    raise ValueError("pilot declared background quota composition mismatch")
+if {
+    split: dict(counts) for split, counts in actual_background_composition.items()
+} != expected_composition:
+    raise ValueError("pilot selected background quota composition mismatch")
 
 def list_lines(path: Path) -> list[str]:
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -474,9 +616,30 @@ def stable_artifact(path: Path, *, description: str) -> tuple[int, str]:
         opened_after = os.fstat(handle.fileno())
     after = resolved.stat()
     identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
-    if identity(opened_before) != identity(opened_after) or identity(opened_after) != identity(after):
+    if (
+        identity(before) != identity(opened_before)
+        or identity(opened_before) != identity(opened_after)
+        or identity(opened_after) != identity(after)
+    ):
         raise RuntimeError(f"{description} changed while hashing: {resolved}")
     return after.st_size, digest.hexdigest()
+
+def stable_content(path: Path, *, description: str) -> tuple[bytes, int, str]:
+    resolved = path.resolve(strict=True)
+    before = resolved.stat()
+    with resolved.open("rb") as handle:
+        opened_before = os.fstat(handle.fileno())
+        content = handle.read()
+        opened_after = os.fstat(handle.fileno())
+    after = resolved.stat()
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+    if (
+        identity(before) != identity(opened_before)
+        or identity(opened_before) != identity(opened_after)
+        or identity(opened_after) != identity(after)
+    ):
+        raise RuntimeError(f"{description} changed while being read: {resolved}")
+    return content, after.st_size, hashlib.sha256(content).hexdigest()
 
 def sha(path: Path) -> str:
     return stable_artifact(path, description="bound evidence")[1]
@@ -496,12 +659,144 @@ old_path = Path(str(old_manifest.get("path", "")))
 drift_path = Path(str(drift_report.get("path", "")))
 if not old_path.is_absolute() or not drift_path.is_absolute():
     raise ValueError("pilot historical evidence paths must be absolute")
-old_size, old_sha = stable_artifact(old_path, description="historical manifest")
-drift_size, drift_sha = stable_artifact(drift_path, description="historical drift report")
-if old_manifest.get("sha256") != old_sha or not isinstance(old_manifest.get("rows"), int) or old_manifest["rows"] <= 0:
+old_content, old_size, old_sha = stable_content(
+    old_path, description="historical manifest"
+)
+drift_content, drift_size, drift_sha = stable_content(
+    drift_path, description="historical drift report"
+)
+if (
+    old_manifest.get("sha256") != old_sha
+    or not isinstance(old_manifest.get("rows"), int)
+    or isinstance(old_manifest.get("rows"), bool)
+    or old_manifest["rows"] <= 0
+):
     raise ValueError("historical manifest binding mismatch")
-if drift_report.get("sha256") != drift_sha or not isinstance(drift_report.get("anchor_source_ids"), int) or drift_report["anchor_source_ids"] <= 0:
+if (
+    drift_report.get("sha256") != drift_sha
+    or not isinstance(drift_report.get("anchor_source_ids"), int)
+    or isinstance(drift_report.get("anchor_source_ids"), bool)
+    or drift_report["anchor_source_ids"] <= 0
+):
     raise ValueError("historical drift report binding mismatch")
+try:
+    historical_lines = old_content.decode("utf-8-sig").splitlines()
+except UnicodeError as error:
+    raise ValueError("historical manifest is not valid UTF-8") from error
+historical_reader = csv.DictReader(historical_lines)
+historical_required = {"source_id", "split", "category"}
+if not historical_reader.fieldnames or not historical_required.issubset(
+    historical_reader.fieldnames
+):
+    raise ValueError("historical manifest lacks probe membership fields")
+historical_membership = set()
+historical_categories_by_source_split = {}
+historical_row_count = 0
+for line, row in enumerate(historical_reader, start=2):
+    historical_row_count += 1
+    source_id = str(row.get("source_id", "")).strip().lower()
+    split = str(row.get("split", "")).strip()
+    category = str(row.get("category", "")).strip().lower()
+    if not sha_re.fullmatch(source_id):
+        raise ValueError(f"historical manifest source_id is invalid at row {line}")
+    if split not in {"training", "validation"}:
+        raise ValueError(f"historical manifest split is invalid at row {line}")
+    if category not in {
+        "can", "pet", "paper", "plastic", "styrofoam", "vinyl",
+        "glass", "battery", "fluorescent", "background",
+    }:
+        raise ValueError(f"historical manifest category is invalid at row {line}")
+    historical_membership.add((source_id, split, category))
+    historical_categories_by_source_split.setdefault((source_id, split), set()).add(
+        category
+    )
+if historical_row_count != old_manifest["rows"]:
+    raise ValueError("historical manifest row count differs from bound evidence")
+if sha(old_path) != old_sha:
+    raise RuntimeError("historical manifest changed while probe membership was parsed")
+
+try:
+    drift_value = json.loads(drift_content.decode("utf-8"))
+except (UnicodeError, json.JSONDecodeError) as error:
+    raise ValueError("historical drift report is invalid JSON") from error
+if not isinstance(drift_value, dict):
+    raise ValueError("historical drift report must contain an object")
+
+def source_ids_from_examples(value, *, location):
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        raise ValueError(f"drift report {location} must contain a list")
+    found = set()
+    for index, example in enumerate(value):
+        if not isinstance(example, dict):
+            raise ValueError(f"drift report {location}[{index}] must be an object")
+        raw = example.get("source_id")
+        if raw is None:
+            continue
+        normalized = str(raw).strip().lower()
+        if not sha_re.fullmatch(normalized):
+            raise ValueError(
+                f"drift report {location}[{index}] has invalid source_id"
+            )
+        found.add(normalized)
+    return found
+
+replay = drift_value.get("replay")
+if not isinstance(replay, dict):
+    raise ValueError("historical drift report must contain a replay object")
+drift_anchor_source_ids = set()
+hard = replay.get("hard_semantic_mismatch_examples")
+if hard is not None:
+    if not isinstance(hard, dict):
+        raise ValueError(
+            "drift report replay.hard_semantic_mismatch_examples must be an object"
+        )
+    for name, examples in hard.items():
+        drift_anchor_source_ids.update(
+            source_ids_from_examples(
+                examples,
+                location=f"replay.hard_semantic_mismatch_examples.{name}",
+            )
+        )
+for section_name in (
+    "confidence_abs_drift", "bbox_max_abs_drift",
+    "declared_vs_replayed_crop_bounds",
+):
+    section = replay.get(section_name)
+    if section is None:
+        continue
+    if not isinstance(section, dict):
+        raise ValueError(f"drift report replay.{section_name} must be an object")
+    drift_anchor_source_ids.update(
+        source_ids_from_examples(
+            section.get("max_examples"),
+            location=f"replay.{section_name}.max_examples",
+        )
+    )
+thresholds = replay.get("fixed_threshold_diagnostics")
+if thresholds is not None:
+    if not isinstance(thresholds, dict):
+        raise ValueError(
+            "drift report replay.fixed_threshold_diagnostics must be an object"
+        )
+    for name, examples in thresholds.items():
+        if str(name).endswith("_nearest_examples"):
+            drift_anchor_source_ids.update(
+                source_ids_from_examples(
+                    examples,
+                    location=f"replay.fixed_threshold_diagnostics.{name}",
+                )
+            )
+if len(drift_anchor_source_ids) != drift_report["anchor_source_ids"]:
+    raise ValueError("historical drift anchor count differs from bound evidence")
+historical_source_ids = {
+    source_id for source_id, _, _ in historical_membership
+}
+if not drift_anchor_source_ids.issubset(historical_source_ids):
+    raise ValueError("historical drift anchor is absent from historical manifest")
+if sha(drift_path) != drift_sha:
+    raise RuntimeError("historical drift report changed while anchors were parsed")
 
 selected = selection.get("selected_sources")
 if not isinstance(selected, list) or len(selected) != 3500:
@@ -510,6 +805,7 @@ selected_by_path = {}
 expected_inventory = {}
 selected_source_hashes = set()
 selected_anchor_paths = set()
+selected_background_probe_paths = set()
 priority_anchors = 0
 for row in selected:
     if not isinstance(row, dict):
@@ -527,16 +823,82 @@ for row in selected:
     if source_key in selected_by_path:
         raise ValueError("pilot selected source path is duplicated")
     source_size, source_sha = stable_artifact(source, description="selected source")
-    label_size, label_sha = stable_artifact(label, description="selected label")
+    label_content, label_size, label_sha = stable_content(
+        label, description="selected label"
+    )
     if row.get("source_sha256") != source_sha or row.get("label_sha256") != label_sha:
         raise ValueError("selected source or label current bytes differ from inventory")
     if not sha_re.fullmatch(source_sha) or source_sha in selected_source_hashes:
         raise ValueError("pilot selected source SHA is invalid or duplicated")
     selected_source_hashes.add(source_sha)
+    actual_historical_categories = sorted(
+        historical_categories_by_source_split.get((source_sha, split), set())
+    )
+    if row.get("historical_categories_selection_only") != actual_historical_categories:
+        raise ValueError("selected historical categories differ from bound manifest")
+    expected_anchor = bool(actual_historical_categories) and (
+        source_sha in drift_anchor_source_ids
+    )
+    if row.get("drift_anchor") is not expected_anchor:
+        raise ValueError("selected drift anchor differs from bound drift allowlist")
+    if row.get("selection_reason") == "drift_anchor_priority" and not expected_anchor:
+        raise ValueError("pilot drift anchor priority is not allowlisted")
+    try:
+        label_text = label_content.decode("utf-8")
+    except UnicodeError as error:
+        raise ValueError("selected current YOLO label is not UTF-8") from error
+    label_lines = [line.strip() for line in label_text.splitlines() if line.strip()]
+    parsed_class_id = None
+    parsed_xywhn = None
+    if label_lines:
+        if len(label_lines) != 1:
+            raise ValueError("selected current YOLO label is not single-object")
+        parts = label_lines[0].split()
+        if len(parts) != 5:
+            raise ValueError("selected current YOLO label has invalid column count")
+        try:
+            raw_class, cx, cy, width, height = (float(value) for value in parts)
+        except ValueError as error:
+            raise ValueError("selected current YOLO label is non-numeric") from error
+        if not math.isfinite(raw_class):
+            raise ValueError("selected current YOLO label class is non-finite")
+        parsed_class_id = int(raw_class)
+        if raw_class != parsed_class_id or not 0 <= parsed_class_id < 9:
+            raise ValueError("selected current YOLO label class is invalid")
+        parsed_xywhn = [cx, cy, width, height]
+        if not all(math.isfinite(value) for value in parsed_xywhn):
+            raise ValueError("selected current YOLO label bbox is non-finite")
+        if not (
+            0 <= cx <= 1
+            and 0 <= cy <= 1
+            and 0 < width <= 1
+            and 0 < height <= 1
+            and cx - width / 2 >= -0.01
+            and cx + width / 2 <= 1.01
+            and cy - height / 2 >= -0.01
+            and cy + height / 2 <= 1.01
+        ):
+            raise ValueError("selected current YOLO label bbox is invalid")
+    parsed_gt_stratum = (
+        "background"
+        if parsed_class_id is None
+        else (
+            "can", "pet", "paper", "plastic", "styrofoam", "vinyl",
+            "glass", "battery", "fluorescent",
+        )[parsed_class_id]
+    )
+    if (
+        row.get("current_gt_stratum") != parsed_gt_stratum
+        or row.get("gt_class_id") != parsed_class_id
+        or row.get("gt_xywhn") != parsed_xywhn
+        or row.get("explicit_empty_label") is not (parsed_class_id is None)
+    ):
+        raise ValueError("selected current YOLO label semantics differ from inventory")
     selected_by_path[source_key] = {
         "split": split,
         "source_sha256": source_sha,
         "label_sha256": label_sha,
+        "selection_cohort": row.get("selection_cohort"),
     }
     for kind, path, size, digest in (
         ("source", source, source_size, source_sha),
@@ -550,6 +912,17 @@ for row in selected:
         selected_anchor_paths.add(source_key)
         if row.get("selection_reason") == "drift_anchor_priority":
             priority_anchors += 1
+    if row.get("historical_background_probe_selection_only") is True:
+        if (
+            row.get("selection_stratum") != "background"
+            or row.get("stratum") != "background"
+            or row.get("current_gt_stratum") == "background"
+            or row.get("selection_cohort") != "historical_background_probe"
+            or row.get("explicit_empty_label") is not False
+            or (source_sha, split, "background") not in historical_membership
+        ):
+            raise ValueError("pilot background probe lacks bound historical membership")
+        selected_background_probe_paths.add(source_key)
 
 if not selected_anchor_paths or priority_anchors <= 0:
     raise ValueError("pilot selection must include historical drift anchors and priority anchors")
@@ -604,13 +977,18 @@ if len(raw_inventory_by_path) != len(raw_inventory_files):
 
 with raw_manifest.open("r", encoding="utf-8-sig", newline="") as handle:
     reader = csv.DictReader(handle)
-    required = {"filepath", "crop_bytes", "source_path_b64", "source_id", "split"}
+    required = {
+        "filepath", "crop_bytes", "source_path_b64", "source_id", "split",
+        "category",
+    }
     if not reader.fieldnames or not required.issubset(reader.fieldnames):
         raise ValueError("raw manifest lacks source cohort binding fields")
     raw_rows = list(reader)
 emitted_paths = set()
 emitted_source_ids = set()
 emitted_split_counts = Counter()
+emitted_background_probe_paths = set()
+background_probe_replay_categories = Counter()
 emitted_crop_paths = set()
 for line, row in enumerate(raw_rows, start=2):
     crop_value = str(row.get("filepath", "")).strip()
@@ -670,6 +1048,15 @@ for line, row in enumerate(raw_rows, start=2):
     emitted_paths.add(source_key)
     emitted_source_ids.add(source_id)
     emitted_split_counts[row["split"]] += 1
+    category = str(row.get("category", "")).strip().lower()
+    if category not in {
+        "can", "pet", "paper", "plastic", "styrofoam", "vinyl", "glass",
+        "battery", "fluorescent", "background",
+    }:
+        raise ValueError("raw manifest category is invalid")
+    if selected_row["selection_cohort"] == "historical_background_probe":
+        emitted_background_probe_paths.add(source_key)
+        background_probe_replay_categories[f"{row['split']}/{category}"] += 1
 expected_raw_files = {"manifest.csv", "dataset_info.json", *emitted_crop_paths}
 if set(raw_inventory_by_path) != expected_raw_files:
     raise ValueError("raw output inventory is not exactly manifest, info, and emitted crops")
@@ -682,6 +1069,8 @@ if emitted_count < minimum_emitted:
     )
 if not selected_anchor_paths.issubset(emitted_paths):
     raise ValueError("raw manifest omits one or more selected drift anchors")
+if not selected_background_probe_paths.issubset(emitted_background_probe_paths):
+    raise ValueError("raw manifest omits one or more selected background probes")
 
 payload = {
     "schema_version": 1,
@@ -695,6 +1084,13 @@ payload = {
     "selected_drift_anchors": len(selected_anchor_paths),
     "emitted_drift_anchors": len(selected_anchor_paths & emitted_paths),
     "priority_drift_anchors": priority_anchors,
+    "selected_background_probes": len(selected_background_probe_paths),
+    "emitted_background_probes": len(emitted_background_probe_paths),
+    "background_probe_replay_categories": dict(
+        sorted(background_probe_replay_categories.items())
+    ),
+    "historical_background_probe_is_selection_only": True,
+    "historical_background_probe_replay_result_assumed": False,
     "historical_selection_only": True,
     "lineage_execution_authorized": False,
     "training_authority": False,
@@ -1095,6 +1491,14 @@ if a_manifest_sha != b_manifest_sha:
 cohort = json.loads(cohort_path.read_text(encoding="utf-8"))
 if cohort.get("status") != "pilot_cohort_current_bytes_and_raw_membership_bound":
     raise ValueError("pilot cohort binding status mismatch")
+if cohort.get("historical_background_probe_is_selection_only") is not True:
+    raise ValueError("pilot cohort does not keep background probes selection-only")
+if cohort.get("historical_background_probe_replay_result_assumed") is not False:
+    raise ValueError("pilot cohort assumes historical background replay results")
+if cohort.get("selected_background_probes") != cohort.get("emitted_background_probes"):
+    raise ValueError("pilot cohort did not emit every selected background probe")
+if not isinstance(cohort.get("background_probe_replay_categories"), dict):
+    raise ValueError("pilot cohort background probe replay distribution is missing")
 payload = {
     "schema_version": 1,
     "status": "validator_ab_exact_reproduction",
@@ -1109,6 +1513,13 @@ payload = {
     "selected_drift_anchors": cohort["selected_drift_anchors"],
     "emitted_drift_anchors": cohort["emitted_drift_anchors"],
     "priority_drift_anchors": cohort["priority_drift_anchors"],
+    "selected_background_probes": cohort["selected_background_probes"],
+    "emitted_background_probes": cohort["emitted_background_probes"],
+    "background_probe_replay_categories": cohort[
+        "background_probe_replay_categories"
+    ],
+    "historical_background_probe_is_selection_only": True,
+    "historical_background_probe_replay_result_assumed": False,
     "bindings": {
         "validated_manifest_sha256": a_manifest_sha,
         "validator_a_report_sha256": sha(a_report_path),
@@ -1192,6 +1603,13 @@ payload = {
     "selected_drift_anchors": comparison_value["selected_drift_anchors"],
     "emitted_drift_anchors": comparison_value["emitted_drift_anchors"],
     "priority_drift_anchors": comparison_value["priority_drift_anchors"],
+    "selected_background_probes": comparison_value["selected_background_probes"],
+    "emitted_background_probes": comparison_value["emitted_background_probes"],
+    "background_probe_replay_categories": comparison_value[
+        "background_probe_replay_categories"
+    ],
+    "historical_background_probe_is_selection_only": True,
+    "historical_background_probe_replay_result_assumed": False,
     "drift_hypothesis_diagnostic_only": True,
     "lineage_execution_authorized": False,
     "judge_authority": False,

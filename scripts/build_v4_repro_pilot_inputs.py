@@ -3,9 +3,12 @@
 The builder resolves the source YOLO YAML with the same helpers used by the
 proposal generator, admits only explicit empty labels or exactly one valid
 0..8 label, quarantines byte-identical sources that cross train/validation,
-and applies a deterministic per-split/per-stratum quota.  Historical v4
-artifacts may prioritize bounded drift examples, but never provide labels or
-promotion authority.
+and applies a deterministic per-split/per-stratum quota.  When current
+explicit-empty sources cannot fill the background input quota, a source that
+was historically emitted as background may be selected as a *probe* while its
+current non-empty YOLO ground truth remains unchanged.  Historical v4
+artifacts only select probes or prioritize bounded drift examples; they never
+provide labels, replay truth, or promotion authority.
 
 The output directory is exclusive.  ``input_ready.json`` is published last;
 any earlier failure publishes ``failed.txt`` and can never leave a ready
@@ -35,7 +38,9 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
 
 CLASS_NAMES = proposal_dataset.CLASS_NAMES
 OUTPUT_STRATA = (*CLASS_NAMES, "background")
-SELECTION_CONTRACT = "v4_repro_pilot_inputs.label_stratified_blake2b.v1"
+SELECTION_CONTRACT = (
+    "v4_repro_pilot_inputs.gt_stratified_historical_background_probe_blake2b.v2"
+)
 ARTIFACT_ROLE = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
     "not_training_blind_or_deployment_authority"
@@ -430,6 +435,15 @@ def _selection_rows(
             if record.stratum not in OUTPUT_STRATA:
                 raise RuntimeError("eligible source is missing a valid stratum")
             eligible[(record.split, record.stratum)].append(record)
+            if (
+                record.stratum != "background"
+                and "background" in record.historical_categories
+            ):
+                # Historical background is a selection hint only.  The source
+                # keeps its current non-empty YOLO label, and the frozen
+                # batch=1 replay decides whether the new proposal is actually
+                # background.
+                eligible[(record.split, "background")].append(record)
 
     selected_rows: list[dict[str, object]] = []
     eligible_counts: dict[str, int] = {}
@@ -437,9 +451,21 @@ def _selection_rows(
     shortages: dict[str, int] = {}
     for split in ("training", "validation"):
         quota = training_quota if split == "training" else validation_quota
-        for stratum in OUTPUT_STRATA:
+        material_available = {
+            stratum: len(eligible.get((split, stratum), []))
+            for stratum in CLASS_NAMES
+        }
+        reserved_records: set[int] = set()
+        # Reserve background probes first so a source can never satisfy both
+        # the background input quota and its current material quota.
+        for stratum in ("background", *CLASS_NAMES):
             key = (split, stratum)
-            candidates = eligible.get(key, [])
+            candidates = [
+                record
+                for record in eligible.get(key, [])
+                if id(record) not in reserved_records
+            ]
+
             def blake_key(record: ScannedSource) -> tuple[str, str, str]:
                 return (
                     _source_score(
@@ -456,25 +482,121 @@ def _selection_rows(
             label = f"{split}/{stratum}"
             eligible_counts[label] = len(candidates)
             anchor_priority_cap = max(1, quota // 5)
-            priority = sorted(
-                (record for record in candidates if record.anchor), key=blake_key
-            )[:anchor_priority_cap]
-            priority_ids = {id(record) for record in priority}
-            # After the bounded priority slice, ignore anchor status entirely
-            # and fill by the original BLAKE2 score.
-            remainder = [
-                record for record in candidates if id(record) not in priority_ids
+            explicit_background: list[ScannedSource] = []
+            if stratum == "background":
+                explicit_background = [
+                    record for record in candidates if record.stratum == "background"
+                ][:quota]
+            explicit_ids = {id(record) for record in explicit_background}
+            remaining_quota = max(0, quota - len(explicit_background))
+            if stratum == "background":
+                # A historical-background probe still has current material GT.
+                # Reserve only the surplus above that material's own quota so a
+                # greedy background choice cannot make a feasible material
+                # allocation fail later.
+                probe_capacity = {
+                    material: max(0, material_available[material] - quota)
+                    for material in CLASS_NAMES
+                }
+                probe_consumed: Counter[str] = Counter()
+
+                def take_safe_probes(
+                    pool: Iterable[ScannedSource], *, limit: int
+                ) -> list[ScannedSource]:
+                    chosen_probes: list[ScannedSource] = []
+                    for record in pool:
+                        if len(chosen_probes) >= limit:
+                            break
+                        material = record.stratum
+                        if material not in probe_capacity:
+                            continue
+                        if probe_consumed[material] >= probe_capacity[material]:
+                            continue
+                        chosen_probes.append(record)
+                        probe_consumed[material] += 1
+                    return chosen_probes
+
+                priority = take_safe_probes(
+                    sorted(
+                        (
+                            record
+                            for record in candidates
+                            if record.anchor and id(record) not in explicit_ids
+                        ),
+                        key=blake_key,
+                    ),
+                    limit=min(anchor_priority_cap, remaining_quota),
+                )
+                priority_ids = {id(record) for record in priority}
+                remainder = take_safe_probes(
+                    (
+                        record
+                        for record in candidates
+                        if id(record) not in explicit_ids
+                        and id(record) not in priority_ids
+                    ),
+                    limit=max(0, remaining_quota - len(priority)),
+                )
+            else:
+                priority = sorted(
+                    (
+                        record
+                        for record in candidates
+                        if record.anchor and id(record) not in explicit_ids
+                    ),
+                    key=blake_key,
+                )[: min(anchor_priority_cap, remaining_quota)]
+                priority_ids = {id(record) for record in priority}
+                # After the bounded priority slice, ignore anchor status entirely
+                # and fill by the original BLAKE2 score.
+                remainder = [
+                    record
+                    for record in candidates
+                    if id(record) not in explicit_ids
+                    and id(record) not in priority_ids
+                ]
+            chosen = [
+                *explicit_background,
+                *priority,
+                *remainder[: max(0, remaining_quota - len(priority))],
             ]
-            chosen = [*priority, *remainder[: max(0, quota - len(priority))]]
             selected_counts[label] = len(chosen)
             shortages[label] = max(0, quota - len(chosen))
+            reserved_records.update(id(record) for record in chosen)
             for rank, record in enumerate(chosen, start=1):
                 if record.label_path is None or record.label_sha256 is None:
                     raise RuntimeError("selected source lacks an explicit label binding")
+                explicit_empty = record.stratum == "background"
+                historical_background_probe = (
+                    stratum == "background" and not explicit_empty
+                )
+                if historical_background_probe and (
+                    "background" not in record.historical_categories
+                    or record.gt_class_id is None
+                    or record.gt_xywhn is None
+                ):
+                    raise RuntimeError(
+                        "historical background probe lacks current GT or historical membership"
+                    )
+                if explicit_empty:
+                    selection_reason = "current_explicit_empty_label"
+                elif id(record) in priority_ids:
+                    selection_reason = "drift_anchor_priority"
+                elif historical_background_probe:
+                    selection_reason = "historical_background_probe_blake2"
+                else:
+                    selection_reason = "deterministic_blake2"
                 selected_rows.append(
                     {
                         "split": split,
                         "stratum": stratum,
+                        "selection_stratum": stratum,
+                        "current_gt_stratum": record.stratum,
+                        "selection_cohort": (
+                            "historical_background_probe"
+                            if historical_background_probe
+                            else "current_yolo_ground_truth"
+                        ),
                         "selection_rank_within_stratum": rank,
                         "selection_score_blake2b128": _source_score(
                             seed=seed,
@@ -483,16 +605,15 @@ def _selection_rows(
                             source_sha256=record.source_sha256,
                         ),
                         "drift_anchor": record.anchor,
-                        "selection_reason": (
-                            "drift_anchor_priority"
-                            if id(record) in priority_ids
-                            else "deterministic_blake2"
-                        ),
+                        "selection_reason": selection_reason,
                         "path": _absolute_posix(record.path),
                         "source_sha256": record.source_sha256,
                         "label_path": _absolute_posix(record.label_path),
                         "label_sha256": record.label_sha256,
-                        "explicit_empty_label": stratum == "background",
+                        "explicit_empty_label": explicit_empty,
+                        "historical_background_probe_selection_only": (
+                            historical_background_probe
+                        ),
                         "gt_class_id": record.gt_class_id,
                         "gt_xywhn": list(record.gt_xywhn) if record.gt_xywhn else None,
                         "historical_categories_selection_only": list(
@@ -598,6 +719,52 @@ def _verify_selected_bindings(selected: Iterable[Mapping[str, object]]) -> None:
             raise RuntimeError(f"selected label changed during input build: {label}")
 
 
+def _verify_selected_semantics(selected: Iterable[Mapping[str, object]]) -> None:
+    paths: set[str] = set()
+    source_hashes: set[str] = set()
+    for row in selected:
+        split = row.get("split")
+        selection = row.get("selection_stratum")
+        current = row.get("current_gt_stratum")
+        cohort = row.get("selection_cohort")
+        path = str(row.get("path", ""))
+        source_sha = str(row.get("source_sha256", ""))
+        explicit = row.get("explicit_empty_label")
+        probe = row.get("historical_background_probe_selection_only")
+        categories = row.get("historical_categories_selection_only")
+        if split not in {"training", "validation"}:
+            raise RuntimeError("selected source has invalid split")
+        if selection not in OUTPUT_STRATA or row.get("stratum") != selection:
+            raise RuntimeError("selected source has invalid selection stratum")
+        if current not in OUTPUT_STRATA:
+            raise RuntimeError("selected source has invalid current GT stratum")
+        if path in paths or source_sha in source_hashes:
+            raise RuntimeError("selected source path or SHA is duplicated")
+        paths.add(path)
+        source_hashes.add(source_sha)
+        if not isinstance(categories, list):
+            raise RuntimeError("selected source historical categories are invalid")
+        if probe is True:
+            if (
+                selection != "background"
+                or current == "background"
+                or explicit is not False
+                or cohort != "historical_background_probe"
+                or "background" not in categories
+                or row.get("gt_class_id") is None
+                or row.get("gt_xywhn") is None
+            ):
+                raise RuntimeError("historical background probe semantics are invalid")
+        else:
+            if (
+                probe is not False
+                or cohort != "current_yolo_ground_truth"
+                or selection != current
+                or explicit is not (current == "background")
+            ):
+                raise RuntimeError("current YOLO ground-truth selection semantics are invalid")
+
+
 def build_pilot_inputs(
     *,
     data_path: Path,
@@ -649,8 +816,49 @@ def build_pilot_inputs(
                 if amount
             )
             raise RuntimeError(f"balanced pilot quota shortage: {detail}")
+        _verify_selected_semantics(selected)
         _verify_selected_bindings(selected)
         universe_sha256, universe_sources = _universe_binding(scanned)
+        selected_current_gt_counts = Counter(
+            f"{row['split']}/{row['current_gt_stratum']}" for row in selected
+        )
+        selected_cohort_counts = Counter(
+            f"{row['split']}/{row['selection_cohort']}" for row in selected
+        )
+        background_quota_composition = {}
+        eligible_background_probe_counts = {}
+        eligible_explicit_empty_counts = {}
+        for split in ("training", "validation"):
+            background_rows = [
+                row
+                for row in selected
+                if row["split"] == split and row["selection_stratum"] == "background"
+            ]
+            explicit = sum(bool(row["explicit_empty_label"]) for row in background_rows)
+            probes = sum(
+                bool(row["historical_background_probe_selection_only"])
+                for row in background_rows
+            )
+            background_quota_composition[split] = {
+                "current_explicit_empty_label": explicit,
+                "historical_background_probe": probes,
+                "total": len(background_rows),
+            }
+            eligible_explicit_empty_counts[split] = sum(
+                1
+                for record in scanned
+                if not record.reasons
+                and record.split == split
+                and record.stratum == "background"
+            )
+            eligible_background_probe_counts[split] = sum(
+                1
+                for record in scanned
+                if not record.reasons
+                and record.split == split
+                and record.stratum != "background"
+                and "background" in record.historical_categories
+            )
 
         train_path = output_dir / "train_pilot.txt"
         validation_path = output_dir / "validation_pilot.txt"
@@ -683,7 +891,11 @@ def build_pilot_inputs(
             "strata": list(OUTPUT_STRATA),
             "source_contract": {
                 "explicit_label_file_required": True,
-                "background_requires_explicit_empty_label": True,
+                "background_prefers_current_explicit_empty_label": True,
+                "historical_background_probe_requires_current_single_object_label": True,
+                "historical_background_category_is_selection_only": True,
+                "historical_background_category_is_not_ground_truth": True,
+                "current_batch1_replay_decides_emitted_category": True,
                 "material_requires_exactly_one_valid_yolo_label": True,
                 "multi_object_excluded": True,
                 "cross_split_content_duplicates_quarantined": True,
@@ -708,6 +920,7 @@ def build_pilot_inputs(
                 "used_for_selection_only": bool(historical_info),
                 "ground_truth_authority": False,
                 "replay_validation_authority": False,
+                "background_category_authority": False,
                 "old_manifest": historical_info,
                 "drift_report": drift_info,
                 "anchors_matched_to_eligible_sources": sum(
@@ -721,10 +934,21 @@ def build_pilot_inputs(
                     for row in selected
                     if row["selection_reason"] == "drift_anchor_priority"
                 ),
+                "eligible_current_explicit_empty_counts": dict(
+                    sorted(eligible_explicit_empty_counts.items())
+                ),
+                "eligible_historical_background_probe_counts": dict(
+                    sorted(eligible_background_probe_counts.items())
+                ),
             },
             "rejections": _rejection_summary(scanned),
             "eligible_counts": eligible_counts,
             "selected_counts": selected_counts,
+            "selected_current_gt_counts": dict(
+                sorted(selected_current_gt_counts.items())
+            ),
+            "selected_cohort_counts": dict(sorted(selected_cohort_counts.items())),
+            "background_quota_composition": background_quota_composition,
             "quota_shortages": shortages,
             "full_quota_met": not any(shortages.values()),
             "selected_sources": selected,
@@ -764,6 +988,16 @@ def build_pilot_inputs(
         _verify_selected_bindings(selected)
         if _stable_sha256(data_path, description="YOLO data YAML final rehash") != data_sha256:
             raise RuntimeError("YOLO data YAML changed during input build")
+        if old_manifest is not None and historical_info is not None:
+            if _stable_sha256(
+                old_manifest, description="historical manifest final rehash"
+            ) != historical_info["sha256"]:
+                raise RuntimeError("historical manifest changed during input build")
+        if drift_report is not None and drift_info is not None:
+            if _stable_sha256(
+                drift_report, description="historical drift report final rehash"
+            ) != drift_info["sha256"]:
+                raise RuntimeError("historical drift report changed during input build")
 
         ready = {
             "schema_version": 1,
@@ -773,6 +1007,11 @@ def build_pilot_inputs(
             "seed": seed,
             "selected_sources": len(selected),
             "selected_counts": selected_counts,
+            "selected_current_gt_counts": dict(
+                sorted(selected_current_gt_counts.items())
+            ),
+            "selected_cohort_counts": dict(sorted(selected_cohort_counts.items())),
+            "background_quota_composition": background_quota_composition,
             "full_quota_met": not any(shortages.values()),
             "bindings": {
                 "inputs_marker_sha256": _sha256_bytes(marker_content),

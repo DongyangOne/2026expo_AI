@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -75,10 +76,20 @@ def cohort_base(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
                     encoding="utf-8",
                 )
                 anchor = rank == 1 and stratum in {"can", "vinyl", "background"}
+                selection_reason = (
+                    "current_explicit_empty_label"
+                    if stratum == "background"
+                    else "drift_anchor_priority"
+                    if anchor
+                    else "deterministic_blake2"
+                )
                 rows.append(
                     {
                         "split": split,
                         "stratum": stratum,
+                        "selection_stratum": stratum,
+                        "current_gt_stratum": stratum,
+                        "selection_cohort": "current_yolo_ground_truth",
                         "path": source.resolve().as_posix(),
                         "source_sha256": _sha(source),
                         "label_path": label.resolve().as_posix(),
@@ -86,18 +97,43 @@ def cohort_base(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
                         "source_size": source.stat().st_size,
                         "label_size": label.stat().st_size,
                         "drift_anchor": anchor,
-                        "selection_reason": (
-                            "drift_anchor_priority" if anchor else "deterministic_blake2"
+                        "selection_reason": selection_reason,
+                        "explicit_empty_label": stratum == "background",
+                        "historical_background_probe_selection_only": False,
+                        "gt_class_id": None if stratum == "background" else class_ids[stratum],
+                        "gt_xywhn": None if stratum == "background" else [0.5, 0.5, 0.2, 0.2],
+                        "historical_categories_selection_only": (
+                            [stratum] if anchor else []
                         ),
                     }
                 )
+    anchor_rows = [row for row in rows if row["drift_anchor"]]
     old_manifest = root / "historical-manifest.csv"
     old_manifest.write_text(
-        "source_id,split,category\n" + "b" * 64 + ",training,can\n",
+        "source_id,split,category\n"
+        + "".join(
+            f"{row['source_sha256']},{row['split']},{row['stratum']}\n"
+            for row in anchor_rows
+        ),
         encoding="utf-8",
     )
     drift_report = root / "historical-drift.json"
-    drift_report.write_text('{"replay":{}}\n', encoding="utf-8")
+    drift_report.write_text(
+        json.dumps(
+            {
+                "replay": {
+                    "hard_semantic_mismatch_examples": {
+                        "fixture": [
+                            {"source_id": row["source_sha256"]}
+                            for row in anchor_rows
+                        ]
+                    }
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return {
         "root": root,
         "selected_rows": rows,
@@ -215,6 +251,38 @@ print(json.dumps(report,sort_keys=True))
         {key: value for key, value in row.items() if key not in {"source_size", "label_size"}}
         for row in cohort["selected_rows"]
     ]
+    probe_modes = {"probe_replays_material", "forged_probe_membership"}
+    probe_source_sha: str | None = None
+    if mode in probe_modes:
+        probe_index = next(
+            index
+            for index, row in enumerate(selected_rows)
+            if row["split"] == "training"
+            and row["stratum"] == "background"
+            and not row["drift_anchor"]
+        )
+        source = tmp_path / "probe-source" / "training" / "images" / "probe.jpg"
+        label = tmp_path / "probe-source" / "training" / "labels" / "probe.txt"
+        source.parent.mkdir(parents=True)
+        label.parent.mkdir(parents=True)
+        source.write_bytes(b"current-material-source-selected-as-historical-background-probe")
+        label.write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+        probe_source_sha = _sha(source)
+        selected_rows[probe_index] = {
+            **selected_rows[probe_index],
+            "path": source.resolve().as_posix(),
+            "source_sha256": probe_source_sha,
+            "label_path": label.resolve().as_posix(),
+            "label_sha256": _sha(label),
+            "current_gt_stratum": "can",
+            "selection_cohort": "historical_background_probe",
+            "selection_reason": "historical_background_probe_blake2",
+            "explicit_empty_label": False,
+            "historical_background_probe_selection_only": True,
+            "gt_class_id": 0,
+            "gt_xywhn": [0.5, 0.5, 0.2, 0.2],
+            "historical_categories_selection_only": ["background"],
+        }
     if mode == "selected_source_tamper":
         tampered_source = tmp_path / "tampered" / "source.jpg"
         tampered_source.parent.mkdir()
@@ -225,6 +293,29 @@ print(json.dumps(report,sort_keys=True))
         tampered_label.parent.mkdir()
         tampered_label.write_bytes(b"tampered-selected-label")
         selected_rows[0]["label_path"] = tampered_label.resolve().as_posix()
+    if mode == "forged_label_semantics":
+        forged_index = next(
+            index
+            for index, row in enumerate(selected_rows)
+            if row["stratum"] == "can"
+        )
+        forged_label = tmp_path / "forged" / "label.txt"
+        forged_label.parent.mkdir()
+        forged_label.write_text("1 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+        selected_rows[forged_index]["label_path"] = forged_label.resolve().as_posix()
+        selected_rows[forged_index]["label_sha256"] = _sha(forged_label)
+    forged_anchor_row: dict[str, object] | None = None
+    if mode == "forged_drift_anchor":
+        forged_anchor_row = next(
+            row
+            for row in selected_rows
+            if row["split"] == "training"
+            and row["stratum"] == "paper"
+            and not row["drift_anchor"]
+        )
+        forged_anchor_row["drift_anchor"] = True
+        forged_anchor_row["selection_reason"] = "drift_anchor_priority"
+        forged_anchor_row["historical_categories_selection_only"] = ["paper"]
     train = pilot / "train_pilot.txt"
     validation = pilot / "validation_pilot.txt"
     train.write_text(
@@ -252,9 +343,60 @@ print(json.dumps(report,sort_keys=True))
         encoding="utf-8",
     )
     universe = "a" * 64
-    old_manifest = Path(cohort["old_manifest"])
+    old_manifest = tmp_path / "historical-manifest.csv"
+    old_manifest.write_bytes(Path(cohort["old_manifest"]).read_bytes())
+    if probe_source_sha is not None and mode != "forged_probe_membership":
+        with old_manifest.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(f"{probe_source_sha},training,background\n")
+    if forged_anchor_row is not None:
+        with old_manifest.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(
+                f"{forged_anchor_row['source_sha256']},"
+                f"{forged_anchor_row['split']},paper\n"
+            )
+    old_manifest_rows = sum(
+        1 for _ in old_manifest.read_text(encoding="utf-8").splitlines()[1:]
+    )
+    if mode == "forged_historical_row_count":
+        old_manifest_rows += 1
     drift_report = Path(cohort["drift_report"])
     anchors_selected = sum(row["drift_anchor"] for row in selected_rows)
+    priority_anchors = sum(
+        row["selection_reason"] == "drift_anchor_priority" for row in selected_rows
+    )
+    selected_current_gt_counts = dict(
+        sorted(
+            Counter(
+                f"{row['split']}/{row['current_gt_stratum']}"
+                for row in selected_rows
+            ).items()
+        )
+    )
+    selected_cohort_counts = dict(
+        sorted(
+            Counter(
+                f"{row['split']}/{row['selection_cohort']}"
+                for row in selected_rows
+            ).items()
+        )
+    )
+    background_quota_composition = {}
+    for split in ("training", "validation"):
+        background_rows = [
+            row
+            for row in selected_rows
+            if row["split"] == split and row["stratum"] == "background"
+        ]
+        background_quota_composition[split] = {
+            "current_explicit_empty_label": sum(
+                row["explicit_empty_label"] is True for row in background_rows
+            ),
+            "historical_background_probe": sum(
+                row["historical_background_probe_selection_only"] is True
+                for row in background_rows
+            ),
+            "total": len(background_rows),
+        }
     pilot_inventory = pilot / "selection_inventory.json"
     pilot_inventory.write_text(
         json.dumps(
@@ -264,21 +406,42 @@ print(json.dumps(report,sort_keys=True))
                     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
                     "not_training_blind_or_deployment_authority"
                 ),
-                "selection_contract": "v4_repro_pilot_inputs.label_stratified_blake2b.v1",
+                "selection_contract": (
+                    "v4_repro_pilot_inputs."
+                    "gt_stratified_historical_background_probe_blake2b.v2"
+                ),
                 "status": "selection_complete_not_replay_validated",
                 "quota_per_stratum": {"training": 250, "validation": 100},
                 "classes": list(materials),
                 "strata": list(strata),
+                "source_contract": {
+                    "explicit_label_file_required": True,
+                    "background_prefers_current_explicit_empty_label": True,
+                    "historical_background_probe_requires_current_single_object_label": True,
+                    "historical_background_category_is_selection_only": True,
+                    "historical_background_category_is_not_ground_truth": True,
+                    "current_batch1_replay_decides_emitted_category": True,
+                    "material_requires_exactly_one_valid_yolo_label": True,
+                    "multi_object_excluded": True,
+                    "cross_split_content_duplicates_quarantined": True,
+                    "same_split_conflicting_ground_truth_quarantined": True,
+                },
                 "selected_counts": selected_counts,
+                "selected_current_gt_counts": selected_current_gt_counts,
+                "selected_cohort_counts": selected_cohort_counts,
+                "background_quota_composition": background_quota_composition,
                 "quota_shortages": {name: 0 for name in selected_counts},
                 "full_quota_met": True,
                 "selected_sources": selected_rows,
                 "historical_selection_evidence": {
                     "used_for_selection_only": True,
+                    "ground_truth_authority": False,
+                    "replay_validation_authority": False,
+                    "background_category_authority": False,
                     "old_manifest": {
                         "path": old_manifest.resolve().as_posix(),
                         "sha256": _sha(old_manifest),
-                        "rows": 1,
+                        "rows": old_manifest_rows,
                     },
                     "drift_report": {
                         "path": drift_report.resolve().as_posix(),
@@ -286,7 +449,19 @@ print(json.dumps(report,sort_keys=True))
                         "anchor_source_ids": anchors_selected,
                     },
                     "anchors_selected": anchors_selected,
-                    "anchors_priority_selected": anchors_selected,
+                    "anchors_priority_selected": priority_anchors,
+                    "eligible_current_explicit_empty_counts": {
+                        split: background_quota_composition[split][
+                            "current_explicit_empty_label"
+                        ]
+                        for split in ("training", "validation")
+                    },
+                    "eligible_historical_background_probe_counts": {
+                        split: background_quota_composition[split][
+                            "historical_background_probe"
+                        ]
+                        for split in ("training", "validation")
+                    },
                 },
                 "bindings": {
                     "resolved_universe_sha256": universe,
@@ -337,10 +512,16 @@ print(json.dumps(report,sort_keys=True))
                     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
                     "not_training_blind_or_deployment_authority"
                 ),
-                "selection_contract": "v4_repro_pilot_inputs.label_stratified_blake2b.v1",
+                "selection_contract": (
+                    "v4_repro_pilot_inputs."
+                    "gt_stratified_historical_background_probe_blake2b.v2"
+                ),
                 "status": "pilot_inputs_ready",
                 "selected_sources": 3500,
                 "selected_counts": selected_counts,
+                "selected_current_gt_counts": selected_current_gt_counts,
+                "selected_cohort_counts": selected_cohort_counts,
+                "background_quota_composition": background_quota_composition,
                 "full_quota_met": True,
                 "historical_selection_only": True,
                 "bindings": {
@@ -385,7 +566,9 @@ print(json.dumps(report,sort_keys=True))
             "path": foreign.resolve().as_posix(),
             "source_sha256": _sha(foreign),
         }
-    manifest_lines = ["id,value,filepath,crop_bytes,source_path_b64,source_id,split"]
+    manifest_lines = [
+        "id,value,filepath,crop_bytes,source_path_b64,source_id,split,category"
+    ]
     current_crop_seed: Path | None = None
     for index, row in enumerate(emitted, start=1):
         crop = raw / row["split"] / "crops" / f"{index:05d}.jpg"
@@ -402,9 +585,15 @@ print(json.dumps(report,sort_keys=True))
             os.link(current_crop_seed, crop)
             crop_value = crop.relative_to(raw).as_posix()
         encoded = base64.urlsafe_b64encode(os.fsencode(row["path"])).decode("ascii")
+        replay_category = row["stratum"]
+        if (
+            mode == "probe_replays_material"
+            and row["selection_cohort"] == "historical_background_probe"
+        ):
+            replay_category = "can"
         manifest_lines.append(
             f'{index},raw,{crop_value},{len(b"sealed-pilot-crop")},{encoded},'
-            f'{row["source_sha256"]},{row["split"]}'
+            f'{row["source_sha256"]},{row["split"]},{replay_category}'
         )
     manifest.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
     info = raw / "dataset_info.json"
@@ -661,6 +850,9 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
     assert "raw manifest contains a source outside the selected pilot cohort" in text
     assert "raw manifest selected-source coverage is below 99 percent" in text
     assert "raw manifest omits one or more selected drift anchors" in text
+    assert "pilot background probe lacks bound historical membership" in text
+    assert "raw manifest omits one or more selected background probes" in text
+    assert "historical_background_probe_replay_result_assumed" in text
     assert "raw manifest crop escapes the inventoried raw directory" in text
     assert 'crop_size, crop_sha = stable_artifact(crop, description="raw manifest crop")' in text
     assert "raw manifest crop current bytes differ from the raw output inventory" in text
@@ -752,6 +944,26 @@ def test_integration_success_seals_two_exact_runs(
         assert checked.returncode == 0, marker
 
 
+def test_integration_historical_background_probe_does_not_force_replay_category(
+    tmp_path: Path, cohort_base: dict[str, object]
+) -> None:
+    result, env = _run(tmp_path, cohort_base, mode="probe_replays_material")
+    assert result.returncode == 0, result.stderr
+    ready = json.loads(
+        (
+            Path(env["VALIDATION_DIR"])
+            / "control"
+            / "diagnostic_ready.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert ready["selected_background_probes"] == 1
+    assert ready["emitted_background_probes"] == 1
+    assert ready["background_probe_replay_categories"] == {"training/can": 1}
+    assert ready["historical_background_probe_is_selection_only"] is True
+    assert ready["historical_background_probe_replay_result_assumed"] is False
+    assert ready["production_deployment_authorized"] is False
+
+
 @pytest.mark.parametrize(
     "mode",
     [
@@ -763,6 +975,7 @@ def test_integration_success_seals_two_exact_runs(
         "generation_wrapper_tamper",
         "selected_source_tamper",
         "selected_label_tamper",
+        "forged_label_semantics",
         "generation_inventory_mismatch",
         "foreign_manifest_source",
         "external_crop",
@@ -771,6 +984,9 @@ def test_integration_success_seals_two_exact_runs(
         "missing_anchor",
         "coverage_shortage",
         "diagnostic_lineage_ready",
+        "forged_probe_membership",
+        "forged_historical_row_count",
+        "forged_drift_anchor",
     ],
 )
 def test_integration_failure_modes_publish_failure_only(

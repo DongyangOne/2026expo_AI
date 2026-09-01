@@ -304,6 +304,217 @@ def test_historical_drift_anchor_is_selection_only_and_has_priority(tmp_path: Pa
     assert inventory["authority"]["production_deployment_authorized"] is False
 
 
+def test_historical_background_probe_fills_quota_without_relabeling(
+    tmp_path: Path,
+) -> None:
+    data, dataset_dir, sources = _fixture(tmp_path)
+    probe_sources = {
+        "training": sources["train_empty"],
+        "validation": sources["val_empty"],
+    }
+    for source in probe_sources.values():
+        label = source.parent.parent / "labels" / f"{source.stem}.txt"
+        label.write_text("0 .5 .5 .4 .4\n", encoding="utf-8")
+
+    old_manifest = tmp_path / "historical-background.csv"
+    with old_manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["source_id", "split", "category"])
+        writer.writeheader()
+        for split, source in probe_sources.items():
+            writer.writerow(
+                {"source_id": _sha(source), "split": split, "category": "background"}
+            )
+
+    output = tmp_path / "probe-pilot"
+    build_pilot_inputs(
+        data_path=data,
+        dataset_dir=dataset_dir,
+        output_dir=output,
+        seed=17,
+        training_quota=1,
+        validation_quota=1,
+        old_manifest=old_manifest,
+    )
+
+    inventory = _inventory(output)
+    background_rows = [
+        row for row in inventory["selected_sources"] if row["stratum"] == "background"
+    ]
+    assert len(background_rows) == 2
+    assert {row["split"] for row in background_rows} == {"training", "validation"}
+    assert all(row["selection_stratum"] == "background" for row in background_rows)
+    assert all(row["current_gt_stratum"] == "can" for row in background_rows)
+    assert all(row["selection_cohort"] == "historical_background_probe" for row in background_rows)
+    assert all(row["explicit_empty_label"] is False for row in background_rows)
+    assert all(
+        row["historical_background_probe_selection_only"] is True
+        for row in background_rows
+    )
+    assert all(row["gt_class_id"] == 0 and row["gt_xywhn"] for row in background_rows)
+    assert all(
+        row["historical_categories_selection_only"] == ["background"]
+        for row in background_rows
+    )
+    selected_paths = [row["path"] for row in inventory["selected_sources"]]
+    assert len(selected_paths) == len(set(selected_paths)) == 20
+    assert inventory["background_quota_composition"] == {
+        "training": {
+            "current_explicit_empty_label": 0,
+            "historical_background_probe": 1,
+            "total": 1,
+        },
+        "validation": {
+            "current_explicit_empty_label": 0,
+            "historical_background_probe": 1,
+            "total": 1,
+        },
+    }
+    assert inventory["historical_selection_evidence"][
+        "eligible_historical_background_probe_counts"
+    ] == {"training": 1, "validation": 1}
+    assert inventory["historical_selection_evidence"][
+        "background_category_authority"
+    ] is False
+
+
+def test_background_probe_preserves_scarce_material_quota(tmp_path: Path) -> None:
+    records: list[ScannedSource] = []
+
+    def add_record(
+        *, split: str, material: str, suffix: str, probe: bool = False,
+        anchor: bool = False,
+    ) -> None:
+        class_id = CLASS_NAMES.index(material)
+        identity = f"{split}-{material}-{suffix}"
+        records.append(
+            ScannedSource(
+                path=tmp_path / f"{identity}.jpg",
+                split=split,
+                source_sha256=hashlib.sha256(identity.encode()).hexdigest(),
+                label_path=tmp_path / f"{identity}.txt",
+                label_sha256=hashlib.sha256(f"label-{identity}".encode()).hexdigest(),
+                stratum=material,
+                gt_class_id=class_id,
+                gt_xywhn=(0.5, 0.5, 0.2, 0.2),
+                historical_categories=("background",) if probe else (),
+                anchor=anchor,
+            )
+        )
+
+    for material in CLASS_NAMES:
+        add_record(
+            split="training",
+            material=material,
+            suffix="base",
+            probe=material == "can",
+            anchor=material == "can",
+        )
+        add_record(split="validation", material=material, suffix="base")
+    add_record(split="training", material="paper", suffix="surplus", probe=True)
+    validation_background = "validation-background"
+    records.append(
+        ScannedSource(
+            path=tmp_path / f"{validation_background}.jpg",
+            split="validation",
+            source_sha256=hashlib.sha256(validation_background.encode()).hexdigest(),
+            label_path=tmp_path / f"{validation_background}.txt",
+            label_sha256=hashlib.sha256(
+                f"label-{validation_background}".encode()
+            ).hexdigest(),
+            stratum="background",
+            gt_class_id=None,
+            gt_xywhn=None,
+        )
+    )
+
+    selected, _, selected_counts, shortages = _selection_rows(
+        records, seed=0, training_quota=1, validation_quota=1
+    )
+
+    training_background = next(
+        row
+        for row in selected
+        if row["split"] == "training" and row["stratum"] == "background"
+    )
+    assert training_background["current_gt_stratum"] == "paper"
+    assert selected_counts == {
+        **{f"training/{stratum}": 1 for stratum in (*CLASS_NAMES, "background")},
+        **{f"validation/{stratum}": 1 for stratum in (*CLASS_NAMES, "background")},
+    }
+    assert set(shortages.values()) == {0}
+    selected_paths = [row["path"] for row in selected]
+    selected_hashes = [row["source_sha256"] for row in selected]
+    assert len(selected_paths) == len(set(selected_paths)) == 20
+    assert len(selected_hashes) == len(set(selected_hashes)) == 20
+def test_historical_background_probe_requires_same_split_membership(
+    tmp_path: Path,
+) -> None:
+    data, dataset_dir, sources = _fixture(tmp_path)
+    val_source = sources["val_empty"]
+    val_label = val_source.parent.parent / "labels" / f"{val_source.stem}.txt"
+    val_label.write_text("0 .5 .5 .4 .4\n", encoding="utf-8")
+    old_manifest = tmp_path / "wrong-split-background.csv"
+    old_manifest.write_text(
+        "source_id,split,category\n"
+        f"{_sha(val_source)},training,background\n",
+        encoding="utf-8",
+    )
+
+    output = tmp_path / "wrong-split-pilot"
+    with pytest.raises(RuntimeError, match="validation/background=1"):
+        build_pilot_inputs(
+            data_path=data,
+            dataset_dir=dataset_dir,
+            output_dir=output,
+            training_quota=1,
+            validation_quota=1,
+            old_manifest=old_manifest,
+        )
+    assert (output / "failed.txt").is_file()
+    assert not (output / "input_ready.json").exists()
+
+
+def test_historical_manifest_mutation_is_detected_before_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.build_v4_repro_pilot_inputs as builder
+
+    data, dataset_dir, sources = _fixture(tmp_path)
+    old_manifest = tmp_path / "historical.csv"
+    old_manifest.write_text(
+        "source_id,split,category\n"
+        f"{_sha(sources['train_can_a'])},training,can\n",
+        encoding="utf-8",
+    )
+    original = builder._verify_selected_bindings
+    mutated = False
+
+    def verify_then_mutate(selected: list[dict[str, object]]) -> None:
+        nonlocal mutated
+        original(selected)
+        if not mutated:
+            old_manifest.write_text(
+                old_manifest.read_text(encoding="utf-8")
+                + f"{_sha(sources['train_paper'])},training,paper\n",
+                encoding="utf-8",
+            )
+            mutated = True
+
+    monkeypatch.setattr(builder, "_verify_selected_bindings", verify_then_mutate)
+    output = tmp_path / "mutated-history"
+    with pytest.raises(RuntimeError, match="historical manifest changed"):
+        builder.build_pilot_inputs(
+            data_path=data,
+            dataset_dir=dataset_dir,
+            output_dir=output,
+            training_quota=1,
+            validation_quota=1,
+            old_manifest=old_manifest,
+        )
+    assert (output / "failed.txt").is_file()
+    assert not (output / "input_ready.json").exists()
+
+
 def test_anchor_priority_is_capped_and_remainder_uses_original_blake_order(
     tmp_path: Path,
 ) -> None:
