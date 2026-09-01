@@ -257,16 +257,23 @@ def _model_config_families(config: Mapping[str, Any]) -> tuple[str, ...]:
     """
 
     family_values: list[str] = []
-    if "model_family" in config:
-        family_values.extend(
-            _string_values(
-                config["model_family"], field="model_config.model_family"
+    model_info = _model_info(config)
+    for source, prefix in (
+        (config, "model_config"),
+        (model_info, "model_config.model_info"),
+    ):
+        if "model_family" in source:
+            family_values.extend(
+                _string_values(
+                    source["model_family"], field=f"{prefix}.model_family"
+                )
             )
-        )
-    if "model_families" in config:
-        family_values.extend(
-            _string_values(config["model_families"], field="model_config.model_families")
-        )
+        if "model_families" in source:
+            family_values.extend(
+                _string_values(
+                    source["model_families"], field=f"{prefix}.model_families"
+                )
+            )
     if family_values:
         return tuple(
             dict.fromkeys(_canonical_family(value) for value in family_values)
@@ -283,32 +290,64 @@ def _model_config_families(config: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _model_info(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = config.get("model_info")
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("model_config.model_info must be an object")
+    return value
+
+
 def _config_architecture_families(config: Mapping[str, Any]) -> tuple[str, ...]:
-    """Read architecture-bearing config fields independently of size-like type.
+    """Read actual model-architecture fields independently of OCI platform data.
 
     Ollama uses ``model_type`` for parameter sizes on some models (for example
-    Gemma4 ``25.8B``), so it is not a family identity when explicit family
-    fields exist.  Renderer, parser, and architecture fields remain useful
-    immutable evidence against a family-name disguise.
+    Gemma4 ``25.8B``), while the top-level OCI ``architecture`` field describes
+    the execution platform (for example ``amd64``), not the model family.
+    Ollama's model architecture is exposed as ``general.architecture`` either
+    directly or inside the nested ``model_info`` object.
     """
 
     values: list[str] = []
-    for key in ("renderer", "parser", "architecture", "general.architecture"):
-        if key in config:
-            values.extend(
-                _string_values(config[key], field=f"model_config.{key}")
-            )
-    general = config.get("general")
-    if general is not None:
-        if not isinstance(general, Mapping):
-            raise ValueError("model_config.general must be an object")
-        if "architecture" in general:
+    for source, prefix in (
+        (config, "model_config"),
+        (_model_info(config), "model_config.model_info"),
+    ):
+        if "general.architecture" in source:
             values.extend(
                 _string_values(
-                    general["architecture"],
-                    field="model_config.general.architecture",
+                    source["general.architecture"],
+                    field=f"{prefix}.general.architecture",
                 )
             )
+        general = source.get("general")
+        if general is not None:
+            if not isinstance(general, Mapping):
+                raise ValueError(f"{prefix}.general must be an object")
+            if "architecture" in general:
+                values.extend(
+                    _string_values(
+                        general["architecture"],
+                        field=f"{prefix}.general.architecture",
+                    )
+                )
+    return tuple(dict.fromkeys(_canonical_family(value) for value in values))
+
+
+def _auxiliary_identity_tokens(config: Mapping[str, Any]) -> tuple[str, ...]:
+    """Retain renderer/parser signals for blocked-family detection only."""
+
+    values: list[str] = []
+    for source, prefix in (
+        (config, "model_config"),
+        (_model_info(config), "model_config.model_info"),
+    ):
+        for key in ("renderer", "parser"):
+            if key in source:
+                values.extend(
+                    _string_values(source[key], field=f"{prefix}.{key}")
+                )
     return tuple(dict.fromkeys(_canonical_family(value) for value in values))
 
 
@@ -419,6 +458,7 @@ def _validate_model_artifacts(
 
     actual_families = _model_config_families(config_value)
     architecture_families = _config_architecture_families(config_value)
+    auxiliary_identity_tokens = _auxiliary_identity_tokens(config_value)
     model_type_tokens = _model_type_tokens(config_value)
     declared_canonical = _canonical_family(declared_family)
     compatible_families = tuple(
@@ -431,7 +471,12 @@ def _validate_model_artifacts(
         )
     immutable_identity_tokens = tuple(
         dict.fromkeys(
-            (*actual_families, *architecture_families, *model_type_tokens)
+            (
+                *actual_families,
+                *architecture_families,
+                *auxiliary_identity_tokens,
+                *model_type_tokens,
+            )
         )
     )
     if any(
@@ -1427,18 +1472,21 @@ def run_independent_visual_judges(
         _canonical_json_bytes(evidence_pair_seed)
     )
     votes: list[dict[str, Any]] = []
-    for row in rows:
-        source_bytes = _read_verified_image(
-            row.source_path,
-            expected_sha256=row.source_sha256,
-            field=f"sample {row.sample_id!r} source",
-        )
-        crop_bytes = _read_verified_image(
-            row.crop_path,
-            expected_sha256=row.crop_sha256,
-            field=f"sample {row.sample_id!r} crop",
-        )
-        for spec in specs:
+    # Keep one judge active for its complete pass before moving to the next
+    # model.  On a single-GPU server this avoids swapping two independent VLMs
+    # into VRAM for every sample while preserving exactly one vote per pair.
+    for spec in specs:
+        for row in rows:
+            source_bytes = _read_verified_image(
+                row.source_path,
+                expected_sha256=row.source_sha256,
+                field=f"sample {row.sample_id!r} source",
+            )
+            crop_bytes = _read_verified_image(
+                row.crop_path,
+                expected_sha256=row.crop_sha256,
+                field=f"sample {row.sample_id!r} crop",
+            )
             payload = build_ollama_payload(
                 spec, source_bytes=source_bytes, crop_bytes=crop_bytes
             )

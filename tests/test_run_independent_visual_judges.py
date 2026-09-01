@@ -264,6 +264,12 @@ def test_runs_two_independent_judges_without_candidate_metadata_leakage(tmp_path
     ]
     chat_calls = [call for call in calls if call[2] == "/api/chat"]
     assert len(chat_calls) == 4
+    assert [call[0].judge_id for call in chat_calls] == [
+        "judge-a",
+        "judge-a",
+        "judge-b",
+        "judge-b",
+    ]
     for index, call in enumerate(calls[:-1]):
         if call[2] == "/api/chat":
             assert calls[index + 1][0].judge_id == call[0].judge_id
@@ -1009,6 +1015,34 @@ def test_real_gemma4_size_shaped_model_type_is_not_treated_as_family(tmp_path):
 
     gemma = next(spec for spec in loaded if spec.judge_id == "judge-b")
     assert gemma.model_config_families == ("gemma4",)
+
+
+def test_real_ollama_oci_platform_architecture_is_not_treated_as_model_family(
+    tmp_path,
+):
+    specs = _judge_specs(tmp_path)
+    _rewrite_model_family(specs[1], "gemma3")
+    _replace_model_config(
+        specs[1],
+        {
+            "model_format": "gguf",
+            "model_family": "gemma3",
+            "model_families": ["gemma3"],
+            "model_type": "4.3B",
+            "file_type": "Q4_K_M",
+            "architecture": "amd64",
+            "os": "linux",
+            "model_info": {
+                "model_family": "gemma3",
+                "general.architecture": "gemma3",
+            },
+        },
+    )
+
+    loaded = judges.load_judge_specs(specs)
+
+    gemma = next(spec for spec in loaded if spec.judge_id == "judge-b")
+    assert gemma.model_config_families == ("gemma3",)
 
 
 @pytest.mark.parametrize(
