@@ -87,6 +87,9 @@ SCHEMA_VERSION = "proposal_verifier.v4.bgfix.v1"
 AUTHORITATIVE_ARTIFACT_ROLE = (
     "v4_development_candidates_not_blind_or_deployment_authority"
 )
+RUNTIME_DIAGNOSTIC_ARTIFACT_ROLE = (
+    "v4_runtime_replay_diagnostic_not_lineage_blind_or_deployment_authority"
+)
 CUSTOM_PROVIDER_ARTIFACT_ROLE = (
     "v4_custom_provider_diagnostics_not_lineage_blind_or_deployment_authority"
 )
@@ -813,6 +816,7 @@ def validate_manifest(
     output_manifest: Path,
     output_report: Path,
     prediction_provider: PredictionProvider | None = None,
+    diagnostic_only: bool = False,
 ) -> dict:
     paths = [input_manifest, dataset_info, detector_model, inference_spec]
     for path in paths:
@@ -954,11 +958,20 @@ def validate_manifest(
         report = {
             "schema_version": 1,
             "artifact_role": (
-                AUTHORITATIVE_ARTIFACT_ROLE
+                (
+                    RUNTIME_DIAGNOSTIC_ARTIFACT_ROLE
+                    if diagnostic_only
+                    else AUTHORITATIVE_ARTIFACT_ROLE
+                )
                 if authoritative
                 else CUSTOM_PROVIDER_ARTIFACT_ROLE
             ),
-            "ready_for_lineage_upgrade": authoritative,
+            "ready_for_lineage_upgrade": authoritative and not diagnostic_only,
+            **(
+                {"lineage_execution_authorized": False}
+                if diagnostic_only
+                else {}
+            ),
             "blind_test_eligible": False,
             "production_deployment_authorized": False,
             "rows": len(validated),
@@ -1011,6 +1024,14 @@ def main() -> None:
     parser.add_argument("--inference-spec", required=True, type=Path)
     parser.add_argument("--output-manifest", required=True, type=Path)
     parser.add_argument("--output-report", required=True, type=Path)
+    parser.add_argument(
+        "--diagnostic-only",
+        action="store_true",
+        help=(
+            "execute the frozen runtime replay but publish evidence that cannot "
+            "authorize lineage, blind evaluation, or deployment"
+        ),
+    )
     args = parser.parse_args()
     report = validate_manifest(
         input_manifest=args.input_manifest,
@@ -1019,6 +1040,7 @@ def main() -> None:
         inference_spec=args.inference_spec,
         output_manifest=args.output_manifest,
         output_report=args.output_report,
+        diagnostic_only=args.diagnostic_only,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
 

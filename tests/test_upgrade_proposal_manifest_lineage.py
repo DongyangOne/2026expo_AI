@@ -659,6 +659,38 @@ def test_validator_report_is_required_pinned_and_bound_to_manifest(tmp_path):
         )
 
 
+def test_runtime_diagnostic_validator_report_cannot_authorize_lineage(tmp_path):
+    source = tmp_path / "source.jpg"
+    crop = tmp_path / "crop.jpg"
+    source.write_bytes(b"source")
+    crop.write_bytes(b"crop")
+    manifest = tmp_path / "validated.csv"
+    _write_manifest(manifest, [_row(filepath="crop.jpg", source="source.jpg")])
+    report, _ = _validator_report(tmp_path / "validator.json", manifest)
+    parsed = json.loads(report.read_text(encoding="utf-8"))
+    parsed["artifact_role"] = (
+        "v4_runtime_replay_diagnostic_not_lineage_blind_or_deployment_authority"
+    )
+    parsed["ready_for_lineage_upgrade"] = False
+    parsed["lineage_execution_authorized"] = False
+    report.write_text(json.dumps(parsed), encoding="utf-8")
+    group_map, group_pin = _automatic_group_map(tmp_path / "groups.json", [manifest])
+
+    with pytest.raises(ValueError, match="artifact_role"):
+        _upgrade_proposal_manifests(
+            inputs=[manifest],
+            validator_report_paths=[report],
+            validator_report_sha256s=[_sha(report)],
+            output_csv=tmp_path / "strict.csv",
+            output_jsonl=tmp_path / "strict.jsonl",
+            lineage_path=tmp_path / "lineage.json",
+            rejections_path=tmp_path / "rejections.json",
+            group_map_path=group_map,
+            group_map_sha256=group_pin,
+            dry_run=True,
+        )
+
+
 def test_group_map_requires_pin_and_unmapped_fallback_requires_phash(tmp_path):
     source = tmp_path / "source.jpg"
     crop = tmp_path / "crop.jpg"

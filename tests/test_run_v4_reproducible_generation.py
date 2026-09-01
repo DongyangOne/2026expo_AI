@@ -37,6 +37,9 @@ def _generation_fixture(tmp_path: Path, *, fail: bool = False) -> dict[str, str]
     code = tmp_path / "code"
     scripts = code / "scripts"
     scripts.mkdir(parents=True)
+    nas = scripts / "nas"
+    nas.mkdir()
+    (nas / SCRIPT.name).write_bytes(SCRIPT.read_bytes())
     generator = scripts / "prepare_proposal_verifier_dataset.py"
     generator.write_text(
         """
@@ -142,6 +145,7 @@ def test_generation_directory_and_markers_are_exclusive_and_hash_bound() -> None
     assert 'mktemp "$CONTROL/.outputs.XXXXXX"' in text
     assert 'ln "$temporary" "$INPUT_MARKER"' in text
     assert 'ln "$temporary" "$OUTPUT_MARKER"' in text
+    assert '"$WRAPPER"' in text
     assert "sha256sum -c" in text
     assert 'inventory_generation_sources "$DATASET_INPUT_INVENTORY"' in text
     assert 'inventory_generation_sources "$DATASET_INPUT_INVENTORY_END"' in text

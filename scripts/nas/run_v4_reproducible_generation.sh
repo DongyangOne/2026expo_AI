@@ -23,6 +23,7 @@ DEVICE=${DEVICE:-0}
 SEED=${SEED:-20260901}
 GENERATOR=$CODE_ROOT/scripts/prepare_proposal_verifier_dataset.py
 PREPROCESSING=$CODE_ROOT/scripts/verifier_preprocessing_contract.py
+WRAPPER=$CODE_ROOT/scripts/nas/run_v4_reproducible_generation.sh
 
 case "$SEED" in
   ''|*[!0-9]*) printf '%s\n' "SEED must be a non-negative integer" >&2; exit 64 ;;
@@ -79,6 +80,7 @@ require_file() {
 
 require_file "$GENERATOR"
 require_file "$PREPROCESSING"
+require_file "$WRAPPER"
 require_file "$MODEL_PATH"
 require_file "$DATA_PATH"
 if [ ! -d "$DATASET_DIR" ]; then
@@ -261,7 +263,7 @@ inventory_generation_sources "$DATASET_INPUT_INVENTORY" || fail "failed to inven
 
 INPUT_MARKER=$CONTROL/inputs.sha256
 temporary=$(mktemp "$CONTROL/.inputs.XXXXXX") || fail "failed to create input marker staging file"
-sha256sum "$MODEL_PATH" "$DATA_PATH" "$GENERATOR" "$PREPROCESSING" \
+sha256sum "$MODEL_PATH" "$DATA_PATH" "$GENERATOR" "$PREPROCESSING" "$WRAPPER" \
   "$DATASET_INPUT_INVENTORY" > "$temporary" || fail "failed to hash generation inputs"
 if ! ln "$temporary" "$INPUT_MARKER" 2>/dev/null; then
   rm -f "$temporary"

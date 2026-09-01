@@ -170,6 +170,7 @@ def _validate(
     fixture: dict[str, object],
     *,
     prediction_provider=_AUTHORITATIVE_RUNTIME,
+    diagnostic_only: bool = False,
 ) -> dict:
     if prediction_provider is _AUTHORITATIVE_RUNTIME:
         proposal = fixture["detector_proposal"]
@@ -226,6 +227,7 @@ def _validate(
                 inference_spec=SPEC_PATH,
                 output_manifest=fixture["output"],
                 output_report=fixture["report"],
+                diagnostic_only=diagnostic_only,
             )
         assert replay_roots
         assert all(not root.exists() for root in replay_roots)
@@ -239,6 +241,7 @@ def _validate(
         output_manifest=fixture["output"],
         output_report=fixture["report"],
         prediction_provider=prediction_provider,
+        diagnostic_only=diagnostic_only,
     )
 
 
@@ -268,6 +271,25 @@ def test_rescues_current_manifest_and_preserves_two_object_count_semantics(tmp_p
     assert row["blind_test_eligible"] == "false"
     stored = json.loads(fixture["report"].read_text(encoding="utf-8"))
     assert stored == report
+
+
+def test_runtime_diagnostic_replay_never_grants_lineage_authority(tmp_path):
+    fixture = _fixture(tmp_path)
+
+    report = _validate(fixture, diagnostic_only=True)
+
+    assert report["artifact_role"] == (
+        "v4_runtime_replay_diagnostic_not_lineage_blind_or_deployment_authority"
+    )
+    assert report["ready_for_lineage_upgrade"] is False
+    assert report["lineage_execution_authorized"] is False
+    assert report["blind_test_eligible"] is False
+    assert report["production_deployment_authorized"] is False
+    provenance = report["contract"]["proposal_provenance"]
+    assert provenance["provider_kind"] == "frozen_yolo_runtime"
+    assert provenance["runtime_detector_executed"] is True
+    assert provenance["runtime_top1_replayed"] is True
+    assert provenance["proposal_class_confidence_bbox_matched"] is True
 
 
 def test_cuda_guard_precedes_scan_and_survives_runtime_replay(tmp_path):
