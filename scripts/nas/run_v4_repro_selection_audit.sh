@@ -15,7 +15,7 @@ require_env() {
   fi
 }
 
-for name in AUDIT_DIR CODE_ROOT PILOT_INPUT_DIR
+for name in AUDIT_DIR CODE_ROOT PILOT_INPUT_DIR QUALITY_EXCLUSION_MANIFEST
 do
   require_env "$name"
 done
@@ -24,29 +24,46 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 
 # Reject relative or newline-bearing roots before AUDIT_DIR is created or any
 # CODE_ROOT/PILOT_INPUT_DIR artifact path is derived from them.
-if ! "$PYTHON_BIN" - "$AUDIT_DIR" "$CODE_ROOT" "$PILOT_INPUT_DIR" <<'PY'
-import sys
+if ! "$PYTHON_BIN" - "$AUDIT_DIR" "$CODE_ROOT" "$PILOT_INPUT_DIR" \
+  "$QUALITY_EXCLUSION_MANIFEST" <<'PY'
 import json
+import os
+import sys
 from pathlib import Path
 
 raw_values = dict(zip(
-    ("AUDIT_DIR", "CODE_ROOT", "PILOT_INPUT_DIR"), sys.argv[1:4], strict=True
+    ("AUDIT_DIR", "CODE_ROOT", "PILOT_INPUT_DIR", "QUALITY_EXCLUSION_MANIFEST"),
+    sys.argv[1:5],
+    strict=True,
 ))
+def reject_symlink_components(path: Path, *, description: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"{description} path contains a symlink component")
+
 for name, raw in raw_values.items():
     if "\n" in raw or "\r" in raw or not Path(raw).is_absolute():
         raise ValueError(f"{name} must be an absolute newline-free path")
 audit = Path(raw_values["AUDIT_DIR"]).resolve(strict=False)
 code_arg = Path(raw_values["CODE_ROOT"])
 pilot_arg = Path(raw_values["PILOT_INPUT_DIR"])
+quality_arg = Path(raw_values["QUALITY_EXCLUSION_MANIFEST"])
 if (
     code_arg.is_symlink()
     or pilot_arg.is_symlink()
     or not code_arg.is_dir()
     or not pilot_arg.is_dir()
+    or quality_arg.is_symlink()
+    or not quality_arg.is_file()
 ):
-    raise ValueError("CODE_ROOT and PILOT_INPUT_DIR must be regular directories")
+    raise ValueError("code, pilot, and quality exclusion inputs must be regular")
+reject_symlink_components(quality_arg, description="QUALITY_EXCLUSION_MANIFEST")
 code = code_arg.resolve(strict=True)
 pilot = pilot_arg.resolve(strict=True)
+quality = quality_arg.resolve(strict=True)
 inventory_path = pilot / "selection_inventory.json"
 if inventory_path.is_symlink() or not inventory_path.is_file():
     raise ValueError("pilot selection inventory must be a regular file")
@@ -75,6 +92,12 @@ for protected_name, protected in (
         pass
     else:
         raise ValueError(f"AUDIT_DIR must not contain {protected_name}")
+try:
+    quality.relative_to(audit)
+except ValueError:
+    pass
+else:
+    raise ValueError("AUDIT_DIR must not contain the quality exclusion manifest")
 PY
 then
   printf '%s\n' "audit roots must be absolute paths" >&2
@@ -84,6 +107,7 @@ fi
 WRAPPER=$CODE_ROOT/scripts/nas/run_v4_repro_selection_audit.sh
 PILOT_BUILDER=$CODE_ROOT/scripts/build_v4_repro_pilot_inputs.py
 PROPOSAL_PREPARE=$CODE_ROOT/scripts/prepare_proposal_verifier_dataset.py
+QUALITY_MANIFEST=$QUALITY_EXCLUSION_MANIFEST
 
 if [ -e "$AUDIT_DIR" ] || [ -L "$AUDIT_DIR" ]; then
   printf '%s\n' "refusing to reuse immutable AUDIT_DIR: $AUDIT_DIR" >&2
@@ -138,7 +162,7 @@ fail() {
   exit "$code"
 }
 
-for artifact in "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE"
+for artifact in "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" "$QUALITY_MANIFEST"
 do
   if [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
     fail "missing or empty audit dependency: $artifact" 66
@@ -150,7 +174,7 @@ fi
 
 if ! "$PYTHON_BIN" - \
   "$AUDIT_DIR" "$RECOMPUTE" "$CODE_ROOT" "$PILOT_INPUT_DIR" \
-  "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" <<'PY'
+  "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" "$QUALITY_MANIFEST" <<'PY'
 import hashlib
 import json
 import os
@@ -168,16 +192,17 @@ from pathlib import Path
     wrapper_arg,
     builder_arg,
     proposal_arg,
-) = map(Path, sys.argv[1:8])
+    quality_arg,
+) = map(Path, sys.argv[1:9])
 
 ROLE = (
     "v4_repro_selection_audit_cpu_only_diagnostic_"
     "not_generation_training_blind_or_deployment_authority"
 )
-AUDIT_CONTRACT = "v4_repro_selection_audit.cpu_only_byte_exact.v1"
+AUDIT_CONTRACT = "v4_repro_selection_audit.cpu_only_byte_exact.v2"
 SELECTION_CONTRACT = (
     "v4_repro_pilot_inputs."
-    "gt_stratified_historical_observation_priority_blake2b.v3"
+    "gt_stratified_historical_observation_priority_blake2b.v4"
 )
 PILOT_ROLE = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
@@ -191,10 +216,44 @@ ARTIFACT_NAMES = (
 )
 SEALED_NAMES = (*ARTIFACT_NAMES, "inputs.sha256", "input_ready.json")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+QUALITY_CONTRACT = "v4_capture_quality_exclusions.sha256_reason_only.v1"
+QUALITY_ROLE = (
+    "v4_capture_quality_exclusion_manifest_selection_only_"
+    "not_ground_truth_or_authority"
+)
+QUALITY_REASONS = {
+    "captured_before_2026_08_01",
+    "severe_frame_crop",
+    "person_occlusion_or_dominance",
+    "clutter_or_multiple_objects",
+    "boundary_unreadable",
+    "objective_unreadable",
+    "resolution_too_low",
+    "extreme_exposure",
+}
+QUALITY_AUTHORITY = {
+    "selection": False,
+    "ground_truth": False,
+    "replay": False,
+    "training": False,
+    "calibration": False,
+    "blind_test": False,
+    "deployment": False,
+}
+QUALITY_MAX_SOURCES = 100
 
 
 def identity(value: os.stat_result) -> tuple[int, int, int, int]:
     return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+
+
+def reject_symlink_components(path: Path, *, description: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"{description} path contains a symlink component")
 
 
 def stable_bytes(path: Path, *, description: str) -> bytes:
@@ -226,10 +285,21 @@ def stable_sha(path: Path, *, description: str) -> str:
     return sha_bytes(stable_bytes(path, description=description))
 
 
+def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for key, item in pairs:
+        if key in parsed:
+            raise ValueError(f"JSON object contains duplicate key: {key}")
+        parsed[key] = item
+    return parsed
+
+
 def load_object(path: Path, *, description: str) -> tuple[dict[str, object], bytes]:
     content = stable_bytes(path, description=description)
     try:
-        value = json.loads(content.decode("utf-8"))
+        value = json.loads(
+            content.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+        )
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid {description}: {path}") from error
     if not isinstance(value, dict):
@@ -319,6 +389,163 @@ def json_bytes(value: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def exact_json_equal(actual: object, expected: object) -> bool:
+    try:
+        options = {
+            "ensure_ascii": False,
+            "sort_keys": True,
+            "separators": (",", ":"),
+            "allow_nan": False,
+        }
+        return json.dumps(actual, **options) == json.dumps(expected, **options)
+    except (TypeError, ValueError):
+        return False
+
+
+def canonical_quality_entries_bytes(entries: list[dict[str, str]]) -> bytes:
+    return (
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def validate_quality_manifest(
+    value: dict[str, object], content: bytes
+) -> tuple[set[str], dict[str, object], dict[str, object]]:
+    expected_keys = {
+        "schema_version", "artifact_role", "quality_exclusion_contract",
+        "status", "excluded_source_count", "reason_counts",
+        "max_excluded_sources", "source_list_sha256", "entries", "authority",
+    }
+    if set(value) != expected_keys:
+        raise ValueError("quality exclusion manifest schema keys are not exact")
+    authority = value.get("authority")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or value.get("artifact_role") != QUALITY_ROLE
+        or value.get("quality_exclusion_contract") != QUALITY_CONTRACT
+        or value.get("status") != "quality_exclusions_ready"
+        or not exact_json_equal(authority, QUALITY_AUTHORITY)
+        or type(value.get("max_excluded_sources")) is not int
+        or value.get("max_excluded_sources") != QUALITY_MAX_SOURCES
+    ):
+        raise ValueError("quality exclusion manifest contract or authority mismatch")
+    entries = value.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("quality exclusion entries must be a non-empty list")
+    if len(entries) > QUALITY_MAX_SOURCES:
+        raise ValueError("quality exclusion entries exceed bounded maximum")
+    normalized: list[dict[str, str]] = []
+    excluded: set[str] = set()
+    reason_counts: dict[str, int] = {}
+    for index, row in enumerate(entries):
+        if not isinstance(row, dict) or set(row) != {"source_sha256", "reason"}:
+            raise ValueError(f"quality exclusion entry {index} is malformed")
+        source_sha = row.get("source_sha256")
+        reason = row.get("reason")
+        if not isinstance(source_sha, str) or not SHA_RE.fullmatch(source_sha):
+            raise ValueError(f"quality exclusion entry {index} source SHA is invalid")
+        if source_sha in excluded:
+            raise ValueError(f"quality exclusion entry {index} duplicates source SHA")
+        if reason not in QUALITY_REASONS:
+            raise ValueError(f"quality exclusion entry {index} reason is unknown")
+        excluded.add(source_sha)
+        normalized.append({"source_sha256": source_sha, "reason": str(reason)})
+        reason_counts[str(reason)] = reason_counts.get(str(reason), 0) + 1
+    normalized.sort(key=lambda row: row["source_sha256"])
+    if entries != normalized:
+        raise ValueError("quality exclusion entries are not canonical SHA order")
+    canonical_sha = sha_bytes(canonical_quality_entries_bytes(normalized))
+    if value.get("source_list_sha256") != canonical_sha:
+        raise ValueError("quality exclusion canonical source-list hash mismatch")
+    expected_counts = dict(sorted(reason_counts.items()))
+    declared_counts = value.get("reason_counts")
+    if (
+        type(value.get("excluded_source_count")) is not int
+        or value.get("excluded_source_count") != len(excluded)
+        or not isinstance(declared_counts, dict)
+        or any(
+            type(count) is not int or count <= 0
+            for count in declared_counts.values()
+        )
+        or not exact_json_equal(declared_counts, expected_counts)
+    ):
+        raise ValueError("quality exclusion counts are inconsistent")
+    full = {
+        "required": True,
+        "manifest_contract": QUALITY_CONTRACT,
+        "manifest_path": quality.resolve(strict=True).as_posix(),
+        "manifest_sha256": sha_bytes(content),
+        "source_list_sha256": canonical_sha,
+        "excluded_source_count": len(excluded),
+        "max_excluded_sources": QUALITY_MAX_SOURCES,
+        "reason_counts": expected_counts,
+        "selection_authority": False,
+        "ground_truth_authority": False,
+        "replay_authority": False,
+        "training_authority": False,
+        "calibration_authority": False,
+        "blind_test_authority": False,
+        "deployment_authority": False,
+    }
+    sanitized = dict(full)
+    sanitized.pop("manifest_path")
+    return excluded, full, sanitized
+
+
+def verify_selected_lists_exclude_quality_sources(
+    inventory_value: dict[str, object],
+    train_content: bytes,
+    validation_content: bytes,
+    excluded: set[str],
+    *,
+    description: str,
+) -> None:
+    rows = inventory_value.get("selected_sources")
+    if not isinstance(rows, list):
+        raise ValueError(f"{description} selected source rows are missing")
+    expected_paths: dict[str, set[str]] = {"training": set(), "validation": set()}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"{description} selected row {index} is malformed")
+        split = row.get("split")
+        raw_path = row.get("path")
+        source_sha = row.get("source_sha256")
+        if (
+            split not in expected_paths
+            or not isinstance(raw_path, str)
+            or not Path(raw_path).is_absolute()
+            or not isinstance(source_sha, str)
+            or not SHA_RE.fullmatch(source_sha)
+        ):
+            raise ValueError(f"{description} selected row {index} binding is invalid")
+        if source_sha in excluded:
+            raise ValueError(f"{description} contains a quality-excluded source SHA")
+        source_path = Path(raw_path)
+        if stable_sha(source_path, description=f"{description} selected source") != source_sha:
+            raise ValueError(f"{description} selected source SHA binding mismatch")
+        if raw_path in expected_paths[str(split)]:
+            raise ValueError(f"{description} selected source path is duplicated")
+        expected_paths[str(split)].add(raw_path)
+    for split, content in (
+        ("training", train_content),
+        ("validation", validation_content),
+    ):
+        try:
+            lines = content.decode("utf-8").splitlines()
+        except UnicodeError as error:
+            raise ValueError(f"{description} {split} list is not UTF-8") from error
+        if len(lines) != len(set(lines)) or set(lines) != expected_paths[split]:
+            raise ValueError(f"{description} {split} list differs from inventory")
+
+
 audit = audit_arg.resolve(strict=True)
 normalized_recompute = (audit / "recompute").resolve(strict=False)
 code = code_arg.resolve(strict=True)
@@ -333,13 +560,23 @@ if (
     or wrapper_arg.is_symlink()
     or builder_arg.is_symlink()
     or proposal_arg.is_symlink()
+    or quality_arg.is_symlink()
     or not audit.is_dir()
     or not code.is_dir()
     or not pilot.is_dir()
+    or not quality_arg.is_file()
 ):
-    raise ValueError("audit, code, and pilot paths must be regular directories")
+    raise ValueError("audit, code, pilot, and quality paths are invalid")
+reject_symlink_components(quality_arg, description="quality exclusion manifest")
+quality = quality_arg.resolve(strict=True)
 ensure_disjoint(audit, pilot, description="AUDIT_DIR and PILOT_INPUT_DIR must be independent")
 ensure_disjoint(audit, code, description="AUDIT_DIR and CODE_ROOT must be independent")
+try:
+    quality.relative_to(audit)
+except ValueError:
+    pass
+else:
+    raise ValueError("quality exclusion manifest must be outside AUDIT_DIR")
 if recompute_arg.resolve(strict=False) != normalized_recompute:
     raise ValueError("recompute path does not normalize beneath AUDIT_DIR")
 if recompute_arg.exists() or recompute_arg.is_symlink():
@@ -353,11 +590,24 @@ pilot_contents = {
     for name, path in pilot_paths.items()
 }
 pilot_hashes = {name: sha_bytes(content) for name, content in pilot_contents.items()}
+quality_value, quality_content = load_object(
+    quality, description="quality exclusion manifest"
+)
+excluded_source_shas, expected_quality, sanitized_quality = validate_quality_manifest(
+    quality_value, quality_content
+)
+quality_sha = sha_bytes(quality_content)
 artifact_hashes = {name: pilot_hashes[name] for name in ARTIFACT_NAMES}
 parse_inputs_marker(pilot_contents["inputs.sha256"], artifact_hashes)
 try:
-    ready = json.loads(pilot_contents["input_ready.json"].decode("utf-8"))
-    inventory = json.loads(pilot_contents["selection_inventory.json"].decode("utf-8"))
+    ready = json.loads(
+        pilot_contents["input_ready.json"].decode("utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+    )
+    inventory = json.loads(
+        pilot_contents["selection_inventory.json"].decode("utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+    )
 except (UnicodeError, json.JSONDecodeError) as error:
     raise ValueError("pilot JSON artifact is invalid") from error
 if not isinstance(ready, dict) or not isinstance(inventory, dict):
@@ -444,6 +694,46 @@ if not isinstance(universe_sha, str) or not SHA_RE.fullmatch(universe_sha):
 if bindings.get("resolved_universe_sha256") != universe_sha:
     raise ValueError("pilot universe binding mismatch")
 
+inventory_quality = inventory.get("quality_exclusion")
+ready_quality = ready.get("quality_exclusion")
+if not isinstance(inventory_quality, dict):
+    raise ValueError("pilot quality exclusion binding is missing")
+matched_resolved_sources = inventory_quality.get("matched_resolved_sources")
+if (
+    type(matched_resolved_sources) is not int
+    or matched_resolved_sources != len(excluded_source_shas)
+):
+    raise ValueError("pilot quality exclusion resolved-source count is invalid")
+expected_inventory_quality = {
+    **expected_quality,
+    "matched_resolved_sources": matched_resolved_sources,
+}
+if not exact_json_equal(inventory_quality, expected_inventory_quality):
+    raise ValueError("pilot quality exclusion binding does not match exact manifest")
+if not exact_json_equal(ready_quality, sanitized_quality):
+    raise ValueError("pilot ready quality exclusion binding mismatch")
+if (
+    inventory_bindings.get("quality_exclusion_manifest_path")
+    != quality.as_posix()
+    or inventory_bindings.get("quality_exclusion_manifest_sha256") != quality_sha
+):
+    raise ValueError("pilot inventory quality exclusion path/hash mismatch")
+selected_rows = inventory.get("selected_sources")
+if not isinstance(selected_rows, list):
+    raise ValueError("pilot selected source rows are missing")
+for index, row in enumerate(selected_rows):
+    if not isinstance(row, dict):
+        raise ValueError(f"pilot selected source row {index} is malformed")
+    if row.get("source_sha256") in excluded_source_shas:
+        raise ValueError("pilot selection contains a quality-excluded source SHA")
+verify_selected_lists_exclude_quality_sources(
+    inventory,
+    pilot_contents["train_pilot.txt"],
+    pilot_contents["validation_pilot.txt"],
+    excluded_source_shas,
+    description="pilot selection",
+)
+
 bound_selector_raw = inventory_bindings.get("selector_path")
 if not isinstance(bound_selector_raw, str) or not Path(bound_selector_raw).is_absolute():
     raise ValueError("pilot selector path binding is invalid")
@@ -510,6 +800,8 @@ command = [
     os.fspath(dataset_dir),
     "--output-dir",
     os.fspath(normalized_recompute),
+    "--quality-exclusion-manifest",
+    os.fspath(quality),
     "--seed",
     str(seed),
     "--train-quota-per-stratum",
@@ -538,6 +830,7 @@ post_run_expected = {
     builder_arg: (builder_sha, "pilot selector"),
     proposal_arg: (proposal_sha, "pilot proposal generator"),
     data_path: (data_sha, "pilot data YAML"),
+    quality: (quality_sha, "quality exclusion manifest"),
     **{
         pilot_paths[name]: (pilot_hashes[name], f"pilot {name}")
         for name in SEALED_NAMES
@@ -584,9 +877,13 @@ recomputed_artifact_hashes = {
 }
 parse_inputs_marker(recomputed_contents["inputs.sha256"], recomputed_artifact_hashes)
 try:
-    recomputed_ready = json.loads(recomputed_contents["input_ready.json"].decode("utf-8"))
+    recomputed_ready = json.loads(
+        recomputed_contents["input_ready.json"].decode("utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+    )
     recomputed_inventory = json.loads(
-        recomputed_contents["selection_inventory.json"].decode("utf-8")
+        recomputed_contents["selection_inventory.json"].decode("utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
     )
 except (UnicodeError, json.JSONDecodeError) as error:
     raise ValueError("recomputed selector JSON artifact is invalid") from error
@@ -605,6 +902,38 @@ for value, description, status in (
         or value.get("seed") != seed
     ):
         raise ValueError(f"{description} contract, status, or seed mismatch")
+recomputed_quality = recomputed_inventory.get("quality_exclusion")
+recomputed_matched = (
+    recomputed_quality.get("matched_resolved_sources")
+    if isinstance(recomputed_quality, dict)
+    else None
+)
+if (
+    type(recomputed_matched) is not int
+    or recomputed_matched != len(excluded_source_shas)
+    or not exact_json_equal(
+        recomputed_quality,
+        {**expected_quality, "matched_resolved_sources": recomputed_matched},
+    )
+    or not exact_json_equal(
+        recomputed_ready.get("quality_exclusion"), sanitized_quality
+    )
+):
+    raise ValueError("recomputed selector quality exclusion binding mismatch")
+recomputed_selected = recomputed_inventory.get("selected_sources")
+if not isinstance(recomputed_selected, list) or any(
+    not isinstance(row, dict)
+    or row.get("source_sha256") in excluded_source_shas
+    for row in recomputed_selected
+):
+    raise ValueError("recomputed selection contains a quality-excluded source")
+verify_selected_lists_exclude_quality_sources(
+    recomputed_inventory,
+    recomputed_contents["train_pilot.txt"],
+    recomputed_contents["validation_pilot.txt"],
+    excluded_source_shas,
+    description="recomputed selection",
+)
 recomputed_ready_bindings = recomputed_ready.get("bindings")
 if not isinstance(recomputed_ready_bindings, dict):
     raise ValueError("recomputed ready bindings are missing")
@@ -662,6 +991,8 @@ evidence = {
     "seed": seed,
     "quota_per_stratum": {"training": train_quota, "validation": validation_quota},
     "selected_sources": selected_sources,
+    "quality_exclusion": expected_inventory_quality,
+    "quality_exclusion_dataset_membership_verified_by_selector_replay": True,
     "comparisons": {
         "selection_inventory_json_byte_exact": True,
         "train_pilot_txt_byte_exact": True,
@@ -680,6 +1011,8 @@ evidence = {
         "data_sha256": data_sha,
         "dataset_dir": dataset_dir.as_posix(),
         "resolved_universe_sha256": universe_sha,
+        "quality_exclusion_manifest_path": quality.as_posix(),
+        "quality_exclusion_manifest_sha256": quality_sha,
         "historical_manifest_path": old_manifest.as_posix() if old_manifest else None,
         "historical_manifest_sha256": old_sha,
         "drift_report_path": drift_report.as_posix() if drift_report else None,
@@ -730,6 +1063,10 @@ if stable_sha(marker_path, description="selection audit marker") != sha_bytes(
     marker_content
 ):
     raise RuntimeError("selection audit marker changed before ready")
+if stable_sha(
+    quality, description="pre-ready quality exclusion manifest"
+) != quality_sha:
+    raise RuntimeError("quality exclusion manifest changed before ready")
 
 ready_out = {
     "schema_version": 1,
@@ -741,6 +1078,8 @@ ready_out = {
     "seed": seed,
     "quota_per_stratum": {"training": train_quota, "validation": validation_quota},
     "selected_sources": selected_sources,
+    "quality_exclusion": sanitized_quality,
+    "quality_exclusion_dataset_membership_verified_by_selector_replay": True,
     "byte_exact_artifacts": [
         "selection_inventory.json",
         "train_pilot.txt",
@@ -753,6 +1092,8 @@ ready_out = {
         "recompute_artifacts": recomputed_hashes,
         "selection_audit_evidence_sha256": evidence_sha,
         "resolved_universe_sha256": universe_sha,
+        "quality_exclusion_manifest_path": quality.as_posix(),
+        "quality_exclusion_manifest_sha256": quality_sha,
     },
     **authority_false,
 }

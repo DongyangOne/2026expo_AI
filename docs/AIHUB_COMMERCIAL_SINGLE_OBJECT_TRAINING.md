@@ -101,6 +101,18 @@ Pi 서버의 2026-08-01 00:00 KST 이후 캡처는 141건, SHA-256 중복 제거
   배포하지 않으며 lineage에 `portable=false`와
   `local_only_contains_absolute_paths=true`를 기록한다.
 
+`2026-08-01` 이전 제외 규칙은 이 운영 캡처에만 적용한다. AI Hub 원본은 촬영일이 아니라
+상용 이용 조건, 단일 객체 라벨, 해상도·bbox·노출·중복 등의 데이터 품질 기준으로
+선별한다.
+
+이미 확인된 촬영 실패가 v4 재현 pilot의 우선 anchor로 다시 뽑히지 않도록 SHA-only
+품질 제외 manifest를 사용한다. `scripts/build_v4_quality_exclusion_manifest.py`는 원본
+경로를 결과에 남기지 않고 `source_sha256`과 허용된 제외 사유만 기록하며, 최대 100개로
+제한한다. selector와 별도 CPU selection audit가 현재 데이터셋 membership과 완전 제외를
+재검증하고, GPU validator는 봉인된 audit 증거와 raw manifest 부재를 확인한다. 이
+manifest는 정답·학습·calibration·blind·배포 권한이 없으며, 유효한 캔·병·종이의
+구김·찌그러짐·압착을 촬영 실패로 제외하는 용도로 사용할 수 없다.
+
 관련 스크립트는 `prepare_operational_capture_queue.py`와
 `label_operational_captures_ollama.py`다.
 

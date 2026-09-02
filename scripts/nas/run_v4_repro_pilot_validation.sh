@@ -17,7 +17,7 @@ require_env() {
 
 for name in \
   VALIDATION_DIR CODE_ROOT GEN_DIR PILOT_INPUT_DIR SELECTION_AUDIT_DIR \
-  DETECTOR_MODEL INFERENCE_SPEC
+  QUALITY_EXCLUSION_MANIFEST DETECTOR_MODEL INFERENCE_SPEC
 do
   require_env "$name"
 done
@@ -30,6 +30,7 @@ AUDIT_WRAPPER=$CODE_ROOT/scripts/nas/run_v4_repro_selection_audit.sh
 PILOT_BUILDER=$CODE_ROOT/scripts/build_v4_repro_pilot_inputs.py
 PROPOSAL_PREPARE=$CODE_ROOT/scripts/prepare_proposal_verifier_dataset.py
 PREPROCESSING=$CODE_ROOT/scripts/verifier_preprocessing_contract.py
+QUALITY_MANIFEST=$QUALITY_EXCLUSION_MANIFEST
 PILOT_READY=$PILOT_INPUT_DIR/input_ready.json
 PILOT_INPUTS=$PILOT_INPUT_DIR/inputs.sha256
 PILOT_INVENTORY=$PILOT_INPUT_DIR/selection_inventory.json
@@ -141,6 +142,7 @@ for artifact in \
   "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$AUDIT_WRAPPER" \
   "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
   "$PREPROCESSING" "$DETECTOR_MODEL" "$INFERENCE_SPEC" \
+  "$QUALITY_MANIFEST" \
   "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
   "$PILOT_TRAIN" "$PILOT_VALIDATION" \
   "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" "$SELECTION_AUDIT_EVIDENCE" \
@@ -161,9 +163,19 @@ if [ -e "$PILOT_INPUT_DIR/failed.txt" ] || [ -L "$PILOT_INPUT_DIR/failed.txt" ];
 fi
 
 if ! "$PYTHON_BIN" - \
-  "$VALIDATION_DIR" "$GEN_DIR" "$PILOT_INPUT_DIR" "$SELECTION_AUDIT_DIR" <<'PY'
+  "$VALIDATION_DIR" "$GEN_DIR" "$PILOT_INPUT_DIR" "$SELECTION_AUDIT_DIR" \
+  "$QUALITY_MANIFEST" <<'PY'
+import os
 import sys
 from pathlib import Path
+
+def reject_symlink_components(path: Path, *, description: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"{description} path contains a symlink component")
 
 validation = Path(sys.argv[1]).resolve()
 generation = Path(sys.argv[2]).resolve()
@@ -172,6 +184,15 @@ audit_arg = Path(sys.argv[4])
 if not audit_arg.is_absolute() or audit_arg.is_symlink() or not audit_arg.is_dir():
     raise ValueError("SELECTION_AUDIT_DIR must be an absolute regular directory")
 audit = audit_arg.resolve(strict=True)
+quality_arg = Path(sys.argv[5])
+if (
+    not quality_arg.is_absolute()
+    or quality_arg.is_symlink()
+    or not quality_arg.is_file()
+    or quality_arg.stat().st_size <= 0
+):
+    raise ValueError("QUALITY_EXCLUSION_MANIFEST must be an absolute regular file")
+reject_symlink_components(quality_arg, description="QUALITY_EXCLUSION_MANIFEST")
 roots = {
     "VALIDATION_DIR": validation,
     "GEN_DIR": generation,
@@ -189,7 +210,7 @@ for outer_name, outer in roots.items():
         raise ValueError(f"{inner_name} must not be inside {outer_name}")
 PY
 then
-  fail "generation, validation, pilot, and selection audit directories are not independent" 64
+  fail "generation, validation, pilot, selection audit, or quality manifest path is invalid" 64
 fi
 
 verify_raw_inventory() {
@@ -274,6 +295,7 @@ verify_pilot_contract() {
     "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
     "$PILOT_TRAIN" "$PILOT_VALIDATION" "$PILOT_BUILDER" \
     "$PROPOSAL_PREPARE" "$PREPROCESSING" "$AUDIT_WRAPPER" \
+    "$QUALITY_MANIFEST" \
     "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" \
     "$SELECTION_AUDIT_EVIDENCE" \
     "$SELECTION_AUDIT_RECOMPUTE" "$SELECTION_AUDIT_INVENTORY" \
@@ -283,6 +305,7 @@ verify_pilot_contract() {
 import csv
 import hashlib
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -293,24 +316,39 @@ import yaml
 (
     ready_path, marker_path, inventory_path, yaml_path, train_path, val_path,
     builder_path, proposal_path, preprocessing_path, audit_wrapper_path,
-    audit_ready_path,
+    quality_manifest_path, audit_ready_path,
     audit_marker_path, audit_evidence_path, recompute_dir,
     recomputed_inventory, recomputed_train,
     recomputed_validation, recomputed_yaml, recomputed_inputs, recomputed_ready,
-) = map(Path, sys.argv[1:21])
+) = map(Path, sys.argv[1:22])
 role = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
     "not_training_blind_or_deployment_authority"
 )
 contract = (
     "v4_repro_pilot_inputs."
-    "gt_stratified_historical_observation_priority_blake2b.v3"
+    "gt_stratified_historical_observation_priority_blake2b.v4"
 )
 audit_role = (
     "v4_repro_selection_audit_cpu_only_diagnostic_"
     "not_generation_training_blind_or_deployment_authority"
 )
-audit_contract = "v4_repro_selection_audit.cpu_only_byte_exact.v1"
+audit_contract = "v4_repro_selection_audit.cpu_only_byte_exact.v2"
+quality_contract = "v4_capture_quality_exclusions.sha256_reason_only.v1"
+quality_role = (
+    "v4_capture_quality_exclusion_manifest_selection_only_"
+    "not_ground_truth_or_authority"
+)
+quality_reasons = {
+    "captured_before_2026_08_01",
+    "severe_frame_crop",
+    "person_occlusion_or_dominance",
+    "clutter_or_multiple_objects",
+    "boundary_unreadable",
+    "objective_unreadable",
+    "resolution_too_low",
+    "extreme_exposure",
+}
 materials = (
     "can", "pet", "paper", "plastic", "styrofoam", "vinyl", "glass",
     "battery", "fluorescent",
@@ -322,11 +360,175 @@ expected_counts = {
 }
 expected_shortages = {name: 0 for name in expected_counts}
 
+def reject_symlink_components(path: Path, *, description: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"{description} path contains a symlink component")
+
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def exact_json_equal(actual, expected) -> bool:
+    try:
+        return json.dumps(
+            actual, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ) == json.dumps(
+            expected, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return False
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"quality exclusion manifest contains duplicate key: {key}")
+        value[key] = item
+    return value
+
+if (
+    not quality_manifest_path.is_absolute()
+    or quality_manifest_path.is_symlink()
+    or not quality_manifest_path.is_file()
+    or quality_manifest_path.stat().st_size <= 0
+):
+    raise ValueError("quality exclusion manifest path is not an absolute regular file")
+reject_symlink_components(
+    quality_manifest_path, description="quality exclusion manifest"
+)
+quality_manifest_sha = sha(quality_manifest_path)
+try:
+    quality_manifest = json.loads(
+        quality_manifest_path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+    )
+except (UnicodeError, json.JSONDecodeError) as error:
+    raise ValueError("quality exclusion manifest is not valid UTF-8 JSON") from error
+quality_manifest_keys = {
+    "schema_version", "artifact_role", "quality_exclusion_contract", "status",
+    "excluded_source_count", "max_excluded_sources", "reason_counts",
+    "source_list_sha256", "entries", "authority",
+}
+if not isinstance(quality_manifest, dict) or set(quality_manifest) != quality_manifest_keys:
+    raise ValueError("quality exclusion manifest top-level schema is not exact")
+if (
+    type(quality_manifest.get("schema_version")) is not int
+    or quality_manifest.get("schema_version") != 1
+    or quality_manifest.get("artifact_role") != quality_role
+    or quality_manifest.get("quality_exclusion_contract") != quality_contract
+    or quality_manifest.get("status") != "quality_exclusions_ready"
+    or type(quality_manifest.get("max_excluded_sources")) is not int
+    or quality_manifest.get("max_excluded_sources") != 100
+):
+    raise ValueError("quality exclusion manifest contract is invalid")
+source_list_sha = quality_manifest.get("source_list_sha256")
+if not isinstance(source_list_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", source_list_sha):
+    raise ValueError("quality exclusion source-list provenance hash is invalid")
+quality_authority = quality_manifest.get("authority")
+expected_manifest_authority = {
+    "selection": False,
+    "ground_truth": False,
+    "replay": False,
+    "training": False,
+    "calibration": False,
+    "blind_test": False,
+    "deployment": False,
+}
+if not exact_json_equal(quality_authority, expected_manifest_authority):
+    raise ValueError("quality exclusion manifest grants authority or has invalid authority fields")
+quality_entries = quality_manifest.get("entries")
+if not isinstance(quality_entries, list) or not 1 <= len(quality_entries) <= 100:
+    raise ValueError("quality exclusion manifest entries must contain 1..100 rows")
+excluded_source_ids = set()
+actual_quality_reason_counts = Counter()
+for index, entry in enumerate(quality_entries):
+    if not isinstance(entry, dict) or set(entry) != {"source_sha256", "reason"}:
+        raise ValueError(f"quality exclusion entry schema is invalid at index {index}")
+    source_id = entry.get("source_sha256")
+    reason = entry.get("reason")
+    if not isinstance(source_id, str) or not re.fullmatch(r"[0-9a-f]{64}", source_id):
+        raise ValueError(f"quality exclusion source SHA is invalid at index {index}")
+    if source_id in excluded_source_ids:
+        raise ValueError("quality exclusion manifest contains a duplicate source SHA")
+    if reason not in quality_reasons:
+        raise ValueError(f"quality exclusion reason is not allowlisted: {reason}")
+    excluded_source_ids.add(source_id)
+    actual_quality_reason_counts[reason] += 1
+canonical_quality_entries = sorted(
+    quality_entries,
+    key=lambda entry: (entry["source_sha256"], entry["reason"]),
+)
+if quality_entries != canonical_quality_entries:
+    raise ValueError("quality exclusion manifest entries are not SHA-sorted")
+canonical_quality_bytes = (
+    json.dumps(
+        canonical_quality_entries,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    + "\n"
+).encode("utf-8")
+if source_list_sha != hashlib.sha256(canonical_quality_bytes).hexdigest():
+    raise ValueError("quality exclusion source-list canonical hash mismatch")
+excluded_count = quality_manifest.get("excluded_source_count")
+declared_reason_counts = quality_manifest.get("reason_counts")
+if (
+    type(excluded_count) is not int
+    or excluded_count != len(excluded_source_ids)
+    or not isinstance(declared_reason_counts, dict)
+    or any(type(value) is not int or value <= 0 for value in declared_reason_counts.values())
+    or not exact_json_equal(
+        declared_reason_counts, dict(sorted(actual_quality_reason_counts.items()))
+    )
+    or sum(declared_reason_counts.values()) != excluded_count
+):
+    raise ValueError("quality exclusion manifest count or reason counts mismatch")
+quality_false_fields = {
+    "selection_authority": False,
+    "ground_truth_authority": False,
+    "replay_authority": False,
+    "training_authority": False,
+    "calibration_authority": False,
+    "blind_test_authority": False,
+    "deployment_authority": False,
+}
+expected_inventory_quality = {
+    "required": True,
+    "manifest_contract": quality_contract,
+    "manifest_path": quality_manifest_path.resolve().as_posix(),
+    "manifest_sha256": quality_manifest_sha,
+    "excluded_source_count": excluded_count,
+    "max_excluded_sources": 100,
+    "matched_resolved_sources": excluded_count,
+    "reason_counts": dict(sorted(actual_quality_reason_counts.items())),
+    "source_list_sha256": source_list_sha,
+    **quality_false_fields,
+}
+expected_ready_quality = {
+    key: value
+    for key, value in expected_inventory_quality.items()
+    if key not in {"manifest_path", "matched_resolved_sources"}
+}
+
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+inventory_quality_value = inventory.get("quality_exclusion")
+if not isinstance(inventory_quality_value, dict):
+    raise ValueError("pilot inventory quality exclusion binding is missing")
+matched_resolved_sources = inventory_quality_value.get("matched_resolved_sources")
+if (
+    type(matched_resolved_sources) is not int
+    or matched_resolved_sources != excluded_count
+):
+    raise ValueError("pilot inventory quality exclusion dataset membership count is invalid")
+expected_inventory_quality["matched_resolved_sources"] = matched_resolved_sources
 for value, description, status in (
     (ready, "pilot ready", "pilot_inputs_ready"),
     (inventory, "pilot inventory", "selection_complete_not_replay_validated"),
@@ -339,6 +541,10 @@ for value, description, status in (
         raise ValueError(f"{description} selection contract mismatch")
     if value.get("status") != status:
         raise ValueError(f"{description} status mismatch")
+if not exact_json_equal(inventory.get("quality_exclusion"), expected_inventory_quality):
+    raise ValueError("pilot inventory quality exclusion binding is not exact")
+if not exact_json_equal(ready.get("quality_exclusion"), expected_ready_quality):
+    raise ValueError("pilot ready quality exclusion binding is not exact")
 
 seed = inventory.get("seed")
 ready_seed = ready.get("seed")
@@ -383,6 +589,9 @@ for field in (
     "multi_object_excluded",
     "cross_split_content_duplicates_quarantined",
     "same_split_conflicting_ground_truth_quarantined",
+    "capture_quality_exclusion_manifest_required",
+    "quality_excluded_sources_never_selected",
+    "object_dent_or_crush_is_not_a_capture_quality_exclusion",
 ):
     if source_contract.get(field) is not True:
         raise ValueError(f"pilot source contract does not require {field}")
@@ -433,6 +642,13 @@ if bindings.get("artifacts") != artifact_hashes:
 inventory_bindings = inventory.get("bindings")
 if not isinstance(inventory_bindings, dict):
     raise ValueError("pilot inventory bindings are missing")
+if (
+    inventory_bindings.get("quality_exclusion_manifest_path")
+    != quality_manifest_path.resolve().as_posix()
+    or inventory_bindings.get("quality_exclusion_manifest_sha256")
+    != quality_manifest_sha
+):
+    raise ValueError("pilot inventory quality exclusion path or hash binding mismatch")
 if bindings.get("resolved_universe_sha256") != inventory_bindings.get("resolved_universe_sha256"):
     raise ValueError("pilot ready universe binding mismatch")
 bound_selector_path = inventory_bindings.get("selector_path")
@@ -496,6 +712,7 @@ selection_order_rows = defaultdict(list)
 listed = {"training": [], "validation": []}
 seen_paths = set()
 seen_source_hashes = set()
+selected_sha_by_path = {}
 for row in selected:
     if not isinstance(row, dict):
         raise ValueError("pilot selected source row must be an object")
@@ -522,7 +739,10 @@ for row in selected:
         raise ValueError("pilot selected source SHA is invalid")
     if source_sha in seen_source_hashes:
         raise ValueError("pilot selected source SHA is duplicated")
+    if source_sha in excluded_source_ids:
+        raise ValueError("pilot selection contains a quality-excluded source SHA")
     seen_source_hashes.add(source_sha)
+    selected_sha_by_path[path_text] = source_sha
     rank = row.get("selection_rank_within_stratum")
     score = row.get("selection_score_blake2b128")
     quota = 250 if split == "training" else 100
@@ -723,10 +943,17 @@ def list_lines(path: Path) -> list[str]:
         raise ValueError(f"pilot list is empty, blank, or duplicated: {path}")
     return lines
 
-if list_lines(train_path) != sorted(listed["training"]):
+pilot_train_lines = list_lines(train_path)
+pilot_validation_lines = list_lines(val_path)
+if pilot_train_lines != sorted(listed["training"]):
     raise ValueError("training pilot list differs from selected inventory rows")
-if list_lines(val_path) != sorted(listed["validation"]):
+if pilot_validation_lines != sorted(listed["validation"]):
     raise ValueError("validation pilot list differs from selected inventory rows")
+if any(
+    selected_sha_by_path[path] in excluded_source_ids
+    for path in (*pilot_train_lines, *pilot_validation_lines)
+):
+    raise ValueError("pilot train or validation list contains a quality-excluded source SHA")
 dataset = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
 if not isinstance(dataset, dict):
     raise ValueError("pilot dataset YAML must be an object")
@@ -855,6 +1082,15 @@ if audit_value.get("byte_exact_artifacts") != [
     "selection_inventory.json", "train_pilot.txt", "validation_pilot.txt",
 ]:
     raise ValueError("selection audit ready byte-exact artifact list mismatch")
+if not exact_json_equal(audit_value.get("quality_exclusion"), expected_ready_quality):
+    raise ValueError("selection audit ready quality exclusion binding is not exact")
+if (
+    audit_value.get(
+        "quality_exclusion_dataset_membership_verified_by_selector_replay"
+    )
+    is not True
+):
+    raise ValueError("selection audit ready lacks exact quality exclusion dataset membership attestation")
 for field in (
     "raw_generation_authorized", "validator_authority", "judge_authority",
     "training_authority", "blind_test_authority",
@@ -874,6 +1110,13 @@ expected_recomputed_hashes = {
 }
 if audit_bindings.get("selector_sha256") != sha(builder_path):
     raise ValueError("selection audit selector hash mismatch")
+if (
+    audit_bindings.get("quality_exclusion_manifest_path")
+    != quality_manifest_path.resolve().as_posix()
+    or audit_bindings.get("quality_exclusion_manifest_sha256")
+    != quality_manifest_sha
+):
+    raise ValueError("selection audit ready quality exclusion path or hash mismatch")
 if audit_bindings.get("resolved_universe_sha256") != inventory_bindings.get(
     "resolved_universe_sha256"
 ):
@@ -903,6 +1146,17 @@ if audit_evidence.get("quota_per_stratum") != inventory.get("quota_per_stratum")
     raise ValueError("selection audit evidence quota mismatch")
 if audit_evidence.get("selected_sources") != len(selected):
     raise ValueError("selection audit evidence selected source count mismatch")
+if not exact_json_equal(
+    audit_evidence.get("quality_exclusion"), expected_inventory_quality
+):
+    raise ValueError("selection audit evidence quality exclusion binding is not exact")
+if (
+    audit_evidence.get(
+        "quality_exclusion_dataset_membership_verified_by_selector_replay"
+    )
+    is not True
+):
+    raise ValueError("selection audit evidence lacks exact quality exclusion dataset membership attestation")
 expected_comparisons = {
     "selection_inventory_json_byte_exact": True,
     "train_pilot_txt_byte_exact": True,
@@ -925,6 +1179,13 @@ if not isinstance(evidence_bindings, dict):
     raise ValueError("selection audit evidence bindings are missing")
 if evidence_bindings.get("selector_sha256") != sha(builder_path):
     raise ValueError("selection audit evidence selector hash mismatch")
+if (
+    evidence_bindings.get("quality_exclusion_manifest_path")
+    != quality_manifest_path.resolve().as_posix()
+    or evidence_bindings.get("quality_exclusion_manifest_sha256")
+    != quality_manifest_sha
+):
+    raise ValueError("selection audit evidence quality exclusion path or hash mismatch")
 for field in (
     "wrapper_path", "selector_path", "proposal_generator_path", "data_path",
     "dataset_dir", "historical_manifest_path", "drift_report_path",
@@ -978,6 +1239,30 @@ expected_audit_marker = {
 }
 if declared_audit_hashes != expected_audit_marker:
     raise ValueError("selection audit marker does not bind the exact seven audit artifacts")
+recomputed_inventory_value = json.loads(
+    recomputed_inventory.read_text(encoding="utf-8")
+)
+if not exact_json_equal(
+    recomputed_inventory_value.get("quality_exclusion"), expected_inventory_quality
+):
+    raise ValueError("selection audit recompute quality exclusion binding is not exact")
+recomputed_selected = recomputed_inventory_value.get("selected_sources")
+if (
+    not isinstance(recomputed_selected, list)
+    or any(not isinstance(row, dict) for row in recomputed_selected)
+    or any(row.get("source_sha256") in excluded_source_ids for row in recomputed_selected)
+):
+    raise ValueError("selection audit recompute contains a quality-excluded source SHA")
+recomputed_train_lines = list_lines(recomputed_train)
+recomputed_validation_lines = list_lines(recomputed_validation)
+if any(
+    path not in selected_sha_by_path
+    or selected_sha_by_path[path] in excluded_source_ids
+    for path in (*recomputed_train_lines, *recomputed_validation_lines)
+):
+    raise ValueError(
+        "selection audit recompute train or validation list contains a quality-excluded source SHA"
+    )
 if recomputed_inventory.read_bytes() != inventory_path.read_bytes():
     raise ValueError("selection audit inventory differs from pilot input")
 if recomputed_train.read_bytes() != train_path.read_bytes():
@@ -1011,6 +1296,9 @@ if (
     != sha(recomputed_inputs)
     or recomputed_ready_value.get("bindings", {}).get("artifacts")
     != expected_recomputed_input_hashes
+    or not exact_json_equal(
+        recomputed_ready_value.get("quality_exclusion"), expected_ready_quality
+    )
 ):
     raise ValueError("selection recompute ready marker is invalid")
 PY
@@ -1032,7 +1320,7 @@ seal_or_verify_cohort() {
   if ! "$PYTHON_BIN" - \
     "$mode" "$COHORT_BINDING" "$PILOT_READY" "$PILOT_INVENTORY" \
     "$PILOT_YAML" "$GEN_DATASET_INPUT_INVENTORY" "$RAW_INVENTORY" \
-    "$RAW_MANIFEST" <<'PY'
+    "$RAW_MANIFEST" "$QUALITY_MANIFEST" <<'PY'
 import base64
 import binascii
 import csv
@@ -1048,8 +1336,8 @@ from pathlib import Path
 mode = sys.argv[1]
 (
     output, ready_path, selection_path, pilot_yaml, generation_inventory_path,
-    raw_inventory_path, raw_manifest,
-) = map(Path, sys.argv[2:9])
+    raw_inventory_path, raw_manifest, quality_manifest_path,
+) = map(Path, sys.argv[2:10])
 if mode not in {"create", "verify"}:
     raise ValueError("invalid cohort binding mode")
 sha_re = re.compile(r"^[0-9a-f]{64}$")
@@ -1095,6 +1383,19 @@ def sha(path: Path) -> str:
 
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 selection = json.loads(selection_path.read_text(encoding="utf-8"))
+quality_manifest = json.loads(quality_manifest_path.read_text(encoding="utf-8"))
+quality_entries = quality_manifest.get("entries")
+if not isinstance(quality_entries, list) or not quality_entries:
+    raise ValueError("quality exclusion manifest entries are missing")
+excluded_source_ids = {
+    str(entry.get("source_sha256", ""))
+    for entry in quality_entries
+    if isinstance(entry, dict)
+}
+if len(excluded_source_ids) != len(quality_entries) or any(
+    not sha_re.fullmatch(source_id) for source_id in excluded_source_ids
+):
+    raise ValueError("quality exclusion manifest source SHA set is invalid")
 if ready.get("historical_selection_only") is not True:
     raise ValueError("pilot ready is not bound to historical selection evidence")
 historical = selection.get("historical_selection_evidence")
@@ -1504,6 +1805,8 @@ for line, row in enumerate(raw_rows, start=2):
     if selected_row is None:
         raise ValueError("raw manifest contains a source outside the selected pilot cohort")
     source_id = str(row.get("source_id", "")).strip().lower()
+    if source_id in excluded_source_ids:
+        raise ValueError("raw manifest contains a quality-excluded source SHA")
     if source_id != selected_row["source_sha256"]:
         raise ValueError("raw manifest source_id differs from selected current bytes")
     if row.get("split") != selected_row["split"]:
@@ -1557,6 +1860,11 @@ payload = {
     "historical_background_probe_is_selection_only": True,
     "historical_background_probe_replay_result_assumed": False,
     "historical_selection_only": True,
+    "quality_exclusion_required": True,
+    "quality_excluded_sources": len(excluded_source_ids),
+    "quality_exclusion_dataset_membership_verified": True,
+    "quality_exclusion_membership_attested_by_cpu_selector_audit": True,
+    "quality_exclusion_absent_from_selection_and_raw": True,
     "lineage_execution_authorized": False,
     "training_authority": False,
     "blind_test_authority": False,
@@ -1567,6 +1875,8 @@ payload = {
         "generation_dataset_input_inventory_sha256": sha(generation_inventory_path),
         "raw_manifest_sha256": sha(raw_manifest),
         "raw_output_inventory_sha256": sha(raw_inventory_path),
+        "quality_exclusion_manifest_path": quality_manifest_path.resolve().as_posix(),
+        "quality_exclusion_manifest_sha256": sha(quality_manifest_path),
         "historical_manifest_sha256": old_sha,
         "historical_manifest_size": old_size,
         "historical_drift_report_sha256": drift_sha,
@@ -1868,6 +2178,7 @@ write_marker "$CONTROL/00_raw_generation.sha256" \
   "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$AUDIT_WRAPPER" \
   "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
   "$PREPROCESSING" "$DETECTOR_MODEL" "$INFERENCE_SPEC" \
+  "$QUALITY_MANIFEST" \
   "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
   "$PILOT_TRAIN" "$PILOT_VALIDATION" \
   "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" "$SELECTION_AUDIT_EVIDENCE" \
@@ -1973,6 +2284,19 @@ if cohort.get("selected_background_probes") != cohort.get("emitted_background_pr
     raise ValueError("pilot cohort did not emit every selected background probe")
 if not isinstance(cohort.get("background_probe_replay_categories"), dict):
     raise ValueError("pilot cohort background probe replay distribution is missing")
+if (
+    cohort.get("quality_exclusion_required") is not True
+    or cohort.get("quality_exclusion_dataset_membership_verified") is not True
+    or cohort.get(
+        "quality_exclusion_membership_attested_by_cpu_selector_audit"
+    )
+    is not True
+    or cohort.get("quality_exclusion_absent_from_selection_and_raw") is not True
+    or not isinstance(cohort.get("quality_excluded_sources"), int)
+    or isinstance(cohort.get("quality_excluded_sources"), bool)
+    or cohort.get("quality_excluded_sources") <= 0
+):
+    raise ValueError("pilot cohort quality exclusion evidence is invalid")
 payload = {
     "schema_version": 1,
     "status": "validator_ab_exact_reproduction",
@@ -1994,6 +2318,11 @@ payload = {
     ],
     "historical_background_probe_is_selection_only": True,
     "historical_background_probe_replay_result_assumed": False,
+    "quality_exclusion_required": True,
+    "quality_excluded_sources": cohort["quality_excluded_sources"],
+    "quality_exclusion_dataset_membership_verified": True,
+    "quality_exclusion_membership_attested_by_cpu_selector_audit": True,
+    "quality_exclusion_absent_from_selection_and_raw": True,
     "bindings": {
         "validated_manifest_sha256": a_manifest_sha,
         "validator_a_report_sha256": sha(a_report_path),
@@ -2047,7 +2376,7 @@ if ! "$PYTHON_BIN" - \
   "$SELECTION_AUDIT_INVENTORY" "$SELECTION_AUDIT_TRAIN" \
   "$SELECTION_AUDIT_VALIDATION" "$SELECTION_AUDIT_YAML" \
   "$SELECTION_AUDIT_INPUTS" "$SELECTION_AUDIT_INPUT_READY" \
-  "$COHORT_BINDING" <<'PY'
+  "$QUALITY_MANIFEST" "$COHORT_BINDING" <<'PY'
 import hashlib
 import json
 import os
@@ -2061,8 +2390,8 @@ from pathlib import Path
     selection_audit_marker, selection_audit_evidence,
     selection_audit_inventory, selection_audit_train,
     selection_audit_validation, selection_audit_yaml, selection_audit_inputs,
-    selection_audit_input_ready, cohort_binding,
-) = map(Path, sys.argv[1:26])
+    selection_audit_input_ready, quality_manifest, cohort_binding,
+) = map(Path, sys.argv[1:27])
 if ready.exists() or ready.is_symlink():
     raise FileExistsError("diagnostic ready marker already exists")
 if failed.exists() or failed.is_symlink():
@@ -2095,6 +2424,11 @@ payload = {
     ],
     "historical_background_probe_is_selection_only": True,
     "historical_background_probe_replay_result_assumed": False,
+    "quality_exclusion_required": True,
+    "quality_excluded_sources": comparison_value["quality_excluded_sources"],
+    "quality_exclusion_dataset_membership_verified": True,
+    "quality_exclusion_membership_attested_by_cpu_selector_audit": True,
+    "quality_exclusion_absent_from_selection_and_raw": True,
     "drift_hypothesis_diagnostic_only": True,
     "lineage_execution_authorized": False,
     "judge_authority": False,
@@ -2125,6 +2459,7 @@ payload = {
         "selection_audit_dataset_yaml_sha256": sha(selection_audit_yaml),
         "selection_audit_inputs_marker_sha256": sha(selection_audit_inputs),
         "selection_audit_input_ready_sha256": sha(selection_audit_input_ready),
+        "quality_exclusion_manifest_sha256": sha(quality_manifest),
         "cohort_binding_sha256": sha(cohort_binding),
     },
 }

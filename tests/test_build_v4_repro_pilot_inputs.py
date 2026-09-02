@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import cv2
@@ -179,6 +180,65 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _quality_manifest(tmp_path: Path, entries: list[dict[str, str]] | None = None) -> Path:
+    if entries is None:
+        default_source = tmp_path / "dataset" / "train" / "images" / "unreadable.jpg"
+        assert default_source.is_file()
+        entries = [
+            {
+                "source_sha256": _sha(default_source),
+                "reason": "objective_unreadable",
+            }
+        ]
+    entries = sorted(entries, key=lambda row: row["source_sha256"])
+    reason_counts: dict[str, int] = {}
+    for row in entries:
+        reason_counts[row["reason"]] = reason_counts.get(row["reason"], 0) + 1
+    path = tmp_path / "quality-exclusions.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "artifact_role": (
+                    "v4_capture_quality_exclusion_manifest_selection_only_"
+                    "not_ground_truth_or_authority"
+                ),
+                "quality_exclusion_contract": (
+                    "v4_capture_quality_exclusions.sha256_reason_only.v1"
+                ),
+                "status": "quality_exclusions_ready",
+                "excluded_source_count": len(entries),
+                "max_excluded_sources": 100,
+                "reason_counts": dict(sorted(reason_counts.items())),
+                "source_list_sha256": hashlib.sha256(
+                    (
+                        json.dumps(
+                            entries,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "entries": entries,
+                "authority": {
+                    "selection": False,
+                    "ground_truth": False,
+                    "replay": False,
+                    "training": False,
+                    "calibration": False,
+                    "blind_test": False,
+                    "deployment": False,
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_deterministic_selection_and_invalid_source_quarantine(tmp_path: Path) -> None:
     data, dataset_dir, sources = _fixture(tmp_path)
     first = tmp_path / "pilot-a"
@@ -188,6 +248,7 @@ def test_deterministic_selection_and_invalid_source_quarantine(tmp_path: Path) -
         data_path=data,
         dataset_dir=dataset_dir,
         output_dir=first,
+        quality_exclusion_manifest=_quality_manifest(tmp_path),
         seed=77,
         training_quota=1,
         validation_quota=1,
@@ -196,6 +257,7 @@ def test_deterministic_selection_and_invalid_source_quarantine(tmp_path: Path) -
         data_path=data,
         dataset_dir=dataset_dir,
         output_dir=second,
+        quality_exclusion_manifest=_quality_manifest(tmp_path),
         seed=77,
         training_quota=1,
         validation_quota=1,
@@ -240,6 +302,7 @@ def test_historical_drift_anchor_is_selection_only_and_has_priority(tmp_path: Pa
         data_path=data,
         dataset_dir=dataset_dir,
         output_dir=default_output,
+        quality_exclusion_manifest=_quality_manifest(tmp_path),
         seed=11,
         training_quota=1,
         validation_quota=1,
@@ -284,6 +347,7 @@ def test_historical_drift_anchor_is_selection_only_and_has_priority(tmp_path: Pa
         data_path=data,
         dataset_dir=dataset_dir,
         output_dir=anchored_output,
+        quality_exclusion_manifest=_quality_manifest(tmp_path),
         seed=11,
         training_quota=1,
         validation_quota=1,
@@ -302,6 +366,291 @@ def test_historical_drift_anchor_is_selection_only_and_has_priority(tmp_path: Pa
     assert inventory["historical_selection_evidence"]["drift_report"]["anchor_source_ids"] == 1
     assert inventory["authority"]["training_authorized"] is False
     assert inventory["authority"]["production_deployment_authorized"] is False
+
+
+def test_capture_quality_exclusion_removes_bad_drift_anchor_but_keeps_normal_anchor(
+    tmp_path: Path,
+) -> None:
+    data, dataset_dir, sources = _fixture(tmp_path)
+    bad_anchor = sources["train_can_a"]
+    good_candidate = sources["train_can_b"]
+    old_manifest = tmp_path / "historical-quality.csv"
+    old_manifest.write_text(
+        "source_id,split,category\n"
+        f"{_sha(bad_anchor)},training,can\n"
+        f"{_sha(good_candidate)},training,can\n",
+        encoding="utf-8",
+    )
+    drift = tmp_path / "quality-drift.json"
+    drift.write_text(
+        json.dumps(
+            {
+                "replay": {
+                    "hard_semantic_mismatch_examples": {
+                        "crop_bounds_changed": [
+                            {"source_id": _sha(bad_anchor)},
+                            {"source_id": _sha(good_candidate)},
+                        ]
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    exclusions = _quality_manifest(
+        tmp_path,
+        [
+            {
+                "source_sha256": _sha(bad_anchor),
+                "reason": "severe_frame_crop",
+            }
+        ],
+    )
+    output = tmp_path / "quality-filtered-pilot"
+    build_pilot_inputs(
+        data_path=data,
+        dataset_dir=dataset_dir,
+        output_dir=output,
+        quality_exclusion_manifest=exclusions,
+        training_quota=1,
+        validation_quota=1,
+        old_manifest=old_manifest,
+        drift_report=drift,
+    )
+
+    inventory = _inventory(output)
+    selected_hashes = {row["source_sha256"] for row in inventory["selected_sources"]}
+    assert _sha(bad_anchor) not in selected_hashes
+    assert _sha(good_candidate) in selected_hashes
+    assert inventory["rejections"]["counts"][
+        "quality_excluded/severe_frame_crop"
+    ] == 1
+    assert inventory["quality_exclusion"] == {
+        "required": True,
+        "manifest_contract": "v4_capture_quality_exclusions.sha256_reason_only.v1",
+        "manifest_path": exclusions.resolve().as_posix(),
+        "manifest_sha256": _sha(exclusions),
+        "source_list_sha256": hashlib.sha256(
+            (
+                json.dumps(
+                    [
+                        {
+                            "source_sha256": _sha(bad_anchor),
+                            "reason": "severe_frame_crop",
+                        }
+                    ],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+        ).hexdigest(),
+        "excluded_source_count": 1,
+        "max_excluded_sources": 100,
+        "matched_resolved_sources": 1,
+        "reason_counts": {"severe_frame_crop": 1},
+        "selection_authority": False,
+        "ground_truth_authority": False,
+        "replay_authority": False,
+        "training_authority": False,
+        "calibration_authority": False,
+        "blind_test_authority": False,
+        "deployment_authority": False,
+    }
+    assert inventory["source_contract"][
+        "object_dent_or_crush_is_not_a_capture_quality_exclusion"
+    ] is True
+    assert inventory["bindings"]["quality_exclusion_manifest_sha256"] == _sha(
+        exclusions
+    )
+
+
+def test_quality_exclusion_sha_must_exist_in_resolved_dataset(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    exclusions = _quality_manifest(
+        tmp_path,
+        [
+            {
+                "source_sha256": "f" * 64,
+                "reason": "captured_before_2026_08_01",
+            }
+        ],
+    )
+    output = tmp_path / "unknown-quality-source"
+    with pytest.raises(ValueError, match="absent from the resolved current dataset"):
+        build_pilot_inputs(
+            data_path=data,
+            dataset_dir=dataset_dir,
+            output_dir=output,
+            quality_exclusion_manifest=exclusions,
+            training_quota=1,
+            validation_quota=1,
+        )
+    assert (output / "failed.txt").is_file()
+    assert not (output / "input_ready.json").exists()
+
+
+def test_quality_matched_count_is_unique_sha_not_duplicate_path_count(
+    tmp_path: Path,
+) -> None:
+    data, dataset_dir, sources = _fixture(tmp_path)
+    duplicate_sha = _sha(sources["train_dup_a"])
+    assert duplicate_sha == _sha(sources["train_dup_b"])
+    exclusions = _quality_manifest(
+        tmp_path,
+        [{"source_sha256": duplicate_sha, "reason": "boundary_unreadable"}],
+    )
+    replacement = _write_source(
+        dataset_dir,
+        split="train",
+        name="plastic_replacement",
+        content=b"plastic-replacement",
+        label="3 .5 .5 .4 .4\n",
+    )
+    train_list = dataset_dir / "train.txt"
+    with train_list.open("a", encoding="utf-8") as handle:
+        handle.write(replacement.as_posix() + "\n")
+    output = tmp_path / "duplicate-quality-sha"
+    build_pilot_inputs(
+        data_path=data,
+        dataset_dir=dataset_dir,
+        output_dir=output,
+        quality_exclusion_manifest=exclusions,
+        training_quota=1,
+        validation_quota=1,
+    )
+    inventory = _inventory(output)
+    assert inventory["quality_exclusion"]["excluded_source_count"] == 1
+    assert inventory["quality_exclusion"]["matched_resolved_sources"] == 1
+    assert inventory["rejections"]["counts"][
+        "quality_excluded/boundary_unreadable"
+    ] == 2
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("duplicate", "duplicates source SHA"),
+        ("unknown_reason", "unknown reason"),
+        ("malformed", "malformed"),
+        ("canonical_hash", "canonical source-list hash is inconsistent"),
+        ("too_many", "bounded maximum"),
+        ("duplicate_key", "contains duplicate key"),
+        ("authority_zero", "contract or authority is invalid"),
+        ("schema_true", "contract or authority is invalid"),
+        ("max_float", "contract or authority is invalid"),
+        ("reason_count_bool", "reason counts are inconsistent"),
+    ],
+)
+def test_quality_exclusion_manifest_fails_closed_on_invalid_entries(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    data, dataset_dir, sources = _fixture(tmp_path)
+    source_sha = _sha(sources["train_can_a"])
+    path = _quality_manifest(
+        tmp_path,
+        [{"source_sha256": source_sha, "reason": "severe_frame_crop"}],
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "duplicate":
+        value["entries"].append(dict(value["entries"][0]))
+        value["excluded_source_count"] = 2
+        value["reason_counts"] = {"severe_frame_crop": 2}
+    elif mutation == "unknown_reason":
+        value["entries"][0]["reason"] = "dented_object"
+        value["reason_counts"] = {"dented_object": 1}
+    else:
+        if mutation == "malformed":
+            value["entries"][0]["path"] = "private.jpg"
+        elif mutation == "too_many":
+            value["entries"] = [
+                {
+                    "source_sha256": hashlib.sha256(str(index).encode()).hexdigest(),
+                    "reason": "severe_frame_crop",
+                }
+                for index in range(101)
+            ]
+            value["entries"].sort(key=lambda row: row["source_sha256"])
+            value["excluded_source_count"] = 101
+            value["reason_counts"] = {"severe_frame_crop": 101}
+            value["source_list_sha256"] = hashlib.sha256(
+                (
+                    json.dumps(
+                        value["entries"], sort_keys=True, separators=(",", ":")
+                    )
+                    + "\n"
+                ).encode()
+            ).hexdigest()
+        elif mutation == "duplicate_key":
+            pass
+        elif mutation == "authority_zero":
+            value["authority"]["training"] = 0
+        elif mutation == "schema_true":
+            value["schema_version"] = True
+        elif mutation == "max_float":
+            value["max_excluded_sources"] = 100.0
+        elif mutation == "reason_count_bool":
+            value["reason_counts"] = {"severe_frame_crop": True}
+        else:
+            value["source_list_sha256"] = "f" * 64
+    rendered = json.dumps(value)
+    if mutation == "duplicate_key":
+        rendered = '{"status":"forged",' + rendered[1:]
+    path.write_text(rendered, encoding="utf-8")
+    output = tmp_path / f"invalid-quality-{mutation}"
+    with pytest.raises(ValueError, match=message):
+        build_pilot_inputs(
+            data_path=data,
+            dataset_dir=dataset_dir,
+            output_dir=output,
+            quality_exclusion_manifest=path,
+            training_quota=1,
+            validation_quota=1,
+        )
+    assert (output / "failed.txt").is_file()
+    assert not (output / "input_ready.json").exists()
+
+
+def test_selector_rejects_symlink_quality_manifest_before_resolve(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path)
+    linked = tmp_path / "quality-link.json"
+    try:
+        os.symlink(manifest, linked)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    with pytest.raises(ValueError, match="regular non-symlink file"):
+        build_pilot_inputs(
+            data_path=data,
+            dataset_dir=dataset_dir,
+            output_dir=tmp_path / "symlink-quality-output",
+            quality_exclusion_manifest=linked,
+            training_quota=1,
+            validation_quota=1,
+        )
+
+
+def test_selector_rejects_quality_manifest_ancestor_symlink(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path)
+    real_parent = tmp_path / "real-quality"
+    real_parent.mkdir()
+    copied = real_parent / manifest.name
+    copied.write_bytes(manifest.read_bytes())
+    linked_parent = tmp_path / "linked-quality"
+    try:
+        os.symlink(real_parent, linked_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    with pytest.raises(ValueError, match="quality exclusion manifest path.*symlink"):
+        build_pilot_inputs(
+            data_path=data,
+            dataset_dir=dataset_dir,
+            output_dir=tmp_path / "ancestor-quality-output",
+            quality_exclusion_manifest=linked_parent / manifest.name,
+            training_quota=1,
+            validation_quota=1,
+        )
 
 
 def test_historical_background_probe_fills_quota_without_relabeling(
@@ -330,6 +679,7 @@ def test_historical_background_probe_fills_quota_without_relabeling(
         data_path=data,
         dataset_dir=dataset_dir,
         output_dir=output,
+        quality_exclusion_manifest=_quality_manifest(tmp_path),
         seed=17,
         training_quota=1,
         validation_quota=1,
@@ -468,6 +818,7 @@ def test_historical_background_probe_requires_same_split_membership(
             data_path=data,
             dataset_dir=dataset_dir,
             output_dir=output,
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
             training_quota=1,
             validation_quota=1,
             old_manifest=old_manifest,
@@ -509,6 +860,7 @@ def test_historical_manifest_mutation_is_detected_before_ready(
             data_path=data,
             dataset_dir=dataset_dir,
             output_dir=output,
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
             training_quota=1,
             validation_quota=1,
             old_manifest=old_manifest,
@@ -637,6 +989,7 @@ def test_ready_marker_binds_every_input_and_is_published_last(tmp_path: Path) ->
         data_path=data,
         dataset_dir=dataset_dir,
         output_dir=output,
+        quality_exclusion_manifest=_quality_manifest(tmp_path),
         seed=99,
         training_quota=1,
         validation_quota=1,
@@ -681,6 +1034,7 @@ def test_failure_after_directory_creation_publishes_failed_without_ready(
             data_path=data,
             dataset_dir=dataset_dir,
             output_dir=output,
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -709,6 +1063,7 @@ def test_unreadable_required_source_causes_shortage_failure(tmp_path: Path) -> N
             data_path=data,
             dataset_dir=dataset_dir,
             output_dir=output,
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -737,6 +1092,7 @@ def test_ready_publish_race_also_publishes_failure(
             data_path=data,
             dataset_dir=dataset_dir,
             output_dir=output,
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -761,6 +1117,7 @@ def test_existing_output_directory_is_never_reused(tmp_path: Path) -> None:
             data_path=data,
             dataset_dir=dataset_dir,
             output_dir=output,
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -778,6 +1135,7 @@ def test_builder_rejects_non_exact_integer_seed(tmp_path: Path, seed: object) ->
             data_path=data,
             dataset_dir=dataset_dir,
             output_dir=tmp_path / "pilot-invalid-seed",
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
             seed=seed,  # type: ignore[arg-type]
             training_quota=1,
             validation_quota=1,

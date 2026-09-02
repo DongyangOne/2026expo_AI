@@ -49,6 +49,36 @@ YOLOE-26을 지원한다. 따라서 모델 이름만 바꾸는 재학습보다 �
    `teacher_required`만 받는다. 기존 train/보호 validation SHA를 teacher pseudo-label로
    재유입시키지 않으며, 최종 manifest의 절대경로 필드는 NAS 내부 후속 단계용이므로
    `portable=false`, `local_only_contains_absolute_paths=true`로 명시한다.
+10. 재현 pilot에서 이미 확인된 촬영 실패는
+    `scripts/build_v4_quality_exclusion_manifest.py`로 별도 봉인한다. 출력에는 원본
+    `source_sha256`과 허용된 품질 사유만 기록하고 경로·파일명·사용자 식별자는 넣지
+    않는다. manifest는 비어 있을 수 없고 최대 100개 SHA로 제한하며, selection·정답·
+    replay·학습·calibration·blind·배포 권한을 모두 `false`로 고정한다.
+11. selector는 제외 SHA가 현재 해석된 데이터셋에 실제 존재하지 않거나 manifest의
+    canonical hash·정렬·개수·사유·권한이 정확하지 않으면 중단한다. 제외 SHA와 바이트가
+    같은 모든 source는 선택하지 않는다. 별도 CPU selection audit가 selector를 다시
+    실행해 동일 결과를 byte 단위로 봉인하고, GPU validator는 그 증거와 최종 raw
+    manifest에 제외 SHA가 없음을 확인한다. GPU 단계 직전에 전체 원본을 다시 읽어
+    QNAP page cache를 채우지 않는다.
+
+`2026-08-01` 컷오프는 운영 카메라 캡처에만 적용한다. 상용 사용 조건을 충족한 AI Hub
+원본 corpus를 날짜 때문에 버리지 않는다. `severe_frame_crop`, 사람 가림·지배, 다중
+물체·혼잡, 경계/대상 판독 불가, 저해상도, 극단 노출 같은 촬영 실패만 제외하며,
+재활용품 자체의 구김·찌그러짐·압착은 제외 사유로 허용하지 않는다.
+
+단일 촬영 실패는 다음처럼 새 불변 파일로 만든다. 입력·출력은 심볼릭 링크가 없는
+절대 물리 경로를 사용하며 기존 출력은 덮어쓰지 않는다.
+
+```bash
+python scripts/build_v4_quality_exclusion_manifest.py \
+  --source /absolute/path/to/bad-capture.jpg \
+  --reason severe_frame_crop \
+  --output /absolute/control/quality-exclusions.json
+```
+
+여러 장은 `path,reason` 두 컬럼의 UTF-8 CSV와 `--image-root`를 사용한다. 이후 selector,
+CPU audit, validator에는 동일 파일을 `--quality-exclusion-manifest` 또는
+`QUALITY_EXCLUSION_MANIFEST`로 전달한다.
 
 ## 다음 실험 순서
 

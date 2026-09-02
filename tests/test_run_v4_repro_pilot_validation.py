@@ -145,6 +145,14 @@ def cohort_base(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
             )
             for selection_rank, row in enumerate(bucket, start=1):
                 row["selection_rank_within_stratum"] = selection_rank
+    quality_source = (
+        root / "sources" / "training" / "images" / "vinyl" / "quality-excluded.jpg"
+    )
+    quality_label = (
+        root / "sources" / "training" / "labels" / "vinyl" / "quality-excluded.txt"
+    )
+    quality_source.write_bytes(b"severely-cropped-operational-frame-after-cutoff")
+    quality_label.write_text("5 0.5 0.5 0.2 0.2\n", encoding="utf-8")
     anchor_rows = [row for row in rows if row["drift_anchor"]]
     old_manifest = root / "historical-manifest.csv"
     old_manifest.write_text(
@@ -178,6 +186,8 @@ def cohort_base(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
         "selected_rows": rows,
         "old_manifest": old_manifest,
         "drift_report": drift_report,
+        "quality_source": quality_source,
+        "quality_source_sha256": _sha(quality_source),
     }
 
 
@@ -221,6 +231,7 @@ p.add_argument('--train-quota-per-stratum',required=True)
 p.add_argument('--validation-quota-per-stratum',required=True)
 p.add_argument('--old-manifest')
 p.add_argument('--drift-report')
+p.add_argument('--quality-exclusion-manifest',required=True)
 a=p.parse_args()
 reference=Path(os.environ['FAKE_SELECTION_RECOMPUTE_REFERENCE'])
 output=Path(a.output_dir)
@@ -509,10 +520,118 @@ print(json.dumps(report,sort_keys=True))
     )
     source_data = tmp_path / "source-data.yaml"
     source_data.write_text(
-        f'path: "{Path(cohort["root"]).joinpath("sources").resolve().as_posix()}"\n',
+        "\n".join(
+            [
+                f'path: "{Path(cohort["root"]).joinpath("sources").resolve().as_posix()}"',
+                'train: "training/images"',
+                'val: "validation/images"',
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     universe = "a" * 64
+    quality_source_sha = str(cohort["quality_source_sha256"])
+    if mode == "quality_selected_source":
+        quality_source_sha = str(selected_rows[0]["source_sha256"])
+    quality_reason = (
+        "unknown_capture_quality_reason"
+        if mode == "quality_unknown_reason"
+        else "severe_frame_crop"
+    )
+    quality_entries = (
+        sorted(
+            [
+                {
+                    "source_sha256": hashlib.sha256(
+                        f"quality-over-cap:{index}".encode()
+                    ).hexdigest(),
+                    "reason": quality_reason,
+                }
+                for index in range(101)
+            ],
+            key=lambda row: row["source_sha256"],
+        )
+        if mode == "quality_over_maximum"
+        else [{"source_sha256": quality_source_sha, "reason": quality_reason}]
+    )
+    quality_count = len(quality_entries)
+    canonical_quality_bytes = (
+        json.dumps(
+            quality_entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    quality_manifest = tmp_path / "quality-exclusions.json"
+    quality_manifest_value = {
+        "schema_version": 1,
+        "artifact_role": (
+            "v4_capture_quality_exclusion_manifest_selection_only_"
+            "not_ground_truth_or_authority"
+        ),
+        "quality_exclusion_contract": (
+            "v4_capture_quality_exclusions.sha256_reason_only.v1"
+        ),
+        "status": "quality_exclusions_ready",
+        "excluded_source_count": quality_count,
+        "max_excluded_sources": 100,
+        "reason_counts": {quality_reason: quality_count},
+        "source_list_sha256": hashlib.sha256(canonical_quality_bytes).hexdigest(),
+        "entries": quality_entries,
+        "authority": {
+            "selection": False,
+            "ground_truth": False,
+            "replay": False,
+            "training": False,
+            "calibration": False,
+            "blind_test": False,
+            "deployment": False,
+        },
+    }
+    if mode == "quality_reason_counts_mismatch":
+        quality_manifest_value["reason_counts"] = {quality_reason: 2}
+    if mode == "quality_numeric_false_authority":
+        quality_manifest_value["authority"]["selection"] = 0
+    quality_manifest.write_text(
+        json.dumps(
+            quality_manifest_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    quality_false_fields = {
+        "selection_authority": False,
+        "ground_truth_authority": False,
+        "replay_authority": False,
+        "training_authority": False,
+        "calibration_authority": False,
+        "blind_test_authority": False,
+        "deployment_authority": False,
+    }
+    inventory_quality = {
+        "required": True,
+        "manifest_contract": "v4_capture_quality_exclusions.sha256_reason_only.v1",
+        "manifest_path": quality_manifest.resolve().as_posix(),
+        "manifest_sha256": _sha(quality_manifest),
+        "excluded_source_count": quality_count,
+        "max_excluded_sources": 100,
+        "matched_resolved_sources": quality_count,
+        "reason_counts": {quality_reason: quality_count},
+        "source_list_sha256": hashlib.sha256(canonical_quality_bytes).hexdigest(),
+        **quality_false_fields,
+    }
+    ready_quality = {
+        key: value
+        for key, value in inventory_quality.items()
+        if key not in {"manifest_path", "matched_resolved_sources"}
+    }
     old_manifest = tmp_path / "historical-manifest.csv"
     old_manifest.write_bytes(Path(cohort["old_manifest"]).read_bytes())
     if probe_source_sha is not None and mode != "forged_probe_membership":
@@ -607,7 +726,7 @@ print(json.dumps(report,sort_keys=True))
                 ),
                 "selection_contract": (
                     "v4_repro_pilot_inputs."
-                    "gt_stratified_historical_observation_priority_blake2b.v3"
+                    "gt_stratified_historical_observation_priority_blake2b.v4"
                 ),
                 "status": "selection_complete_not_replay_validated",
                 "seed": pilot_seed,
@@ -628,6 +747,9 @@ print(json.dumps(report,sort_keys=True))
                     "multi_object_excluded": True,
                     "cross_split_content_duplicates_quarantined": True,
                     "same_split_conflicting_ground_truth_quarantined": True,
+                    "capture_quality_exclusion_manifest_required": True,
+                    "quality_excluded_sources_never_selected": True,
+                    "object_dent_or_crush_is_not_a_capture_quality_exclusion": True,
                 },
                 "selected_counts": selected_counts,
                 "eligible_counts": {
@@ -643,6 +765,7 @@ print(json.dumps(report,sort_keys=True))
                 "background_quota_composition": background_quota_composition,
                 "quota_shortages": {name: 0 for name in selected_counts},
                 "full_quota_met": True,
+                "quality_exclusion": inventory_quality,
                 "selected_sources": selected_rows,
                 "historical_selection_evidence": {
                     "used_for_selection_only": True,
@@ -702,6 +825,16 @@ print(json.dumps(report,sort_keys=True))
                     "proposal_generator_sha256": _sha(
                         scripts / "prepare_proposal_verifier_dataset.py"
                     ),
+                    "quality_exclusion_manifest_path": (
+                        (tmp_path / "wrong-quality-exclusions.json").resolve().as_posix()
+                        if mode == "quality_manifest_path_binding_mismatch"
+                        else quality_manifest.resolve().as_posix()
+                    ),
+                    "quality_exclusion_manifest_sha256": (
+                        "f" * 64
+                        if mode == "quality_manifest_hash_binding_mismatch"
+                        else _sha(quality_manifest)
+                    ),
                 },
                 "authority": {
                     "raw_generation_authorized": False,
@@ -738,7 +871,7 @@ print(json.dumps(report,sort_keys=True))
                 ),
                 "selection_contract": (
                     "v4_repro_pilot_inputs."
-                    "gt_stratified_historical_observation_priority_blake2b.v3"
+                    "gt_stratified_historical_observation_priority_blake2b.v4"
                 ),
                 "status": "pilot_inputs_ready",
                 "seed": ready_seed,
@@ -749,6 +882,7 @@ print(json.dumps(report,sort_keys=True))
                 "background_quota_composition": background_quota_composition,
                 "full_quota_met": True,
                 "historical_selection_only": True,
+                "quality_exclusion": ready_quality,
                 "bindings": {
                     "inputs_marker_sha256": _sha(pilot_inputs),
                     "artifacts": {name: _sha(path) for name, path in sorted(pilot_artifacts.items())},
@@ -882,9 +1016,10 @@ print(json.dumps(report,sort_keys=True))
                 "status": "pilot_inputs_ready",
                 "selection_contract": (
                     "v4_repro_pilot_inputs."
-                    "gt_stratified_historical_observation_priority_blake2b.v3"
+                    "gt_stratified_historical_observation_priority_blake2b.v4"
                 ),
                 "seed": 20260901,
+                "quality_exclusion": ready_quality,
                 "bindings": {
                     "inputs_marker_sha256": _sha(recomputed_inputs),
                     "artifacts": {
@@ -931,16 +1066,22 @@ print(json.dumps(report,sort_keys=True))
                     "v4_repro_selection_audit_cpu_only_diagnostic_"
                     "not_generation_training_blind_or_deployment_authority"
                 ),
-                "audit_contract": "v4_repro_selection_audit.cpu_only_byte_exact.v1",
+                "audit_contract": "v4_repro_selection_audit.cpu_only_byte_exact.v2",
                 "status": "selection_recomputed_byte_exact",
                 "selection_contract": (
                     "v4_repro_pilot_inputs."
-                    "gt_stratified_historical_observation_priority_blake2b.v3"
+                    "gt_stratified_historical_observation_priority_blake2b.v4"
                 ),
                 "cpu_only": True,
                 "seed": 20260901,
                 "quota_per_stratum": {"training": 250, "validation": 100},
                 "selected_sources": 3500,
+                "quality_exclusion_dataset_membership_verified_by_selector_replay": True,
+                "quality_exclusion": (
+                    {**inventory_quality, "manifest_sha256": "f" * 64}
+                    if mode == "quality_audit_evidence_mismatch"
+                    else inventory_quality
+                ),
                 "comparisons": {
                     "selection_inventory_json_byte_exact": True,
                     "train_pilot_txt_byte_exact": True,
@@ -975,6 +1116,8 @@ print(json.dumps(report,sort_keys=True))
                     "historical_manifest_sha256": _sha(old_manifest),
                     "drift_report_path": drift_report.resolve().as_posix(),
                     "drift_report_sha256": _sha(drift_report),
+                    "quality_exclusion_manifest_path": quality_manifest.resolve().as_posix(),
+                    "quality_exclusion_manifest_sha256": _sha(quality_manifest),
                     "pilot_artifacts": {
                         name: _sha(path)
                         for name, path in sorted(audit_pilot_artifacts.items())
@@ -995,6 +1138,10 @@ print(json.dumps(report,sort_keys=True))
         selection_audit_evidence_value["bindings"]["wrapper_sha256"] = "f" * 64
     if mode == "selection_audit_wrapper_hash_missing":
         selection_audit_evidence_value["bindings"].pop("wrapper_sha256")
+    if mode == "quality_audit_evidence_membership_attestation_missing":
+        selection_audit_evidence_value.pop(
+            "quality_exclusion_dataset_membership_verified_by_selector_replay"
+        )
     selection_audit_evidence.write_text(
         json.dumps(
             selection_audit_evidence_value,
@@ -1024,16 +1171,22 @@ print(json.dumps(report,sort_keys=True))
             "v4_repro_selection_audit_cpu_only_diagnostic_"
             "not_generation_training_blind_or_deployment_authority"
         ),
-        "audit_contract": "v4_repro_selection_audit.cpu_only_byte_exact.v1",
+        "audit_contract": "v4_repro_selection_audit.cpu_only_byte_exact.v2",
         "status": "selection_audit_ready",
         "selection_contract": (
             "v4_repro_pilot_inputs."
-            "gt_stratified_historical_observation_priority_blake2b.v3"
+            "gt_stratified_historical_observation_priority_blake2b.v4"
         ),
         "seed": 20260901,
         "cpu_only": True,
         "quota_per_stratum": {"training": 250, "validation": 100},
         "selected_sources": 3500,
+        "quality_exclusion_dataset_membership_verified_by_selector_replay": True,
+        "quality_exclusion": (
+            {**ready_quality, "manifest_sha256": "f" * 64}
+            if mode == "quality_audit_ready_mismatch"
+            else ready_quality
+        ),
         "byte_exact_artifacts": [
             "selection_inventory.json",
             "train_pilot.txt",
@@ -1044,6 +1197,8 @@ print(json.dumps(report,sort_keys=True))
             "selection_audit_marker_sha256": _sha(selection_audit_marker),
             "selection_audit_evidence_sha256": _sha(selection_audit_evidence),
             "resolved_universe_sha256": universe,
+            "quality_exclusion_manifest_path": quality_manifest.resolve().as_posix(),
+            "quality_exclusion_manifest_sha256": _sha(quality_manifest),
             "pilot_artifacts": {
                 name: _sha(path) for name, path in sorted(audit_pilot_artifacts.items())
             },
@@ -1062,6 +1217,10 @@ print(json.dumps(report,sort_keys=True))
         ] = "f" * 64
     if mode == "selection_audit_authority":
         selection_audit_ready_value["validator_authority"] = True
+    if mode == "quality_audit_ready_membership_attestation_missing":
+        selection_audit_ready_value.pop(
+            "quality_exclusion_dataset_membership_verified_by_selector_replay"
+        )
     selection_audit_ready.write_text(
         json.dumps(selection_audit_ready_value, sort_keys=True, separators=(",", ":"))
         + "\n",
@@ -1086,6 +1245,7 @@ print(json.dumps(report,sort_keys=True))
             "AUDIT_DIR": real_selection_audit.as_posix(),
             "CODE_ROOT": code.as_posix(),
             "PILOT_INPUT_DIR": pilot.as_posix(),
+            "QUALITY_EXCLUSION_MANIFEST": quality_manifest.as_posix(),
             "PYTHON_BIN": Path(sys.executable).as_posix(),
             "FAKE_SELECTION_RECOMPUTE_REFERENCE": selection_reference.as_posix(),
             "FAKE_SELECTION_COUNTER": selection_counter.as_posix(),
@@ -1362,6 +1522,7 @@ exec "$REAL_PYTHON" "$@"
         "GEN_DIR": generation.as_posix(),
         "PILOT_INPUT_DIR": pilot.as_posix(),
         "SELECTION_AUDIT_DIR": selection_audit_for_validation.as_posix(),
+        "QUALITY_EXCLUSION_MANIFEST": quality_manifest.as_posix(),
         "DETECTOR_MODEL": detector.as_posix(),
         "INFERENCE_SPEC": spec.as_posix(),
         "PYTHON_BIN": python_bin,
@@ -1401,6 +1562,7 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
     for name in (
         "VALIDATION_DIR", "CODE_ROOT", "GEN_DIR", "PILOT_INPUT_DIR",
         "SELECTION_AUDIT_DIR",
+        "QUALITY_EXCLUSION_MANIFEST",
         "DETECTOR_MODEL", "INFERENCE_SPEC",
     ):
         assert name in text
@@ -1432,6 +1594,16 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
     assert "selection audit evidence wrapper hash mismatch" in text
     assert "selection audit root file set is not exact" in text
     assert "selection audit recompute file set is not exact" in text
+    assert (
+        "quality_exclusion_dataset_membership_verified_by_selector_replay"
+        in text
+    )
+    assert "lacks exact quality exclusion dataset membership attestation" in text
+    assert "pilot selection contains a quality-excluded source SHA" in text
+    assert "raw manifest contains a quality-excluded source SHA" in text
+    assert "quality exclusion reason is not allowlisted" in text
+    assert "quality exclusion source-list canonical hash mismatch" in text
+    assert "quality exclusion manifest entries must contain 1..100 rows" in text
     assert "subprocess.run" not in text
     assert "raw manifest contains a source outside the selected pilot cohort" in text
     assert "raw manifest selected-source coverage is below 99 percent" in text
@@ -1491,6 +1663,38 @@ def test_wrapper_has_no_external_control_or_credentials() -> None:
         assert token not in text
 
 
+def test_rejects_quality_manifest_ancestor_symlink(
+    tmp_path: Path, cohort_base: dict[str, object]
+) -> None:
+    env = _fixture(
+        tmp_path,
+        mode="quality_ancestor_symlink_preflight",
+        cohort=cohort_base,
+    )
+    original = Path(env["QUALITY_EXCLUSION_MANIFEST"])
+    real_parent = tmp_path / "real-quality-input"
+    real_parent.mkdir()
+    copied = real_parent / original.name
+    shutil.copyfile(original, copied)
+    linked_parent = tmp_path / "linked-quality-input"
+    try:
+        os.symlink(real_parent, linked_parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    env["QUALITY_EXCLUSION_MANIFEST"] = (linked_parent / copied.name).as_posix()
+    result = subprocess.run(
+        [_integration_bash(tmp_path), SCRIPT.as_posix()],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 64
+    control = Path(env["VALIDATION_DIR"]) / "control"
+    assert (control / "failed.txt").is_file()
+    assert not (control / "diagnostic_ready.json").exists()
+
+
 def test_integration_success_seals_two_exact_runs(
     tmp_path: Path, cohort_base: dict[str, object]
 ) -> None:
@@ -1509,6 +1713,13 @@ def test_integration_success_seals_two_exact_runs(
     assert ready["selected_source_coverage"] == pytest.approx(0.99)
     assert ready["selected_drift_anchors"] > 0
     assert ready["emitted_drift_anchors"] == ready["selected_drift_anchors"]
+    assert ready["quality_exclusion_required"] is True
+    assert ready["quality_excluded_sources"] == 1
+    assert ready["quality_exclusion_dataset_membership_verified"] is True
+    assert ready[
+        "quality_exclusion_membership_attested_by_cpu_selector_audit"
+    ] is True
+    assert ready["quality_exclusion_absent_from_selection_and_raw"] is True
     assert ready["lineage_execution_authorized"] is False
     assert ready["training_authority"] is False
     assert ready["blind_test_authority"] is False
@@ -1542,6 +1753,9 @@ def test_integration_success_seals_two_exact_runs(
     )
     assert ready["bindings"]["selection_audit_evidence_sha256"] == _sha(
         audit / "selection_audit_evidence.json"
+    )
+    assert ready["bindings"]["quality_exclusion_manifest_sha256"] == _sha(
+        Path(env["QUALITY_EXCLUSION_MANIFEST"])
     )
     assert (root / "validator-a" / "manifest.csv").is_symlink()
     assert (root / "validator-b" / "validation").is_symlink()
@@ -1631,6 +1845,17 @@ def test_integration_accepts_archived_pilot_code_paths_with_exact_hashes(
         "selection_audit_wrapper_file_missing",
         "selection_audit_extra_root_file",
         "selection_audit_extra_recompute_directory",
+        "quality_unknown_reason",
+        "quality_reason_counts_mismatch",
+        "quality_numeric_false_authority",
+        "quality_over_maximum",
+        "quality_audit_ready_membership_attestation_missing",
+        "quality_audit_evidence_membership_attestation_missing",
+        "quality_selected_source",
+        "quality_manifest_path_binding_mismatch",
+        "quality_manifest_hash_binding_mismatch",
+        "quality_audit_evidence_mismatch",
+        "quality_audit_ready_mismatch",
         "generation_inventory_mismatch",
         "foreign_manifest_source",
         "external_crop",

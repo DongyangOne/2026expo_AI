@@ -39,13 +39,38 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
 CLASS_NAMES = proposal_dataset.CLASS_NAMES
 OUTPUT_STRATA = (*CLASS_NAMES, "background")
 SELECTION_CONTRACT = (
-    "v4_repro_pilot_inputs.gt_stratified_historical_observation_priority_blake2b.v3"
+    "v4_repro_pilot_inputs.gt_stratified_historical_observation_priority_blake2b.v4"
 )
 ARTIFACT_ROLE = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
     "not_training_blind_or_deployment_authority"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+QUALITY_EXCLUSION_CONTRACT = "v4_capture_quality_exclusions.sha256_reason_only.v1"
+QUALITY_EXCLUSION_ROLE = (
+    "v4_capture_quality_exclusion_manifest_selection_only_"
+    "not_ground_truth_or_authority"
+)
+QUALITY_EXCLUSION_REASONS = (
+    "captured_before_2026_08_01",
+    "severe_frame_crop",
+    "person_occlusion_or_dominance",
+    "clutter_or_multiple_objects",
+    "boundary_unreadable",
+    "objective_unreadable",
+    "resolution_too_low",
+    "extreme_exposure",
+)
+QUALITY_EXCLUSION_MAX_SOURCES = 100
+QUALITY_EXCLUSION_AUTHORITY = {
+    "selection": False,
+    "ground_truth": False,
+    "replay": False,
+    "training": False,
+    "calibration": False,
+    "blind_test": False,
+    "deployment": False,
+}
 
 
 @dataclass
@@ -78,6 +103,19 @@ def _json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _canonical_quality_entries_bytes(entries: list[dict[str, str]]) -> bytes:
+    return (
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 def _stable_bytes(path: Path, *, description: str) -> bytes:
     resolved = path.resolve()
     before = resolved.stat()
@@ -94,6 +132,15 @@ def _sha256_bytes(content: bytes) -> str:
 
 def _stable_sha256(path: Path, *, description: str) -> str:
     return _sha256_bytes(_stable_bytes(path, description=description))
+
+
+def _reject_symlink_components(path: Path, *, description: str) -> None:
+    absolute = Path(os.path.abspath(path))
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"{description} path must not contain symlink components")
 
 
 def _publish_exclusive(path: Path, content: bytes) -> None:
@@ -151,6 +198,143 @@ def _ground_truth_reason(reason: str) -> str:
     if reason == "not_single_object":
         return "multi_object_label"
     return f"malformed_label/{reason}"
+
+
+def _read_quality_exclusion_manifest(
+    path: Path,
+) -> tuple[dict[str, str], dict[str, object]]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("quality exclusion manifest must be a regular non-symlink file")
+    content = _stable_bytes(path, description="quality exclusion manifest")
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        parsed: dict[str, object] = {}
+        for key, item in pairs:
+            if key in parsed:
+                raise ValueError(
+                    f"quality exclusion manifest contains duplicate key: {key}"
+                )
+            parsed[key] = item
+        return parsed
+
+    try:
+        value = json.loads(
+            content.decode("utf-8"), object_pairs_hook=reject_duplicate_keys
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("quality exclusion manifest is not valid UTF-8 JSON") from error
+    expected_keys = {
+        "schema_version",
+        "artifact_role",
+        "quality_exclusion_contract",
+        "status",
+        "excluded_source_count",
+        "max_excluded_sources",
+        "reason_counts",
+        "source_list_sha256",
+        "entries",
+        "authority",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("quality exclusion manifest schema keys are not exact")
+    authority = value.get("authority")
+    if (
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or value.get("artifact_role") != QUALITY_EXCLUSION_ROLE
+        or value.get("quality_exclusion_contract") != QUALITY_EXCLUSION_CONTRACT
+        or value.get("status") != "quality_exclusions_ready"
+        or not isinstance(authority, dict)
+        or set(authority) != set(QUALITY_EXCLUSION_AUTHORITY)
+        or any(type(item) is not bool or item is not False for item in authority.values())
+        or type(value.get("max_excluded_sources")) is not int
+        or value.get("max_excluded_sources") != QUALITY_EXCLUSION_MAX_SOURCES
+    ):
+        raise ValueError("quality exclusion manifest contract or authority is invalid")
+    source_list_sha256 = value.get("source_list_sha256")
+    if not isinstance(source_list_sha256, str) or not SHA256_RE.fullmatch(
+        source_list_sha256
+    ):
+        raise ValueError("quality exclusion source-list hash is invalid")
+    entries = value.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("quality exclusion entries must be a non-empty list")
+    if len(entries) > QUALITY_EXCLUSION_MAX_SOURCES:
+        raise ValueError("quality exclusion entries exceed the bounded maximum")
+    indexed: dict[str, str] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or set(entry) != {"source_sha256", "reason"}:
+            raise ValueError(f"quality exclusion entry {index} is malformed")
+        source_sha256 = entry.get("source_sha256")
+        reason = entry.get("reason")
+        if not isinstance(source_sha256, str) or not SHA256_RE.fullmatch(source_sha256):
+            raise ValueError(f"quality exclusion entry {index} has invalid source SHA")
+        if source_sha256 in indexed:
+            raise ValueError(f"quality exclusion entry {index} duplicates source SHA")
+        if reason not in QUALITY_EXCLUSION_REASONS:
+            raise ValueError(f"quality exclusion entry {index} has unknown reason")
+        indexed[source_sha256] = str(reason)
+    if entries != [
+        {"source_sha256": source_sha256, "reason": indexed[source_sha256]}
+        for source_sha256 in sorted(indexed)
+    ]:
+        raise ValueError("quality exclusion entries must be uniquely SHA-sorted")
+    if source_list_sha256 != _sha256_bytes(_canonical_quality_entries_bytes(entries)):
+        raise ValueError("quality exclusion canonical source-list hash is inconsistent")
+    declared_count = value.get("excluded_source_count")
+    if type(declared_count) is not int or declared_count != len(indexed):
+        raise ValueError("quality exclusion source count is invalid")
+    reason_counts = Counter(indexed.values())
+    expected_reason_counts = dict(sorted(reason_counts.items()))
+    declared_reason_counts = value.get("reason_counts")
+    if (
+        not isinstance(declared_reason_counts, dict)
+        or set(declared_reason_counts) != set(expected_reason_counts)
+        or any(
+            type(count) is not int or count <= 0
+            for count in declared_reason_counts.values()
+        )
+        or declared_reason_counts != expected_reason_counts
+    ):
+        raise ValueError("quality exclusion reason counts are inconsistent")
+    return indexed, {
+        "required": True,
+        "manifest_contract": QUALITY_EXCLUSION_CONTRACT,
+        "manifest_path": _absolute_posix(path),
+        "manifest_sha256": _sha256_bytes(content),
+        "source_list_sha256": source_list_sha256,
+        "excluded_source_count": len(indexed),
+        "max_excluded_sources": QUALITY_EXCLUSION_MAX_SOURCES,
+        "reason_counts": expected_reason_counts,
+        "selection_authority": False,
+        "ground_truth_authority": False,
+        "replay_authority": False,
+        "training_authority": False,
+        "calibration_authority": False,
+        "blind_test_authority": False,
+        "deployment_authority": False,
+    }
+
+
+def _apply_quality_exclusions(
+    scanned: Iterable[ScannedSource], exclusions: Mapping[str, str]
+) -> int:
+    records = list(scanned)
+    resolved_hashes = {record.source_sha256 for record in records}
+    unknown = sorted(set(exclusions) - resolved_hashes)
+    if unknown:
+        preview = ", ".join(unknown[:3])
+        raise ValueError(
+            "quality exclusion SHA is absent from the resolved current dataset: "
+            f"{preview}"
+        )
+    for record in records:
+        reason = exclusions.get(record.source_sha256)
+        if reason is not None:
+            record.reasons.add(f"quality_excluded/{reason}")
+    # This is deliberately the unique manifest-SHA count. A byte-identical
+    # source may occur at several paths, but the manifest and its existence
+    # contract are SHA keyed.
+    return len(exclusions)
 
 
 def _scan_sources(
@@ -814,6 +998,7 @@ def build_pilot_inputs(
     data_path: Path,
     dataset_dir: Path,
     output_dir: Path,
+    quality_exclusion_manifest: Path,
     seed: int = 20260901,
     training_quota: int = 250,
     validation_quota: int = 100,
@@ -829,6 +1014,18 @@ def build_pilot_inputs(
 
     data_path = data_path.resolve()
     dataset_dir = dataset_dir.resolve()
+    quality_exclusion_manifest_arg = quality_exclusion_manifest
+    if (
+        quality_exclusion_manifest_arg.is_symlink()
+        or not quality_exclusion_manifest_arg.is_file()
+    ):
+        raise ValueError(
+            "quality exclusion manifest must be a regular non-symlink file"
+        )
+    _reject_symlink_components(
+        quality_exclusion_manifest_arg, description="quality exclusion manifest"
+    )
+    quality_exclusion_manifest = quality_exclusion_manifest_arg.resolve(strict=True)
     output_dir = output_dir.resolve(strict=False)
     if not data_path.is_file():
         raise FileNotFoundError(f"missing YOLO data YAML: {data_path}")
@@ -841,6 +1038,12 @@ def build_pilot_inputs(
         if not scanned:
             raise RuntimeError("YOLO data YAML resolved no source images")
         _quarantine_duplicates(scanned)
+
+        exclusions, quality_exclusion_info = _read_quality_exclusion_manifest(
+            quality_exclusion_manifest
+        )
+        matched_excluded_sources = _apply_quality_exclusions(scanned, exclusions)
+        quality_exclusion_info["matched_resolved_sources"] = matched_excluded_sources
 
         historical, historical_info = _read_historical_manifest(old_manifest)
         anchors, drift_info = _read_drift_report(drift_report, historical)
@@ -951,6 +1154,9 @@ def build_pilot_inputs(
                 "multi_object_excluded": True,
                 "cross_split_content_duplicates_quarantined": True,
                 "same_split_conflicting_ground_truth_quarantined": True,
+                "capture_quality_exclusion_manifest_required": True,
+                "quality_excluded_sources_never_selected": True,
+                "object_dent_or_crush_is_not_a_capture_quality_exclusion": True,
             },
             "bindings": {
                 "data_path": _absolute_posix(data_path),
@@ -966,7 +1172,14 @@ def build_pilot_inputs(
                 ),
                 "resolved_universe_sha256": universe_sha256,
                 "resolved_universe_sources": universe_sources,
+                "quality_exclusion_manifest_path": quality_exclusion_info[
+                    "manifest_path"
+                ],
+                "quality_exclusion_manifest_sha256": quality_exclusion_info[
+                    "manifest_sha256"
+                ],
             },
+            "quality_exclusion": quality_exclusion_info,
             "historical_selection_evidence": {
                 "used_for_selection_only": bool(historical_info),
                 "ground_truth_authority": False,
@@ -1048,6 +1261,11 @@ def build_pilot_inputs(
         _verify_selected_bindings(selected)
         if _stable_sha256(data_path, description="YOLO data YAML final rehash") != data_sha256:
             raise RuntimeError("YOLO data YAML changed during input build")
+        if _stable_sha256(
+            quality_exclusion_manifest,
+            description="quality exclusion manifest final rehash",
+        ) != quality_exclusion_info["manifest_sha256"]:
+            raise RuntimeError("quality exclusion manifest changed during input build")
         if old_manifest is not None and historical_info is not None:
             if _stable_sha256(
                 old_manifest, description="historical manifest final rehash"
@@ -1081,6 +1299,11 @@ def build_pilot_inputs(
                 },
                 "resolved_universe_sha256": universe_sha256,
             },
+            "quality_exclusion": {
+                key: value
+                for key, value in quality_exclusion_info.items()
+                if key != "manifest_path" and key != "matched_resolved_sources"
+            },
             "historical_selection_only": bool(historical_info),
             "validator_authority": False,
             "training_authorized": False,
@@ -1100,6 +1323,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--dataset-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--quality-exclusion-manifest", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=20260901)
     parser.add_argument("--train-quota-per-stratum", type=int, default=250)
     parser.add_argument("--validation-quota-per-stratum", type=int, default=100)
@@ -1114,6 +1338,7 @@ def main() -> None:
         data_path=args.data,
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
+        quality_exclusion_manifest=args.quality_exclusion_manifest,
         seed=args.seed,
         training_quota=args.train_quota_per_stratum,
         validation_quota=args.validation_quota_per_stratum,
