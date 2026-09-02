@@ -427,7 +427,7 @@ def test_background_probe_preserves_scarce_material_quota(tmp_path: Path) -> Non
         )
     )
 
-    selected, _, selected_counts, shortages = _selection_rows(
+    selected, _, selected_counts, shortages, observed_counts = _selection_rows(
         records, seed=0, training_quota=1, validation_quota=1
     )
 
@@ -446,6 +446,8 @@ def test_background_probe_preserves_scarce_material_quota(tmp_path: Path) -> Non
     selected_hashes = [row["source_sha256"] for row in selected]
     assert len(selected_paths) == len(set(selected_paths)) == 20
     assert len(selected_hashes) == len(set(selected_hashes)) == 20
+    assert observed_counts["training/can"] == 1
+    assert observed_counts["training/paper"] == 0
 def test_historical_background_probe_requires_same_split_membership(
     tmp_path: Path,
 ) -> None:
@@ -515,7 +517,7 @@ def test_historical_manifest_mutation_is_detected_before_ready(
     assert not (output / "input_ready.json").exists()
 
 
-def test_anchor_priority_is_capped_and_remainder_uses_original_blake_order(
+def test_anchor_priority_is_capped_and_observed_remainder_uses_blake_order(
     tmp_path: Path,
 ) -> None:
     records = []
@@ -536,7 +538,7 @@ def test_anchor_priority_is_capped_and_remainder_uses_original_blake_order(
             )
         )
 
-    selected, _, _, _ = _selection_rows(
+    selected, _, _, _, _ = _selection_rows(
         records, seed=123, training_quota=5, validation_quota=1
     )
     selected_can = [
@@ -547,6 +549,10 @@ def test_anchor_priority_is_capped_and_remainder_uses_original_blake_order(
     assert sum(
         row["selection_reason"] == "drift_anchor_priority" for row in selected_can
     ) == 1
+    assert sum(
+        row["selection_reason"] == "historical_observation_priority_blake2"
+        for row in selected_can
+    ) == 4
 
     def score(record: ScannedSource) -> tuple[str, str, str]:
         return (
@@ -568,6 +574,60 @@ def test_anchor_priority_is_capped_and_remainder_uses_original_blake_order(
     assert {row["source_sha256"] for row in selected_can} == {
         record.source_sha256 for record in expected
     }
+
+
+def test_same_split_historical_observation_is_selection_only_priority(
+    tmp_path: Path,
+) -> None:
+    records: list[ScannedSource] = []
+    for index in range(8):
+        identity = f"candidate-{index}"
+        records.append(
+            ScannedSource(
+                path=tmp_path / identity / "images" / "item.jpg",
+                split="training",
+                source_sha256=hashlib.sha256(identity.encode()).hexdigest(),
+                label_path=tmp_path / identity / "labels" / "item.txt",
+                label_sha256=hashlib.sha256(f"label-{identity}".encode()).hexdigest(),
+                stratum="can",
+                gt_class_id=0,
+                gt_xywhn=(0.5, 0.5, 0.4, 0.4),
+            )
+        )
+
+    def score(record: ScannedSource) -> tuple[str, str, str]:
+        return (
+            _source_score(
+                seed=321,
+                split="training",
+                stratum="can",
+                source_sha256=record.source_sha256,
+            ),
+            record.source_sha256,
+            record.path.resolve().as_posix(),
+        )
+
+    observed = max(records, key=score)
+    unseen_blake_first = min((record for record in records if record is not observed), key=score)
+    assert score(unseen_blake_first) < score(observed)
+    observed.historical_categories = ("paper",)
+
+    selected, _, _, _, observed_counts = _selection_rows(
+        records, seed=321, training_quota=1, validation_quota=1
+    )
+    selected_can = next(
+        row
+        for row in selected
+        if row["split"] == "training" and row["stratum"] == "can"
+    )
+    assert selected_can["source_sha256"] == observed.source_sha256
+    assert selected_can["selection_reason"] == (
+        "historical_observation_priority_blake2"
+    )
+    assert selected_can["historical_categories_selection_only"] == ["paper"]
+    assert selected_can["current_gt_stratum"] == "can"
+    assert selected_can["selection_cohort"] == "current_yolo_ground_truth"
+    assert observed_counts["training/can"] == 1
 
 
 def test_ready_marker_binds_every_input_and_is_published_last(tmp_path: Path) -> None:
@@ -708,3 +768,17 @@ def test_existing_output_directory_is_never_reused(tmp_path: Path) -> None:
     assert sentinel.read_text(encoding="utf-8") == "keep"
     assert not (output / "input_ready.json").exists()
     assert not (output / "failed.txt").exists()
+
+
+@pytest.mark.parametrize("seed", [True, False, 1.5])
+def test_builder_rejects_non_exact_integer_seed(tmp_path: Path, seed: object) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    with pytest.raises(ValueError, match="seed must be a non-negative integer"):
+        build_pilot_inputs(
+            data_path=data,
+            dataset_dir=dataset_dir,
+            output_dir=tmp_path / "pilot-invalid-seed",
+            seed=seed,  # type: ignore[arg-type]
+            training_quota=1,
+            validation_quota=1,
+        )

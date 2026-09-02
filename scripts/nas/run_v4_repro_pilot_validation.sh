@@ -16,7 +16,8 @@ require_env() {
 }
 
 for name in \
-  VALIDATION_DIR CODE_ROOT GEN_DIR PILOT_INPUT_DIR DETECTOR_MODEL INFERENCE_SPEC
+  VALIDATION_DIR CODE_ROOT GEN_DIR PILOT_INPUT_DIR SELECTION_AUDIT_DIR \
+  DETECTOR_MODEL INFERENCE_SPEC
 do
   require_env "$name"
 done
@@ -25,6 +26,7 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 VALIDATOR=$CODE_ROOT/scripts/validate_v4_background_candidates.py
 WRAPPER=$CODE_ROOT/scripts/nas/run_v4_repro_pilot_validation.sh
 GEN_WRAPPER=$CODE_ROOT/scripts/nas/run_v4_reproducible_generation.sh
+AUDIT_WRAPPER=$CODE_ROOT/scripts/nas/run_v4_repro_selection_audit.sh
 PILOT_BUILDER=$CODE_ROOT/scripts/build_v4_repro_pilot_inputs.py
 PROPOSAL_PREPARE=$CODE_ROOT/scripts/prepare_proposal_verifier_dataset.py
 PREPROCESSING=$CODE_ROOT/scripts/verifier_preprocessing_contract.py
@@ -34,6 +36,16 @@ PILOT_INVENTORY=$PILOT_INPUT_DIR/selection_inventory.json
 PILOT_YAML=$PILOT_INPUT_DIR/pilot_dataset.yaml
 PILOT_TRAIN=$PILOT_INPUT_DIR/train_pilot.txt
 PILOT_VALIDATION=$PILOT_INPUT_DIR/validation_pilot.txt
+SELECTION_AUDIT_READY=$SELECTION_AUDIT_DIR/selection_audit_ready.json
+SELECTION_AUDIT_MARKER=$SELECTION_AUDIT_DIR/selection_audit.sha256
+SELECTION_AUDIT_EVIDENCE=$SELECTION_AUDIT_DIR/selection_audit_evidence.json
+SELECTION_AUDIT_RECOMPUTE=$SELECTION_AUDIT_DIR/recompute
+SELECTION_AUDIT_INVENTORY=$SELECTION_AUDIT_RECOMPUTE/selection_inventory.json
+SELECTION_AUDIT_TRAIN=$SELECTION_AUDIT_RECOMPUTE/train_pilot.txt
+SELECTION_AUDIT_VALIDATION=$SELECTION_AUDIT_RECOMPUTE/validation_pilot.txt
+SELECTION_AUDIT_YAML=$SELECTION_AUDIT_RECOMPUTE/pilot_dataset.yaml
+SELECTION_AUDIT_INPUTS=$SELECTION_AUDIT_RECOMPUTE/inputs.sha256
+SELECTION_AUDIT_INPUT_READY=$SELECTION_AUDIT_RECOMPUTE/input_ready.json
 GEN_CONTROL=$GEN_DIR/control
 RAW_DIR=$GEN_DIR/raw
 RAW_MANIFEST=$RAW_DIR/manifest.csv
@@ -55,7 +67,6 @@ if ! mkdir "$CONTROL"; then
   printf '%s\n' "failed to create validation control directory: $CONTROL" >&2
   exit 73
 fi
-
 READY=$CONTROL/diagnostic_ready.json
 terminal_state=0
 
@@ -127,10 +138,15 @@ verify_marker() {
 }
 
 for artifact in \
-  "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
+  "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$AUDIT_WRAPPER" \
+  "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
   "$PREPROCESSING" "$DETECTOR_MODEL" "$INFERENCE_SPEC" \
   "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
   "$PILOT_TRAIN" "$PILOT_VALIDATION" \
+  "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" "$SELECTION_AUDIT_EVIDENCE" \
+  "$SELECTION_AUDIT_INVENTORY" "$SELECTION_AUDIT_TRAIN" \
+  "$SELECTION_AUDIT_VALIDATION" "$SELECTION_AUDIT_YAML" \
+  "$SELECTION_AUDIT_INPUTS" "$SELECTION_AUDIT_INPUT_READY" \
   "$RAW_MANIFEST" "$DATASET_INFO" "$GEN_INPUTS" "$GEN_OUTPUTS" \
   "$GEN_DATASET_INPUT_INVENTORY" \
   "$RAW_INVENTORY" "$GEN_READY"
@@ -144,40 +160,36 @@ if [ -e "$PILOT_INPUT_DIR/failed.txt" ] || [ -L "$PILOT_INPUT_DIR/failed.txt" ];
   fail "pilot input failure marker exists" 65
 fi
 
-if ! "$PYTHON_BIN" - "$VALIDATION_DIR" "$GEN_DIR" "$PILOT_INPUT_DIR" <<'PY'
+if ! "$PYTHON_BIN" - \
+  "$VALIDATION_DIR" "$GEN_DIR" "$PILOT_INPUT_DIR" "$SELECTION_AUDIT_DIR" <<'PY'
 import sys
 from pathlib import Path
 
 validation = Path(sys.argv[1]).resolve()
 generation = Path(sys.argv[2]).resolve()
 pilot = Path(sys.argv[3]).resolve(strict=True)
-try:
-    validation.relative_to(generation)
-except ValueError:
-    pass
-else:
-    raise ValueError("VALIDATION_DIR must not be inside GEN_DIR")
-try:
-    generation.relative_to(validation)
-except ValueError:
-    pass
-else:
-    raise ValueError("GEN_DIR must not be inside VALIDATION_DIR")
-try:
-    validation.relative_to(pilot)
-except ValueError:
-    pass
-else:
-    raise ValueError("VALIDATION_DIR must not be inside PILOT_INPUT_DIR")
-try:
-    pilot.relative_to(validation)
-except ValueError:
-    pass
-else:
-    raise ValueError("PILOT_INPUT_DIR must not be inside VALIDATION_DIR")
+audit_arg = Path(sys.argv[4])
+if not audit_arg.is_absolute() or audit_arg.is_symlink() or not audit_arg.is_dir():
+    raise ValueError("SELECTION_AUDIT_DIR must be an absolute regular directory")
+audit = audit_arg.resolve(strict=True)
+roots = {
+    "VALIDATION_DIR": validation,
+    "GEN_DIR": generation,
+    "PILOT_INPUT_DIR": pilot,
+    "SELECTION_AUDIT_DIR": audit,
+}
+for outer_name, outer in roots.items():
+    for inner_name, inner in roots.items():
+        if outer_name == inner_name:
+            continue
+        try:
+            inner.relative_to(outer)
+        except ValueError:
+            continue
+        raise ValueError(f"{inner_name} must not be inside {outer_name}")
 PY
 then
-  fail "generation and validation directories are not independent" 64
+  fail "generation, validation, pilot, and selection audit directories are not independent" 64
 fi
 
 verify_raw_inventory() {
@@ -255,32 +267,50 @@ verify_pilot_contract() {
   if ! (cd "$PILOT_INPUT_DIR" && sha256sum -c inputs.sha256 >/dev/null 2>&1); then
     fail "pilot input marker verification failed" 65
   fi
+  if [ -e "$SELECTION_AUDIT_DIR/failed.txt" ] || [ -L "$SELECTION_AUDIT_DIR/failed.txt" ]; then
+    fail "selection audit failure marker exists" 65
+  fi
   if ! "$PYTHON_BIN" - \
     "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
     "$PILOT_TRAIN" "$PILOT_VALIDATION" "$PILOT_BUILDER" \
-    "$PROPOSAL_PREPARE" "$PREPROCESSING" <<'PY'
+    "$PROPOSAL_PREPARE" "$PREPROCESSING" "$AUDIT_WRAPPER" \
+    "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" \
+    "$SELECTION_AUDIT_EVIDENCE" \
+    "$SELECTION_AUDIT_RECOMPUTE" "$SELECTION_AUDIT_INVENTORY" \
+    "$SELECTION_AUDIT_TRAIN" "$SELECTION_AUDIT_VALIDATION" \
+    "$SELECTION_AUDIT_YAML" "$SELECTION_AUDIT_INPUTS" \
+    "$SELECTION_AUDIT_INPUT_READY" <<'PY'
 import csv
 import hashlib
 import json
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import yaml
 
 (
     ready_path, marker_path, inventory_path, yaml_path, train_path, val_path,
-    builder_path, proposal_path, preprocessing_path,
-) = map(Path, sys.argv[1:10])
+    builder_path, proposal_path, preprocessing_path, audit_wrapper_path,
+    audit_ready_path,
+    audit_marker_path, audit_evidence_path, recompute_dir,
+    recomputed_inventory, recomputed_train,
+    recomputed_validation, recomputed_yaml, recomputed_inputs, recomputed_ready,
+) = map(Path, sys.argv[1:21])
 role = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
     "not_training_blind_or_deployment_authority"
 )
 contract = (
     "v4_repro_pilot_inputs."
-    "gt_stratified_historical_background_probe_blake2b.v2"
+    "gt_stratified_historical_observation_priority_blake2b.v3"
 )
+audit_role = (
+    "v4_repro_selection_audit_cpu_only_diagnostic_"
+    "not_generation_training_blind_or_deployment_authority"
+)
+audit_contract = "v4_repro_selection_audit.cpu_only_byte_exact.v1"
 materials = (
     "can", "pet", "paper", "plastic", "styrofoam", "vinyl", "glass",
     "battery", "fluorescent",
@@ -310,6 +340,17 @@ for value, description, status in (
     if value.get("status") != status:
         raise ValueError(f"{description} status mismatch")
 
+seed = inventory.get("seed")
+ready_seed = ready.get("seed")
+if (
+    type(seed) is not int
+    or seed < 0
+    or seed != 20260901
+    or type(ready_seed) is not int
+    or ready_seed != seed
+):
+    raise ValueError("pilot selection seed is invalid or inconsistent")
+
 if ready.get("selected_sources") != 3500:
     raise ValueError("pilot ready selected source count must be 3500")
 if ready.get("selected_counts") != expected_counts:
@@ -336,6 +377,7 @@ for field in (
     "historical_background_probe_requires_current_single_object_label",
     "historical_background_category_is_selection_only",
     "historical_background_category_is_not_ground_truth",
+    "historical_observation_priority_is_selection_only",
     "current_batch1_replay_decides_emitted_category",
     "material_requires_exactly_one_valid_yolo_label",
     "multi_object_excluded",
@@ -393,19 +435,46 @@ if not isinstance(inventory_bindings, dict):
     raise ValueError("pilot inventory bindings are missing")
 if bindings.get("resolved_universe_sha256") != inventory_bindings.get("resolved_universe_sha256"):
     raise ValueError("pilot ready universe binding mismatch")
-if Path(str(inventory_bindings.get("selector_path", ""))).resolve() != builder_path.resolve():
-    raise ValueError("pilot inventory selector path mismatch")
+bound_selector_path = inventory_bindings.get("selector_path")
+if (
+    not isinstance(bound_selector_path, str)
+    or not Path(bound_selector_path).is_absolute()
+    or builder_path.is_symlink()
+):
+    raise ValueError("pilot inventory selector path binding is invalid")
 if inventory_bindings.get("selector_sha256") != sha(builder_path):
     raise ValueError("pilot inventory selector hash mismatch")
-if Path(str(inventory_bindings.get("proposal_generator_path", ""))).resolve() != proposal_path.resolve():
-    raise ValueError("pilot inventory proposal generator path mismatch")
+bound_proposal_path = inventory_bindings.get("proposal_generator_path")
+if (
+    not isinstance(bound_proposal_path, str)
+    or not Path(bound_proposal_path).is_absolute()
+    or proposal_path.is_symlink()
+):
+    raise ValueError("pilot inventory proposal generator path binding is invalid")
 if inventory_bindings.get("proposal_generator_sha256") != sha(proposal_path):
     raise ValueError("pilot inventory proposal generator hash mismatch")
+data_path = Path(str(inventory_bindings.get("data_path", "")))
+dataset_dir = Path(str(inventory_bindings.get("dataset_dir", "")))
+if (
+    not data_path.is_absolute()
+    or data_path.is_symlink()
+    or not data_path.is_file()
+    or inventory_bindings.get("data_sha256") != sha(data_path)
+):
+    raise ValueError("pilot inventory data binding mismatch")
+if not dataset_dir.is_absolute() or dataset_dir.is_symlink() or not dataset_dir.is_dir():
+    raise ValueError("pilot inventory dataset directory binding mismatch")
 # The current builder imports the proposal generator, which imports this crop
 # contract. The preprocessing bytes have no inventory field yet, so the outer
 # 00 marker is their immutable binding for this diagnostic run.
 if not preprocessing_path.is_file() or preprocessing_path.stat().st_size <= 0:
     raise ValueError("pilot preprocessing dependency is missing or empty")
+if (
+    audit_wrapper_path.is_symlink()
+    or not audit_wrapper_path.is_file()
+    or audit_wrapper_path.stat().st_size <= 0
+):
+    raise ValueError("selection audit wrapper dependency is missing or unsafe")
 
 selected = inventory.get("selected_sources")
 if not isinstance(selected, list) or len(selected) != 3500:
@@ -421,6 +490,9 @@ actual_background_composition = {
         {"current_explicit_empty_label": 0, "historical_background_probe": 0}
     ),
 }
+actual_historical_observation_priorities = 0
+actual_selected_material_observed_counts = Counter()
+selection_order_rows = defaultdict(list)
 listed = {"training": [], "validation": []}
 seen_paths = set()
 seen_source_hashes = set()
@@ -451,9 +523,24 @@ for row in selected:
     if source_sha in seen_source_hashes:
         raise ValueError("pilot selected source SHA is duplicated")
     seen_source_hashes.add(source_sha)
+    rank = row.get("selection_rank_within_stratum")
+    score = row.get("selection_score_blake2b128")
+    quota = 250 if split == "training" else 100
+    expected_score = hashlib.blake2b(
+        f"{seed}|{split}|{stratum}|{source_sha}".encode("utf-8"),
+        digest_size=16,
+    ).hexdigest()
+    if (
+        not isinstance(rank, int)
+        or isinstance(rank, bool)
+        or not 1 <= rank <= quota
+        or score != expected_score
+    ):
+        raise ValueError("pilot selected source rank or BLAKE2 score is invalid")
     categories = row.get("historical_categories_selection_only")
     explicit = row.get("explicit_empty_label")
     probe = row.get("historical_background_probe_selection_only")
+    reason = row.get("selection_reason")
     if not isinstance(categories, list) or any(
         category not in strata for category in categories
     ):
@@ -470,10 +557,11 @@ for row in selected:
             or len(row["gt_xywhn"]) != 4
         ):
             raise ValueError("pilot historical background probe semantics are invalid")
-        if row.get("selection_reason") not in {
+        if reason not in {
             "historical_background_probe_blake2", "drift_anchor_priority",
         }:
             raise ValueError("pilot historical background probe reason is invalid")
+        tier = 1 if reason == "drift_anchor_priority" else 2
         actual_background_composition[split]["historical_background_probe"] += 1
     else:
         if (
@@ -484,9 +572,26 @@ for row in selected:
         ):
             raise ValueError("pilot current GT selection semantics are invalid")
         if stratum == "background":
-            if row.get("selection_reason") != "current_explicit_empty_label":
+            if reason != "current_explicit_empty_label":
                 raise ValueError("pilot explicit background reason is invalid")
             actual_background_composition[split]["current_explicit_empty_label"] += 1
+            tier = 0
+        elif reason == "drift_anchor_priority":
+            if row.get("drift_anchor") is not True or not categories:
+                raise ValueError("pilot drift anchor priority lacks an anchor")
+            tier = 0
+            actual_selected_material_observed_counts[f"{split}/{stratum}"] += 1
+        elif categories:
+            if reason != "historical_observation_priority_blake2":
+                raise ValueError("pilot historical observation reason is invalid")
+            actual_historical_observation_priorities += 1
+            actual_selected_material_observed_counts[f"{split}/{stratum}"] += 1
+            tier = 1
+        elif reason != "deterministic_blake2":
+            raise ValueError("pilot unseen material reason is invalid")
+        else:
+            tier = 2
+    selection_order_rows[(split, stratum)].append((rank, tier, score))
     actual_counts[f"{split}/{stratum}"] += 1
     actual_current_gt_counts[f"{split}/{current_gt_stratum}"] += 1
     actual_cohort_counts[f"{split}/{cohort}"] += 1
@@ -497,6 +602,26 @@ if dict(actual_current_gt_counts) != inventory.get("selected_current_gt_counts")
     raise ValueError("pilot selected current GT counts mismatch")
 if dict(actual_cohort_counts) != inventory.get("selected_cohort_counts"):
     raise ValueError("pilot selected cohort counts mismatch")
+for split, quota in (("training", 250), ("validation", 100)):
+    for stratum in strata:
+        ordered = sorted(selection_order_rows[(split, stratum)])
+        if [rank for rank, _, _ in ordered] != list(range(1, quota + 1)):
+            raise ValueError("pilot selection ranks are not exact and continuous")
+        if any(
+            previous[1] > current[1]
+            for previous, current in zip(ordered, ordered[1:])
+        ):
+            raise ValueError("pilot selection priority tiers are out of order")
+        if any(
+            previous[1] == current[1] and previous[2] > current[2]
+            for previous, current in zip(ordered, ordered[1:])
+        ):
+            raise ValueError("pilot selection BLAKE2 order differs within a tier")
+        priority_tier = 1 if stratum == "background" else 0
+        if sum(
+            1 for _, tier, _ in ordered if tier == priority_tier
+        ) > max(1, quota // 5):
+            raise ValueError("pilot drift anchor priority exceeds its bounded cap")
 historical = inventory.get("historical_selection_evidence")
 if not isinstance(historical, dict):
     raise ValueError("pilot historical selection evidence is missing")
@@ -506,6 +631,53 @@ if historical.get("replay_validation_authority") is not False:
     raise ValueError("pilot historical evidence grants replay authority")
 if historical.get("background_category_authority") is not False:
     raise ValueError("pilot historical evidence grants background authority")
+declared_historical_observation_priorities = historical.get(
+    "historical_observation_priority_selected"
+)
+if (
+    not isinstance(declared_historical_observation_priorities, int)
+    or isinstance(declared_historical_observation_priorities, bool)
+    or declared_historical_observation_priorities < 0
+    or declared_historical_observation_priorities
+    != actual_historical_observation_priorities
+):
+    raise ValueError("pilot historical observation priority count is invalid")
+eligible_counts = inventory.get("eligible_counts")
+eligible_material_observed = historical.get(
+    "eligible_material_historical_observed_counts"
+)
+expected_material_labels = {
+    f"{split}/{material}"
+    for split in ("training", "validation")
+    for material in materials
+}
+if (
+    not isinstance(eligible_counts, dict)
+    or set(eligible_counts) != set(expected_counts)
+    or not isinstance(eligible_material_observed, dict)
+    or set(eligible_material_observed) != expected_material_labels
+):
+    raise ValueError("pilot eligible material observation evidence is missing")
+for label, quota in expected_counts.items():
+    available = eligible_counts[label]
+    if (
+        not isinstance(available, int)
+        or isinstance(available, bool)
+        or available < quota
+    ):
+        raise ValueError("pilot eligible source count is invalid")
+for label in sorted(expected_material_labels):
+    observed = eligible_material_observed[label]
+    available = eligible_counts[label]
+    quota = 250 if label.startswith("training/") else 100
+    if (
+        not isinstance(observed, int)
+        or isinstance(observed, bool)
+        or observed < 0
+        or observed > available
+        or actual_selected_material_observed_counts[label] != min(quota, observed)
+    ):
+        raise ValueError("pilot eligible historical observation count is invalid")
 eligible_empty = historical.get("eligible_current_explicit_empty_counts")
 eligible_probe = historical.get("eligible_historical_background_probe_counts")
 declared_composition = inventory.get("background_quota_composition")
@@ -524,6 +696,8 @@ for split, quota in (("training", 250), ("validation", 100)):
         or available_probe < 0
     ):
         raise ValueError("pilot eligible background counts are invalid")
+    if eligible_counts[f"{split}/background"] != available_empty + available_probe:
+        raise ValueError("pilot background eligible evidence does not cover its universe")
     selected_empty = min(quota, available_empty)
     selected_probe = quota - selected_empty
     if available_probe < selected_probe:
@@ -567,12 +741,287 @@ if Path(str(dataset.get("path", ""))).resolve() != Path(
 names = dataset.get("names")
 if names != {index: name for index, name in enumerate(materials)}:
     raise ValueError("pilot YAML material names mismatch")
+
+old_evidence = historical.get("old_manifest")
+drift_evidence = historical.get("drift_report")
+if not isinstance(old_evidence, dict) or not isinstance(drift_evidence, dict):
+    raise ValueError("pilot historical recompute evidence is missing")
+old_path = Path(str(old_evidence.get("path", "")))
+drift_path = Path(str(drift_evidence.get("path", "")))
+if (
+    not old_path.is_absolute()
+    or old_path.is_symlink()
+    or not old_path.is_file()
+    or old_evidence.get("sha256") != sha(old_path)
+):
+    raise ValueError("pilot historical manifest recompute binding mismatch")
+if (
+    not drift_path.is_absolute()
+    or drift_path.is_symlink()
+    or not drift_path.is_file()
+    or drift_evidence.get("sha256") != sha(drift_path)
+):
+    raise ValueError("pilot drift report recompute binding mismatch")
+
+# Selected-row checks alone cannot prove top-K completeness. That expensive
+# selector replay is performed by a separate CPU-only immutable stage before
+# raw generation. Validation consumes only its sealed evidence so it cannot
+# refill host page cache immediately before the GPU validator starts.
+if recompute_dir.is_symlink() or not recompute_dir.is_dir():
+    raise ValueError("selection audit recompute directory is missing or unsafe")
+audit_root = audit_ready_path.parent
+if audit_root.is_symlink() or not audit_root.is_dir():
+    raise ValueError("selection audit root is missing or unsafe")
+expected_audit_root_entries = {
+    "selection_audit_ready.json",
+    "selection_audit.sha256",
+    "selection_audit_evidence.json",
+    "recompute",
+}
+audit_root_entries = list(audit_root.iterdir())
+if (
+    {entry.name for entry in audit_root_entries} != expected_audit_root_entries
+    or any(entry.is_symlink() for entry in audit_root_entries)
+    or any(
+        entry.name == "recompute" and not entry.is_dir()
+        for entry in audit_root_entries
+    )
+    or any(
+        entry.name != "recompute" and not entry.is_file()
+        for entry in audit_root_entries
+    )
+):
+    raise ValueError("selection audit root file set is not exact")
+expected_recompute_entries = {
+    "input_ready.json", "inputs.sha256", "pilot_dataset.yaml",
+    "selection_inventory.json", "train_pilot.txt", "validation_pilot.txt",
+}
+recompute_entries = list(recompute_dir.iterdir())
+if (
+    {entry.name for entry in recompute_entries} != expected_recompute_entries
+    or any(entry.is_symlink() or not entry.is_file() for entry in recompute_entries)
+):
+    raise ValueError("selection audit recompute file set is not exact")
+audit_artifacts = {
+    "input_ready.json": recomputed_ready,
+    "inputs.sha256": recomputed_inputs,
+    "pilot_dataset.yaml": recomputed_yaml,
+    "selection_inventory.json": recomputed_inventory,
+    "train_pilot.txt": recomputed_train,
+    "validation_pilot.txt": recomputed_validation,
+}
+pilot_artifacts_for_audit = {
+    "input_ready.json": ready_path,
+    "inputs.sha256": marker_path,
+    "pilot_dataset.yaml": yaml_path,
+    "selection_inventory.json": inventory_path,
+    "train_pilot.txt": train_path,
+    "validation_pilot.txt": val_path,
+}
+for description, artifacts in (
+    ("selection audit", {
+        "selection_audit_ready.json": audit_ready_path,
+        "selection_audit.sha256": audit_marker_path,
+        "selection_audit_evidence.json": audit_evidence_path,
+        **audit_artifacts,
+    }),
+    ("pilot audit binding", pilot_artifacts_for_audit),
+):
+    for name, artifact in artifacts.items():
+        if artifact.is_symlink() or not artifact.is_file() or artifact.stat().st_size <= 0:
+            raise ValueError(f"{description} artifact is missing or unsafe: {name}")
+
+audit_value = json.loads(audit_ready_path.read_text(encoding="utf-8"))
+if audit_value.get("schema_version") != 1:
+    raise ValueError("selection audit ready schema mismatch")
+if audit_value.get("artifact_role") != audit_role:
+    raise ValueError("selection audit ready role mismatch")
+if audit_value.get("audit_contract") != audit_contract:
+    raise ValueError("selection audit ready audit contract mismatch")
+if audit_value.get("status") != "selection_audit_ready":
+    raise ValueError("selection audit ready status mismatch")
+if audit_value.get("selection_contract") != contract:
+    raise ValueError("selection audit selection contract mismatch")
+if audit_value.get("cpu_only") is not True:
+    raise ValueError("selection audit ready is not CPU-only")
+audit_seed = audit_value.get("seed")
+if type(audit_seed) is not int or audit_seed != seed or audit_seed != 20260901:
+    raise ValueError("selection audit seed is invalid or inconsistent")
+if audit_value.get("quota_per_stratum") != inventory.get("quota_per_stratum"):
+    raise ValueError("selection audit ready quota mismatch")
+if audit_value.get("selected_sources") != len(selected):
+    raise ValueError("selection audit ready selected source count mismatch")
+if audit_value.get("byte_exact_artifacts") != [
+    "selection_inventory.json", "train_pilot.txt", "validation_pilot.txt",
+]:
+    raise ValueError("selection audit ready byte-exact artifact list mismatch")
+for field in (
+    "raw_generation_authorized", "validator_authority", "judge_authority",
+    "training_authority", "blind_test_authority",
+    "candidate_promotion_authorized", "production_deployment_authorized",
+):
+    if audit_value.get(field) is not False:
+        raise ValueError(f"selection audit unexpectedly grants {field}")
+
+audit_bindings = audit_value.get("bindings")
+if not isinstance(audit_bindings, dict):
+    raise ValueError("selection audit bindings are missing")
+expected_pilot_audit_hashes = {
+    name: sha(path) for name, path in sorted(pilot_artifacts_for_audit.items())
+}
+expected_recomputed_hashes = {
+    name: sha(path) for name, path in sorted(audit_artifacts.items())
+}
+if audit_bindings.get("selector_sha256") != sha(builder_path):
+    raise ValueError("selection audit selector hash mismatch")
+if audit_bindings.get("resolved_universe_sha256") != inventory_bindings.get(
+    "resolved_universe_sha256"
+):
+    raise ValueError("selection audit ready universe binding mismatch")
+if audit_bindings.get("pilot_artifacts") != expected_pilot_audit_hashes:
+    raise ValueError("selection audit pilot artifact bindings mismatch")
+if audit_bindings.get("recompute_artifacts") != expected_recomputed_hashes:
+    raise ValueError("selection audit recompute artifact bindings mismatch")
+if audit_bindings.get("selection_audit_marker_sha256") != sha(audit_marker_path):
+    raise ValueError("selection audit marker binding mismatch")
+if audit_bindings.get("selection_audit_evidence_sha256") != sha(audit_evidence_path):
+    raise ValueError("selection audit evidence binding mismatch")
+
+audit_evidence = json.loads(audit_evidence_path.read_text(encoding="utf-8"))
+if (
+    audit_evidence.get("schema_version") != 1
+    or audit_evidence.get("artifact_role") != audit_role
+    or audit_evidence.get("audit_contract") != audit_contract
+    or audit_evidence.get("status") != "selection_recomputed_byte_exact"
+    or audit_evidence.get("selection_contract") != contract
+    or audit_evidence.get("cpu_only") is not True
+    or type(audit_evidence.get("seed")) is not int
+    or audit_evidence.get("seed") != seed
+):
+    raise ValueError("selection audit evidence contract is invalid")
+if audit_evidence.get("quota_per_stratum") != inventory.get("quota_per_stratum"):
+    raise ValueError("selection audit evidence quota mismatch")
+if audit_evidence.get("selected_sources") != len(selected):
+    raise ValueError("selection audit evidence selected source count mismatch")
+expected_comparisons = {
+    "selection_inventory_json_byte_exact": True,
+    "train_pilot_txt_byte_exact": True,
+    "validation_pilot_txt_byte_exact": True,
+}
+if audit_evidence.get("comparisons") != expected_comparisons:
+    raise ValueError("selection audit evidence comparisons are invalid")
+evidence_authority = audit_evidence.get("authority")
+if not isinstance(evidence_authority, dict):
+    raise ValueError("selection audit evidence authority is missing")
+for field in (
+    "raw_generation_authorized", "validator_authority", "judge_authority",
+    "training_authority", "blind_test_authority",
+    "candidate_promotion_authorized", "production_deployment_authorized",
+):
+    if evidence_authority.get(field) is not False:
+        raise ValueError(f"selection audit evidence unexpectedly grants {field}")
+evidence_bindings = audit_evidence.get("bindings")
+if not isinstance(evidence_bindings, dict):
+    raise ValueError("selection audit evidence bindings are missing")
+if evidence_bindings.get("selector_sha256") != sha(builder_path):
+    raise ValueError("selection audit evidence selector hash mismatch")
+for field in (
+    "wrapper_path", "selector_path", "proposal_generator_path", "data_path",
+    "dataset_dir", "historical_manifest_path", "drift_report_path",
+):
+    value = evidence_bindings.get(field)
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError(f"selection audit evidence path binding is invalid: {field}")
+if evidence_bindings.get("wrapper_sha256") != sha(audit_wrapper_path):
+    raise ValueError("selection audit evidence wrapper hash mismatch")
+if evidence_bindings.get("proposal_generator_sha256") != sha(proposal_path):
+    raise ValueError("selection audit evidence proposal generator hash mismatch")
+if evidence_bindings.get("data_sha256") != inventory_bindings.get("data_sha256"):
+    raise ValueError("selection audit evidence data hash mismatch")
+if Path(evidence_bindings["dataset_dir"]).resolve() != dataset_dir.resolve():
+    raise ValueError("selection audit evidence dataset directory mismatch")
+if evidence_bindings.get("historical_manifest_sha256") != old_evidence.get("sha256"):
+    raise ValueError("selection audit evidence historical manifest hash mismatch")
+if evidence_bindings.get("drift_report_sha256") != drift_evidence.get("sha256"):
+    raise ValueError("selection audit evidence drift report hash mismatch")
+if evidence_bindings.get("resolved_universe_sha256") != inventory_bindings.get(
+    "resolved_universe_sha256"
+):
+    raise ValueError("selection audit evidence universe binding mismatch")
+if evidence_bindings.get("pilot_artifacts") != expected_pilot_audit_hashes:
+    raise ValueError("selection audit evidence pilot artifact bindings mismatch")
+if evidence_bindings.get("recompute_artifacts") != expected_recomputed_hashes:
+    raise ValueError("selection audit evidence recompute artifact bindings mismatch")
+
+declared_audit_hashes = {}
+for line in audit_marker_path.read_text(encoding="utf-8").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64}) [ *](.+)", line)
+    if not match:
+        raise ValueError("selection audit marker line is invalid")
+    path = Path(match.group(2))
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError("selection audit marker path is not absolute and regular")
+    resolved = path.resolve(strict=True)
+    if resolved in declared_audit_hashes:
+        raise ValueError("selection audit marker path is duplicated")
+    declared_audit_hashes[resolved] = match.group(1)
+expected_audit_marker = {
+    path.resolve(): digest
+    for name, path in sorted(
+        {**audit_artifacts, "selection_audit_evidence.json": audit_evidence_path}.items()
+    )
+    for digest in (
+        sha(audit_evidence_path)
+        if name == "selection_audit_evidence.json"
+        else expected_recomputed_hashes[name],
+    )
+}
+if declared_audit_hashes != expected_audit_marker:
+    raise ValueError("selection audit marker does not bind the exact seven audit artifacts")
+if recomputed_inventory.read_bytes() != inventory_path.read_bytes():
+    raise ValueError("selection audit inventory differs from pilot input")
+if recomputed_train.read_bytes() != train_path.read_bytes():
+    raise ValueError("selection audit training list differs from pilot input")
+if recomputed_validation.read_bytes() != val_path.read_bytes():
+    raise ValueError("selection audit validation list differs from pilot input")
+recomputed_artifacts = {
+    "pilot_dataset.yaml": recomputed_yaml,
+    "selection_inventory.json": recomputed_inventory,
+    "train_pilot.txt": recomputed_train,
+    "validation_pilot.txt": recomputed_validation,
+}
+expected_recomputed_input_hashes = {
+    name: sha(path) for name, path in recomputed_artifacts.items()
+}
+declared_recomputed_hashes = {}
+for line in recomputed_inputs.read_text(encoding="ascii").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)", line)
+    if not match or match.group(2) in declared_recomputed_hashes:
+        raise ValueError("selection recompute marker is invalid or duplicated")
+    declared_recomputed_hashes[match.group(2)] = match.group(1)
+if declared_recomputed_hashes != expected_recomputed_input_hashes:
+    raise ValueError("selection recompute marker does not bind its exact artifacts")
+recomputed_ready_value = json.loads(recomputed_ready.read_text(encoding="utf-8"))
+if (
+    recomputed_ready_value.get("status") != "pilot_inputs_ready"
+    or recomputed_ready_value.get("selection_contract") != contract
+    or type(recomputed_ready_value.get("seed")) is not int
+    or recomputed_ready_value.get("seed") != seed
+    or recomputed_ready_value.get("bindings", {}).get("inputs_marker_sha256")
+    != sha(recomputed_inputs)
+    or recomputed_ready_value.get("bindings", {}).get("artifacts")
+    != expected_recomputed_input_hashes
+):
+    raise ValueError("selection recompute ready marker is invalid")
 PY
   then
     fail "pilot input contract verification failed" 65
   fi
   if [ -e "$PILOT_INPUT_DIR/failed.txt" ] || [ -L "$PILOT_INPUT_DIR/failed.txt" ]; then
     fail "pilot input failure marker appeared during verification" 65
+  fi
+  if [ -e "$SELECTION_AUDIT_DIR/failed.txt" ] || [ -L "$SELECTION_AUDIT_DIR/failed.txt" ]; then
+    fail "selection audit failure marker appeared during verification" 65
   fi
 }
 
@@ -807,6 +1256,7 @@ selected_source_hashes = set()
 selected_anchor_paths = set()
 selected_background_probe_paths = set()
 priority_anchors = 0
+verified_historical_observation_priorities = 0
 for row in selected:
     if not isinstance(row, dict):
         raise ValueError("pilot selected row must be an object")
@@ -843,6 +1293,16 @@ for row in selected:
         raise ValueError("selected drift anchor differs from bound drift allowlist")
     if row.get("selection_reason") == "drift_anchor_priority" and not expected_anchor:
         raise ValueError("pilot drift anchor priority is not allowlisted")
+    if row.get("selection_reason") == "historical_observation_priority_blake2":
+        if (
+            not actual_historical_categories
+            or row.get("selection_stratum") == "background"
+            or row.get("current_gt_stratum") != row.get("selection_stratum")
+            or row.get("selection_cohort") != "current_yolo_ground_truth"
+            or row.get("historical_background_probe_selection_only") is not False
+        ):
+            raise ValueError("pilot historical observation priority lacks bound membership")
+        verified_historical_observation_priorities += 1
     try:
         label_text = label_content.decode("utf-8")
     except UnicodeError as error:
@@ -930,6 +1390,11 @@ if historical.get("anchors_selected") != len(selected_anchor_paths):
     raise ValueError("selected drift anchor count differs from historical evidence")
 if historical.get("anchors_priority_selected") != priority_anchors:
     raise ValueError("priority drift anchor count differs from historical evidence")
+if (
+    historical.get("historical_observation_priority_selected")
+    != verified_historical_observation_priorities
+):
+    raise ValueError("verified historical observation priority count differs")
 
 generation_inventory = json.loads(generation_inventory_path.read_text(encoding="utf-8"))
 if generation_inventory.get("schema_version") != 1 or generation_inventory.get("contract") != "resolved_yolo_train_val_sources_and_label_sidecars_sha256.v1":
@@ -1146,7 +1611,7 @@ verify_generation_contract() {
     "$GEN_READY" "$GEN_INPUTS" "$GEN_OUTPUTS" "$RAW_MANIFEST" \
     "$DATASET_INFO" "$RAW_INVENTORY" "$PILOT_YAML" "$DETECTOR_MODEL" \
     "$PROPOSAL_PREPARE" "$PREPROCESSING" "$GEN_WRAPPER" \
-    "$GEN_DATASET_INPUT_INVENTORY" <<'PY'
+    "$GEN_DATASET_INPUT_INVENTORY" "$PILOT_READY" <<'PY'
 import csv
 import hashlib
 import json
@@ -1157,9 +1622,10 @@ from pathlib import Path
 (
     ready_path, inputs, outputs, manifest, info, inventory, pilot_yaml,
     detector, proposal_prepare, preprocessing, generation_wrapper,
-    dataset_input_inventory,
-) = map(Path, sys.argv[1:13])
+    dataset_input_inventory, pilot_ready_path,
+) = map(Path, sys.argv[1:14])
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
+pilot_ready = json.loads(pilot_ready_path.read_text(encoding="utf-8"))
 if ready.get("schema_version") != 1:
     raise ValueError("generation ready schema mismatch")
 if ready.get("status") != "raw_generation_ready":
@@ -1219,10 +1685,13 @@ for (section, field), expected in expected_contract.items():
     if dataset_info.get(section, {}).get(field) != expected:
         raise ValueError(f"generation dataset_info contract mismatch: {section}.{field}")
 seed = ready.get("seed")
-if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+if type(seed) is not int or seed != 20260901:
     raise ValueError("generation ready seed is invalid")
-if dataset_info.get("selection", {}).get("seed") != seed:
+dataset_seed = dataset_info.get("selection", {}).get("seed")
+if type(dataset_seed) is not int or dataset_seed != seed:
     raise ValueError("generation dataset_info seed differs from ready marker")
+if type(pilot_ready.get("seed")) is not int or pilot_ready.get("seed") != seed:
+    raise ValueError("generation seed differs from pilot selection seed")
 written = dataset_info.get("written_crops")
 with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
     manifest_rows = sum(1 for _ in csv.DictReader(handle))
@@ -1396,10 +1865,15 @@ PY
 verify_generation_contract
 seal_or_verify_cohort create
 write_marker "$CONTROL/00_raw_generation.sha256" \
-  "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
+  "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$AUDIT_WRAPPER" \
+  "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
   "$PREPROCESSING" "$DETECTOR_MODEL" "$INFERENCE_SPEC" \
   "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
   "$PILOT_TRAIN" "$PILOT_VALIDATION" \
+  "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" "$SELECTION_AUDIT_EVIDENCE" \
+  "$SELECTION_AUDIT_INVENTORY" "$SELECTION_AUDIT_TRAIN" \
+  "$SELECTION_AUDIT_VALIDATION" "$SELECTION_AUDIT_YAML" \
+  "$SELECTION_AUDIT_INPUTS" "$SELECTION_AUDIT_INPUT_READY" \
   "$RAW_MANIFEST" "$DATASET_INFO" "$GEN_INPUTS" "$GEN_OUTPUTS" \
   "$GEN_DATASET_INPUT_INVENTORY" \
   "$RAW_INVENTORY" "$GEN_READY" "$COHORT_BINDING"
@@ -1565,8 +2039,15 @@ verify_marker "$CONTROL/03_reproducibility.sha256"
 if ! "$PYTHON_BIN" - \
   "$READY" "$CONTROL/failed.txt" "$CONTROL/03_reproducibility.sha256" \
   "$GEN_READY" "$COMPARISON" "$A_MANIFEST" "$A_REPORT" "$B_REPORT" \
+  "$AUDIT_WRAPPER" \
   "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
-  "$PILOT_TRAIN" "$PILOT_VALIDATION" "$COHORT_BINDING" <<'PY'
+  "$PILOT_TRAIN" "$PILOT_VALIDATION" \
+  "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" \
+  "$SELECTION_AUDIT_EVIDENCE" \
+  "$SELECTION_AUDIT_INVENTORY" "$SELECTION_AUDIT_TRAIN" \
+  "$SELECTION_AUDIT_VALIDATION" "$SELECTION_AUDIT_YAML" \
+  "$SELECTION_AUDIT_INPUTS" "$SELECTION_AUDIT_INPUT_READY" \
+  "$COHORT_BINDING" <<'PY'
 import hashlib
 import json
 import os
@@ -1575,9 +2056,13 @@ from pathlib import Path
 
 (
     ready, failed, chain, generation_ready, comparison, manifest, report_a,
-    report_b, pilot_ready, pilot_inputs, pilot_inventory, pilot_yaml,
-    pilot_train, pilot_validation, cohort_binding,
-) = map(Path, sys.argv[1:16])
+    report_b, audit_wrapper, pilot_ready, pilot_inputs, pilot_inventory, pilot_yaml,
+    pilot_train, pilot_validation, selection_audit_ready,
+    selection_audit_marker, selection_audit_evidence,
+    selection_audit_inventory, selection_audit_train,
+    selection_audit_validation, selection_audit_yaml, selection_audit_inputs,
+    selection_audit_input_ready, cohort_binding,
+) = map(Path, sys.argv[1:26])
 if ready.exists() or ready.is_symlink():
     raise FileExistsError("diagnostic ready marker already exists")
 if failed.exists() or failed.is_symlink():
@@ -1624,12 +2109,22 @@ payload = {
         "validated_manifest_sha256": sha(manifest),
         "validator_a_report_sha256": sha(report_a),
         "validator_b_report_sha256": sha(report_b),
+        "selection_audit_wrapper_sha256": sha(audit_wrapper),
         "pilot_input_ready_sha256": sha(pilot_ready),
         "pilot_inputs_marker_sha256": sha(pilot_inputs),
         "pilot_selection_inventory_sha256": sha(pilot_inventory),
         "pilot_dataset_yaml_sha256": sha(pilot_yaml),
         "pilot_train_list_sha256": sha(pilot_train),
         "pilot_validation_list_sha256": sha(pilot_validation),
+        "selection_audit_ready_sha256": sha(selection_audit_ready),
+        "selection_audit_marker_sha256": sha(selection_audit_marker),
+        "selection_audit_evidence_sha256": sha(selection_audit_evidence),
+        "selection_audit_inventory_sha256": sha(selection_audit_inventory),
+        "selection_audit_train_list_sha256": sha(selection_audit_train),
+        "selection_audit_validation_list_sha256": sha(selection_audit_validation),
+        "selection_audit_dataset_yaml_sha256": sha(selection_audit_yaml),
+        "selection_audit_inputs_marker_sha256": sha(selection_audit_inputs),
+        "selection_audit_input_ready_sha256": sha(selection_audit_input_ready),
         "cohort_binding_sha256": sha(cohort_binding),
     },
 }

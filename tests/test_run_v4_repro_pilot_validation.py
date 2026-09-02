@@ -75,12 +75,25 @@ def cohort_base(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
                     "" if stratum == "background" else f"{class_ids[stratum]} 0.5 0.5 0.2 0.2\n",
                     encoding="utf-8",
                 )
+                source_sha = _sha(source)
                 anchor = rank == 1 and stratum in {"can", "vinyl", "background"}
+                historical_observed = anchor or (
+                    rank == 2 and stratum == "paper"
+                )
+                historical_categories = (
+                    ["can"]
+                    if rank == 2 and stratum == "paper"
+                    else [stratum]
+                    if historical_observed
+                    else []
+                )
                 selection_reason = (
                     "current_explicit_empty_label"
                     if stratum == "background"
                     else "drift_anchor_priority"
                     if anchor
+                    else "historical_observation_priority_blake2"
+                    if historical_observed
                     else "deterministic_blake2"
                 )
                 rows.append(
@@ -90,8 +103,13 @@ def cohort_base(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
                         "selection_stratum": stratum,
                         "current_gt_stratum": stratum,
                         "selection_cohort": "current_yolo_ground_truth",
+                        "selection_rank_within_stratum": rank,
+                        "selection_score_blake2b128": hashlib.blake2b(
+                            f"20260901|{split}|{stratum}|{source_sha}".encode(),
+                            digest_size=16,
+                        ).hexdigest(),
                         "path": source.resolve().as_posix(),
-                        "source_sha256": _sha(source),
+                        "source_sha256": source_sha,
                         "label_path": label.resolve().as_posix(),
                         "label_sha256": _sha(label),
                         "source_size": source.stat().st_size,
@@ -102,18 +120,39 @@ def cohort_base(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
                         "historical_background_probe_selection_only": False,
                         "gt_class_id": None if stratum == "background" else class_ids[stratum],
                         "gt_xywhn": None if stratum == "background" else [0.5, 0.5, 0.2, 0.2],
-                        "historical_categories_selection_only": (
-                            [stratum] if anchor else []
-                        ),
+                        "historical_categories_selection_only": historical_categories,
                     }
                 )
+    tier_by_reason = {
+        "current_explicit_empty_label": 0,
+        "drift_anchor_priority": 0,
+        "historical_observation_priority_blake2": 1,
+        "historical_background_probe_blake2": 2,
+        "deterministic_blake2": 2,
+    }
+    for split in ("training", "validation"):
+        for stratum in strata:
+            bucket = sorted(
+                (
+                    row
+                    for row in rows
+                    if row["split"] == split and row["stratum"] == stratum
+                ),
+                key=lambda row: (
+                    tier_by_reason[row["selection_reason"]],
+                    row["selection_score_blake2b128"],
+                ),
+            )
+            for selection_rank, row in enumerate(bucket, start=1):
+                row["selection_rank_within_stratum"] = selection_rank
     anchor_rows = [row for row in rows if row["drift_anchor"]]
     old_manifest = root / "historical-manifest.csv"
     old_manifest.write_text(
         "source_id,split,category\n"
         + "".join(
-            f"{row['source_sha256']},{row['split']},{row['stratum']}\n"
-            for row in anchor_rows
+            f"{row['source_sha256']},{row['split']},{category}\n"
+            for row in rows
+            for category in row["historical_categories_selection_only"]
         ),
         encoding="utf-8",
     )
@@ -153,10 +192,67 @@ def _fixture(
     nas = scripts / "nas"
     nas.mkdir(parents=True)
     (nas / SCRIPT.name).write_bytes(SCRIPT.read_bytes())
+    audit_wrapper_source = SCRIPT.parent / "run_v4_repro_selection_audit.sh"
+    (nas / audit_wrapper_source.name).write_bytes(audit_wrapper_source.read_bytes())
     (nas / "run_v4_reproducible_generation.sh").write_text(
         "#!/bin/sh\n# frozen batch=1 generation fixture\n", encoding="utf-8"
     )
-    (scripts / "build_v4_repro_pilot_inputs.py").write_text("BUILDER = 1\n", encoding="utf-8")
+    (scripts / "build_v4_repro_pilot_inputs.py").write_text(
+        r'''
+import argparse,hashlib,json,os,shutil
+from pathlib import Path
+
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+counter=Path(os.environ['FAKE_SELECTION_COUNTER'])
+count=int(counter.read_text(encoding='ascii')) if counter.exists() else 0
+count+=1
+counter.write_text(str(count),encoding='ascii')
+if count != 1:
+    raise SystemExit('CPU selector was executed more than once')
+
+p=argparse.ArgumentParser()
+p.add_argument('--data',required=True)
+p.add_argument('--dataset-dir',required=True)
+p.add_argument('--output-dir',required=True)
+p.add_argument('--seed',required=True,type=int)
+p.add_argument('--train-quota-per-stratum',required=True)
+p.add_argument('--validation-quota-per-stratum',required=True)
+p.add_argument('--old-manifest')
+p.add_argument('--drift-report')
+a=p.parse_args()
+reference=Path(os.environ['FAKE_SELECTION_RECOMPUTE_REFERENCE'])
+output=Path(a.output_dir)
+output.mkdir(parents=False,exist_ok=False)
+for name in ('selection_inventory.json','train_pilot.txt','validation_pilot.txt'):
+    shutil.copyfile(reference/name,output/name)
+materials=('can','pet','paper','plastic','styrofoam','vinyl','glass','battery','fluorescent')
+yaml_lines=[
+    f'path: "{Path(a.dataset_dir).resolve().as_posix()}"',
+    f'train: "{(output/"train_pilot.txt").resolve().as_posix()}"',
+    f'val: "{(output/"validation_pilot.txt").resolve().as_posix()}"',
+    'names:',
+    *(f'  {index}: {name}' for index,name in enumerate(materials)),
+]
+(output/'pilot_dataset.yaml').write_text('\n'.join(yaml_lines)+'\n',encoding='utf-8')
+artifacts={name:output/name for name in (
+    'pilot_dataset.yaml','selection_inventory.json','train_pilot.txt','validation_pilot.txt'
+)}
+marker=''.join(f'{sha(path)}  {name}\n' for name,path in sorted(artifacts.items()))
+(output/'inputs.sha256').write_text(marker,encoding='ascii')
+ready=json.loads((reference/'input_ready.json').read_text(encoding='utf-8'))
+ready['seed']=a.seed
+ready['bindings']['inputs_marker_sha256']=sha(output/'inputs.sha256')
+ready['bindings']['artifacts']={
+    name:sha(path) for name,path in sorted(artifacts.items())
+}
+(output/'input_ready.json').write_text(
+    json.dumps(ready,sort_keys=True,separators=(',',':'))+'\n',encoding='utf-8'
+)
+''',
+        encoding="utf-8",
+    )
     (scripts / "prepare_proposal_verifier_dataset.py").write_text("PREPARE = 1\n", encoding="utf-8")
     (scripts / "verifier_preprocessing_contract.py").write_text("CONTRACT = 1\n", encoding="utf-8")
     validator = scripts / "validate_v4_background_candidates.py"
@@ -277,6 +373,10 @@ print(json.dumps(report,sort_keys=True))
             "current_gt_stratum": "can",
             "selection_cohort": "historical_background_probe",
             "selection_reason": "historical_background_probe_blake2",
+            "selection_score_blake2b128": hashlib.blake2b(
+                f"20260901|training|background|{probe_source_sha}".encode(),
+                digest_size=16,
+            ).hexdigest(),
             "explicit_empty_label": False,
             "historical_background_probe_selection_only": True,
             "gt_class_id": 0,
@@ -304,6 +404,71 @@ print(json.dumps(report,sort_keys=True))
         forged_label.write_text("1 0.5 0.5 0.2 0.2\n", encoding="utf-8")
         selected_rows[forged_index]["label_path"] = forged_label.resolve().as_posix()
         selected_rows[forged_index]["label_sha256"] = _sha(forged_label)
+    if mode == "forged_selection_blake_score":
+        original_score = selected_rows[0]["selection_score_blake2b128"]
+        selected_rows[0]["selection_score_blake2b128"] = (
+            ("0" if original_score[0] != "0" else "1") + original_score[1:]
+        )
+    if mode == "forged_observation_priority_membership":
+        forged_observed_row = next(
+            row
+            for row in selected_rows
+            if row["stratum"] == "paper"
+            and row["selection_reason"] == "deterministic_blake2"
+        )
+        forged_observed_row["selection_reason"] = (
+            "historical_observation_priority_blake2"
+        )
+        forged_observed_row["historical_categories_selection_only"] = ["paper"]
+    tier_by_reason = {
+        "current_explicit_empty_label": 0,
+        "drift_anchor_priority": 0,
+        "historical_observation_priority_blake2": 1,
+        "historical_background_probe_blake2": 2,
+        "deterministic_blake2": 2,
+    }
+    for split in ("training", "validation"):
+        for stratum in (*materials, "background"):
+            bucket = sorted(
+                (
+                    row
+                    for row in selected_rows
+                    if row["split"] == split and row["stratum"] == stratum
+                ),
+                key=lambda row: (
+                    (
+                        1
+                        if stratum == "background"
+                        and row["selection_reason"] == "drift_anchor_priority"
+                        else tier_by_reason[row["selection_reason"]]
+                    ),
+                    row["selection_score_blake2b128"],
+                ),
+            )
+            for selection_rank, row in enumerate(bucket, start=1):
+                row["selection_rank_within_stratum"] = selection_rank
+    if mode == "forged_observation_priority_tier_order":
+        observed_row = next(
+            row
+            for row in selected_rows
+            if row["split"] == "training"
+            and row["stratum"] == "paper"
+            and row["selection_reason"]
+            == "historical_observation_priority_blake2"
+        )
+        unseen_row = next(
+            row
+            for row in selected_rows
+            if row["split"] == "training"
+            and row["stratum"] == "paper"
+            and row["selection_reason"] == "deterministic_blake2"
+        )
+        observed_row["selection_rank_within_stratum"], unseen_row[
+            "selection_rank_within_stratum"
+        ] = (
+            unseen_row["selection_rank_within_stratum"],
+            observed_row["selection_rank_within_stratum"],
+        )
     forged_anchor_row: dict[str, object] | None = None
     if mode == "forged_drift_anchor":
         forged_anchor_row = next(
@@ -342,6 +507,11 @@ print(json.dumps(report,sort_keys=True))
         + "\n",
         encoding="utf-8",
     )
+    source_data = tmp_path / "source-data.yaml"
+    source_data.write_text(
+        f'path: "{Path(cohort["root"]).joinpath("sources").resolve().as_posix()}"\n',
+        encoding="utf-8",
+    )
     universe = "a" * 64
     old_manifest = tmp_path / "historical-manifest.csv"
     old_manifest.write_bytes(Path(cohort["old_manifest"]).read_bytes())
@@ -364,6 +534,35 @@ print(json.dumps(report,sort_keys=True))
     priority_anchors = sum(
         row["selection_reason"] == "drift_anchor_priority" for row in selected_rows
     )
+    historical_observation_priorities = sum(
+        row["selection_reason"] == "historical_observation_priority_blake2"
+        for row in selected_rows
+    )
+    eligible_material_historical_observed_counts = dict(
+        sorted(
+            Counter(
+                f"{row['split']}/{row['stratum']}"
+                for row in selected_rows
+                if row["stratum"] != "background"
+                and row["historical_categories_selection_only"]
+            ).items()
+        )
+    )
+    for split in ("training", "validation"):
+        for material in materials:
+            eligible_material_historical_observed_counts.setdefault(
+                f"{split}/{material}", 0
+            )
+    if mode == "forged_eligible_observation_count":
+        eligible_material_historical_observed_counts["training/paper"] += 1
+    pilot_seed: object = (
+        -1
+        if mode == "negative_selection_seed"
+        else 20260902
+        if mode == "forged_positive_pilot_seed"
+        else 20260901
+    )
+    ready_seed: object = True if mode == "boolean_ready_seed" else pilot_seed
     selected_current_gt_counts = dict(
         sorted(
             Counter(
@@ -408,9 +607,10 @@ print(json.dumps(report,sort_keys=True))
                 ),
                 "selection_contract": (
                     "v4_repro_pilot_inputs."
-                    "gt_stratified_historical_background_probe_blake2b.v2"
+                    "gt_stratified_historical_observation_priority_blake2b.v3"
                 ),
                 "status": "selection_complete_not_replay_validated",
+                "seed": pilot_seed,
                 "quota_per_stratum": {"training": 250, "validation": 100},
                 "classes": list(materials),
                 "strata": list(strata),
@@ -420,6 +620,9 @@ print(json.dumps(report,sort_keys=True))
                     "historical_background_probe_requires_current_single_object_label": True,
                     "historical_background_category_is_selection_only": True,
                     "historical_background_category_is_not_ground_truth": True,
+                    "historical_observation_priority_is_selection_only": (
+                        mode != "false_observation_source_contract"
+                    ),
                     "current_batch1_replay_decides_emitted_category": True,
                     "material_requires_exactly_one_valid_yolo_label": True,
                     "multi_object_excluded": True,
@@ -427,6 +630,14 @@ print(json.dumps(report,sort_keys=True))
                     "same_split_conflicting_ground_truth_quarantined": True,
                 },
                 "selected_counts": selected_counts,
+                "eligible_counts": {
+                    **selected_counts,
+                    "training/background": (
+                        selected_counts["training/background"] + 1
+                        if mode == "forged_background_eligible_count"
+                        else selected_counts["training/background"]
+                    ),
+                },
                 "selected_current_gt_counts": selected_current_gt_counts,
                 "selected_cohort_counts": selected_cohort_counts,
                 "background_quota_composition": background_quota_composition,
@@ -450,6 +661,13 @@ print(json.dumps(report,sort_keys=True))
                     },
                     "anchors_selected": anchors_selected,
                     "anchors_priority_selected": priority_anchors,
+                    "historical_observation_priority_selected": (
+                        historical_observation_priorities
+                        + (1 if mode == "forged_observation_priority_count" else 0)
+                    ),
+                    "eligible_material_historical_observed_counts": (
+                        eligible_material_historical_observed_counts
+                    ),
                     "eligible_current_explicit_empty_counts": {
                         split: background_quota_composition[split][
                             "current_explicit_empty_label"
@@ -464,17 +682,23 @@ print(json.dumps(report,sort_keys=True))
                     },
                 },
                 "bindings": {
+                    "data_path": source_data.resolve().as_posix(),
+                    "data_sha256": _sha(source_data),
                     "resolved_universe_sha256": universe,
                     "dataset_dir": Path(cohort["root"]).joinpath("sources").resolve().as_posix(),
-                    "selector_path": (scripts / "build_v4_repro_pilot_inputs.py")
-                    .resolve()
-                    .as_posix(),
+                    "selector_path": (
+                        tmp_path / "archived-code" / "build_v4_repro_pilot_inputs.py"
+                        if mode == "archived_code_paths"
+                        else scripts / "build_v4_repro_pilot_inputs.py"
+                    ).resolve().as_posix(),
                     "selector_sha256": _sha(scripts / "build_v4_repro_pilot_inputs.py"),
                     "proposal_generator_path": (
-                        scripts / "prepare_proposal_verifier_dataset.py"
-                    )
-                    .resolve()
-                    .as_posix(),
+                        tmp_path
+                        / "archived-code"
+                        / "prepare_proposal_verifier_dataset.py"
+                        if mode == "archived_code_paths"
+                        else scripts / "prepare_proposal_verifier_dataset.py"
+                    ).resolve().as_posix(),
                     "proposal_generator_sha256": _sha(
                         scripts / "prepare_proposal_verifier_dataset.py"
                     ),
@@ -514,9 +738,10 @@ print(json.dumps(report,sort_keys=True))
                 ),
                 "selection_contract": (
                     "v4_repro_pilot_inputs."
-                    "gt_stratified_historical_background_probe_blake2b.v2"
+                    "gt_stratified_historical_observation_priority_blake2b.v3"
                 ),
                 "status": "pilot_inputs_ready",
+                "seed": ready_seed,
                 "selected_sources": 3500,
                 "selected_counts": selected_counts,
                 "selected_current_gt_counts": selected_current_gt_counts,
@@ -540,6 +765,347 @@ print(json.dumps(report,sort_keys=True))
         + "\n",
         encoding="utf-8",
     )
+    selection_reference = tmp_path / "selection-audit-reference"
+    selection_reference.mkdir()
+    for artifact in (pilot_inventory, train, validation, pilot_ready):
+        shutil.copyfile(artifact, selection_reference / artifact.name)
+
+    if mode == "forged_non_top_k_selection":
+        victim_index, victim = max(
+            (
+                (index, row)
+                for index, row in enumerate(selected_rows)
+                if row["split"] == "training"
+                and row["stratum"] == "paper"
+                and row["selection_reason"] == "deterministic_blake2"
+            ),
+            key=lambda item: item[1]["selection_score_blake2b128"],
+        )
+        extra_dir = Path(cohort["root"]) / "sources" / "training"
+        extra_source = extra_dir / "images" / "paper" / "non-top-k-extra.jpg"
+        extra_label = extra_dir / "labels" / "paper" / "non-top-k-extra.txt"
+        extra_label.write_text("2 0.5 0.5 0.2 0.2\n", encoding="utf-8")
+        for attempt in range(1, 100_000):
+            extra_source.write_bytes(f"non-top-k-extra:{attempt}".encode())
+            extra_sha = _sha(extra_source)
+            extra_score = hashlib.blake2b(
+                f"20260901|training|paper|{extra_sha}".encode(), digest_size=16
+            ).hexdigest()
+            if extra_score > victim["selection_score_blake2b128"]:
+                break
+        else:  # pragma: no cover - astronomically unlikely fixture failure
+            raise AssertionError("could not construct a higher-BLAKE eligible source")
+        replacement = {
+            **victim,
+            "path": extra_source.resolve().as_posix(),
+            "source_sha256": extra_sha,
+            "label_path": extra_label.resolve().as_posix(),
+            "label_sha256": _sha(extra_label),
+            "selection_score_blake2b128": extra_score,
+        }
+        selected_rows[victim_index] = replacement
+        train.write_text(
+            "\n".join(
+                sorted(row["path"] for row in selected_rows if row["split"] == "training")
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        forged_inventory = json.loads(pilot_inventory.read_text(encoding="utf-8"))
+        forged_inventory["selected_sources"] = selected_rows
+        forged_inventory["eligible_counts"]["training/paper"] += 1
+        pilot_inventory.write_text(
+            json.dumps(forged_inventory, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        pilot_artifacts = {
+            "pilot_dataset.yaml": pilot_yaml,
+            "selection_inventory.json": pilot_inventory,
+            "train_pilot.txt": train,
+            "validation_pilot.txt": validation,
+        }
+        with pilot_inputs.open("w", encoding="ascii", newline="\n") as handle:
+            for name, artifact in sorted(pilot_artifacts.items()):
+                handle.write(f"{_sha(artifact)}  {name}\n")
+        forged_ready = json.loads(pilot_ready.read_text(encoding="utf-8"))
+        forged_ready["bindings"]["inputs_marker_sha256"] = _sha(pilot_inputs)
+        forged_ready["bindings"]["artifacts"] = {
+            name: _sha(path) for name, path in sorted(pilot_artifacts.items())
+        }
+        pilot_ready.write_text(
+            json.dumps(forged_ready, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+    selection_audit = tmp_path / "selection-audit"
+    selection_recompute = selection_audit / "recompute"
+    selection_recompute.mkdir(parents=True)
+    recomputed_inventory = selection_recompute / "selection_inventory.json"
+    recomputed_train = selection_recompute / "train_pilot.txt"
+    recomputed_validation = selection_recompute / "validation_pilot.txt"
+    shutil.copyfile(
+        selection_reference / "selection_inventory.json", recomputed_inventory
+    )
+    shutil.copyfile(selection_reference / "train_pilot.txt", recomputed_train)
+    shutil.copyfile(
+        selection_reference / "validation_pilot.txt", recomputed_validation
+    )
+    recomputed_yaml = selection_recompute / "pilot_dataset.yaml"
+    recomputed_yaml.write_text(
+        "\n".join(
+            [
+                f'path: "{Path(cohort["root"]).joinpath("sources").resolve().as_posix()}"',
+                f'train: "{recomputed_train.resolve().as_posix()}"',
+                f'val: "{recomputed_validation.resolve().as_posix()}"',
+                "names:",
+                *(f"  {index}: {name}" for index, name in enumerate(materials)),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    recomputed_input_artifacts = {
+        "pilot_dataset.yaml": recomputed_yaml,
+        "selection_inventory.json": recomputed_inventory,
+        "train_pilot.txt": recomputed_train,
+        "validation_pilot.txt": recomputed_validation,
+    }
+    recomputed_inputs = selection_recompute / "inputs.sha256"
+    with recomputed_inputs.open("w", encoding="ascii", newline="\n") as handle:
+        for name, artifact in sorted(recomputed_input_artifacts.items()):
+            handle.write(f"{_sha(artifact)}  {name}\n")
+    recomputed_ready = selection_recompute / "input_ready.json"
+    recomputed_ready.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "pilot_inputs_ready",
+                "selection_contract": (
+                    "v4_repro_pilot_inputs."
+                    "gt_stratified_historical_observation_priority_blake2b.v3"
+                ),
+                "seed": 20260901,
+                "bindings": {
+                    "inputs_marker_sha256": _sha(recomputed_inputs),
+                    "artifacts": {
+                        name: _sha(path)
+                        for name, path in sorted(recomputed_input_artifacts.items())
+                    },
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    recompute_audit_artifacts = {
+        "input_ready.json": recomputed_ready,
+        "inputs.sha256": recomputed_inputs,
+        "pilot_dataset.yaml": recomputed_yaml,
+        "selection_inventory.json": recomputed_inventory,
+        "train_pilot.txt": recomputed_train,
+        "validation_pilot.txt": recomputed_validation,
+    }
+    audit_pilot_artifacts = {
+        "input_ready.json": pilot_ready,
+        "inputs.sha256": pilot_inputs,
+        "pilot_dataset.yaml": pilot_yaml,
+        "selection_inventory.json": pilot_inventory,
+        "train_pilot.txt": train,
+        "validation_pilot.txt": validation,
+    }
+    false_authority = {
+        "raw_generation_authorized": False,
+        "validator_authority": False,
+        "judge_authority": False,
+        "training_authority": False,
+        "blind_test_authority": False,
+        "candidate_promotion_authorized": False,
+        "production_deployment_authorized": False,
+    }
+    selection_audit_evidence = selection_audit / "selection_audit_evidence.json"
+    selection_audit_evidence_value = {
+                "schema_version": 1,
+                "artifact_role": (
+                    "v4_repro_selection_audit_cpu_only_diagnostic_"
+                    "not_generation_training_blind_or_deployment_authority"
+                ),
+                "audit_contract": "v4_repro_selection_audit.cpu_only_byte_exact.v1",
+                "status": "selection_recomputed_byte_exact",
+                "selection_contract": (
+                    "v4_repro_pilot_inputs."
+                    "gt_stratified_historical_observation_priority_blake2b.v3"
+                ),
+                "cpu_only": True,
+                "seed": 20260901,
+                "quota_per_stratum": {"training": 250, "validation": 100},
+                "selected_sources": 3500,
+                "comparisons": {
+                    "selection_inventory_json_byte_exact": True,
+                    "train_pilot_txt_byte_exact": True,
+                    "validation_pilot_txt_byte_exact": True,
+                },
+                "bindings": {
+                    "wrapper_path": (
+                        nas / "run_v4_repro_selection_audit.sh"
+                    ).resolve().as_posix(),
+                    "wrapper_sha256": _sha(
+                        nas / "run_v4_repro_selection_audit.sh"
+                    ),
+                    "selector_path": (
+                        scripts / "build_v4_repro_pilot_inputs.py"
+                    ).resolve().as_posix(),
+                    "selector_sha256": _sha(
+                        scripts / "build_v4_repro_pilot_inputs.py"
+                    ),
+                    "proposal_generator_path": (
+                        scripts / "prepare_proposal_verifier_dataset.py"
+                    ).resolve().as_posix(),
+                    "proposal_generator_sha256": _sha(
+                        scripts / "prepare_proposal_verifier_dataset.py"
+                    ),
+                    "data_path": source_data.resolve().as_posix(),
+                    "data_sha256": _sha(source_data),
+                    "dataset_dir": Path(cohort["root"]).joinpath(
+                        "sources"
+                    ).resolve().as_posix(),
+                    "resolved_universe_sha256": universe,
+                    "historical_manifest_path": old_manifest.resolve().as_posix(),
+                    "historical_manifest_sha256": _sha(old_manifest),
+                    "drift_report_path": drift_report.resolve().as_posix(),
+                    "drift_report_sha256": _sha(drift_report),
+                    "pilot_artifacts": {
+                        name: _sha(path)
+                        for name, path in sorted(audit_pilot_artifacts.items())
+                    },
+                    "recompute_artifacts": {
+                        name: _sha(path)
+                        for name, path in sorted(recompute_audit_artifacts.items())
+                    },
+                },
+                "authority": {
+                    **false_authority,
+                    "validator_authority": (
+                        mode == "selection_audit_evidence_authority"
+                    ),
+                },
+    }
+    if mode == "selection_audit_wrapper_hash_mismatch":
+        selection_audit_evidence_value["bindings"]["wrapper_sha256"] = "f" * 64
+    if mode == "selection_audit_wrapper_hash_missing":
+        selection_audit_evidence_value["bindings"].pop("wrapper_sha256")
+    selection_audit_evidence.write_text(
+        json.dumps(
+            selection_audit_evidence_value,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    selection_audit_marker = selection_audit / "selection_audit.sha256"
+    _write_sha_marker(
+        selection_audit_marker,
+        [
+            path
+            for _, path in sorted(
+                {
+                    **recompute_audit_artifacts,
+                    "selection_audit_evidence.json": selection_audit_evidence,
+                }.items()
+            )
+        ],
+    )
+    selection_audit_ready = selection_audit / "selection_audit_ready.json"
+    selection_audit_ready_value = {
+        "schema_version": 1,
+        "artifact_role": (
+            "v4_repro_selection_audit_cpu_only_diagnostic_"
+            "not_generation_training_blind_or_deployment_authority"
+        ),
+        "audit_contract": "v4_repro_selection_audit.cpu_only_byte_exact.v1",
+        "status": "selection_audit_ready",
+        "selection_contract": (
+            "v4_repro_pilot_inputs."
+            "gt_stratified_historical_observation_priority_blake2b.v3"
+        ),
+        "seed": 20260901,
+        "cpu_only": True,
+        "quota_per_stratum": {"training": 250, "validation": 100},
+        "selected_sources": 3500,
+        "byte_exact_artifacts": [
+            "selection_inventory.json",
+            "train_pilot.txt",
+            "validation_pilot.txt",
+        ],
+        "bindings": {
+            "selector_sha256": _sha(scripts / "build_v4_repro_pilot_inputs.py"),
+            "selection_audit_marker_sha256": _sha(selection_audit_marker),
+            "selection_audit_evidence_sha256": _sha(selection_audit_evidence),
+            "resolved_universe_sha256": universe,
+            "pilot_artifacts": {
+                name: _sha(path) for name, path in sorted(audit_pilot_artifacts.items())
+            },
+            "recompute_artifacts": {
+                name: _sha(path)
+                for name, path in sorted(recompute_audit_artifacts.items())
+            },
+        },
+        **false_authority,
+    }
+    if mode == "selection_audit_selector_mismatch":
+        selection_audit_ready_value["bindings"]["selector_sha256"] = "f" * 64
+    if mode == "selection_audit_pilot_binding_mismatch":
+        selection_audit_ready_value["bindings"]["pilot_artifacts"][
+            "selection_inventory.json"
+        ] = "f" * 64
+    if mode == "selection_audit_authority":
+        selection_audit_ready_value["validator_authority"] = True
+    selection_audit_ready.write_text(
+        json.dumps(selection_audit_ready_value, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    if mode == "selection_audit_marker_tamper":
+        with selection_audit_marker.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(f"{'f' * 64}  {(tmp_path / 'foreign-audit.txt').as_posix()}\n")
+    if mode == "selection_audit_extra_root_file":
+        (selection_audit / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+    if mode == "selection_audit_extra_recompute_directory":
+        (selection_recompute / "unexpected-directory").mkdir()
+    if mode == "selection_audit_wrapper_file_missing":
+        (nas / "run_v4_repro_selection_audit.sh").unlink()
+
+    selection_counter = tmp_path / "selection-selector-count.txt"
+    selection_audit_for_validation = selection_audit
+    if mode == "success":
+        real_selection_audit = tmp_path / "real-selection-audit"
+        audit_env = {
+            **os.environ,
+            "AUDIT_DIR": real_selection_audit.as_posix(),
+            "CODE_ROOT": code.as_posix(),
+            "PILOT_INPUT_DIR": pilot.as_posix(),
+            "PYTHON_BIN": Path(sys.executable).as_posix(),
+            "FAKE_SELECTION_RECOMPUTE_REFERENCE": selection_reference.as_posix(),
+            "FAKE_SELECTION_COUNTER": selection_counter.as_posix(),
+        }
+        audit_result = subprocess.run(
+            [
+                _integration_bash(tmp_path),
+                (nas / "run_v4_repro_selection_audit.sh").as_posix(),
+            ],
+            env=audit_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if audit_result.returncode != 0:
+            raise AssertionError(
+                "real selection audit fixture failed:\n"
+                f"stdout={audit_result.stdout}\nstderr={audit_result.stderr}"
+            )
+        selection_audit_for_validation = real_selection_audit
 
     detector = tmp_path / "best.pt"
     detector.write_bytes(b"detector")
@@ -602,6 +1168,12 @@ print(json.dumps(report,sort_keys=True))
         data_binding = tmp_path / "wrong-pilot.yaml"
         data_binding.write_text("wrong: true\n", encoding="utf-8")
     batch = 2 if mode == "wrong_batch" else 1
+    generation_seed = (
+        20260902 if mode == "pilot_generation_seed_mismatch" else 20260901
+    )
+    dataset_selection_seed: object = (
+        20260901.0 if mode == "float_generation_selection_seed" else generation_seed
+    )
     info.write_text(
         json.dumps(
             {
@@ -627,7 +1199,7 @@ print(json.dumps(report,sort_keys=True))
                     "val_max_per_class": 2000,
                     "max_background": 10000,
                     "val_max_background": 2000,
-                    "seed": 20260901,
+                    "seed": dataset_selection_seed,
                 },
                 "storage_guards": {"min_free_gb": 300.0, "max_output_gb": 30.0},
             },
@@ -730,7 +1302,7 @@ print(json.dumps(report,sort_keys=True))
                 "artifact_role": "raw_v4_reproducible_generation_not_validation_or_promotion_authority",
                 "status": "raw_generation_ready",
                 "batch": 1,
-                "seed": 20260901,
+                "seed": generation_seed,
                 "validator_authority": False,
                 "judge_authority": False,
                 "training_authority": False,
@@ -789,9 +1361,12 @@ exec "$REAL_PYTHON" "$@"
         "CODE_ROOT": code.as_posix(),
         "GEN_DIR": generation.as_posix(),
         "PILOT_INPUT_DIR": pilot.as_posix(),
+        "SELECTION_AUDIT_DIR": selection_audit_for_validation.as_posix(),
         "DETECTOR_MODEL": detector.as_posix(),
         "INFERENCE_SPEC": spec.as_posix(),
         "PYTHON_BIN": python_bin,
+        "FAKE_SELECTION_RECOMPUTE_REFERENCE": selection_reference.as_posix(),
+        "FAKE_SELECTION_COUNTER": selection_counter.as_posix(),
         "FAKE_VALIDATOR_MODE": mode,
     }
 
@@ -825,6 +1400,7 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
     text = _text()
     for name in (
         "VALIDATION_DIR", "CODE_ROOT", "GEN_DIR", "PILOT_INPUT_DIR",
+        "SELECTION_AUDIT_DIR",
         "DETECTOR_MODEL", "INFERENCE_SPEC",
     ):
         assert name in text
@@ -834,10 +1410,13 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
     assert "raw_output_inventory.json" in text
     assert "dataset_input_inventory.json" in text
     assert "selection_inventory.json" in text
+    assert "selection_audit_ready.json" in text
+    assert "selection_audit.sha256" in text
     assert "build_v4_repro_pilot_inputs.py" in text
     assert "prepare_proposal_verifier_dataset.py" in text
     assert "verifier_preprocessing_contract.py" in text
     assert "run_v4_reproducible_generation.sh" in text
+    assert "run_v4_repro_selection_audit.sh" in text
     assert "pilot_dataset.yaml" in text
     assert "train_pilot.txt" in text
     assert "validation_pilot.txt" in text
@@ -847,6 +1426,13 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
     assert "generation input marker does not bind the exact pilot dependencies" in text
     assert "selected source or label current bytes differ from inventory" in text
     assert "generation dataset input inventory differs from selected current bytes" in text
+    assert "selection audit inventory differs from pilot input" in text
+    assert "selection audit marker does not bind the exact seven audit artifacts" in text
+    assert "selection audit evidence comparisons are invalid" in text
+    assert "selection audit evidence wrapper hash mismatch" in text
+    assert "selection audit root file set is not exact" in text
+    assert "selection audit recompute file set is not exact" in text
+    assert "subprocess.run" not in text
     assert "raw manifest contains a source outside the selected pilot cohort" in text
     assert "raw manifest selected-source coverage is below 99 percent" in text
     assert "raw manifest omits one or more selected drift anchors" in text
@@ -910,6 +1496,7 @@ def test_integration_success_seals_two_exact_runs(
 ) -> None:
     result, env = _run(tmp_path, cohort_base)
     assert result.returncode == 0, result.stderr
+    assert Path(env["FAKE_SELECTION_COUNTER"]).read_text(encoding="ascii") == "1"
     root = Path(env["VALIDATION_DIR"])
     control = root / "control"
     ready = json.loads((control / "diagnostic_ready.json").read_text(encoding="utf-8"))
@@ -926,7 +1513,36 @@ def test_integration_success_seals_two_exact_runs(
     assert ready["training_authority"] is False
     assert ready["blind_test_authority"] is False
     assert ready["production_deployment_authorized"] is False
+    selection = json.loads(
+        (Path(env["PILOT_INPUT_DIR"]) / "selection_inventory.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    historical_material = next(
+        row
+        for row in selection["selected_sources"]
+        if row["split"] == "training"
+        and row["current_gt_stratum"] == "paper"
+        and row["selection_reason"]
+        == "historical_observation_priority_blake2"
+    )
+    assert historical_material["historical_categories_selection_only"] == ["can"]
+    assert historical_material["selection_stratum"] == "paper"
     assert not (control / "failed.txt").exists()
+    audit = Path(env["SELECTION_AUDIT_DIR"])
+    assert (audit / "selection_audit.sha256").is_file()
+    assert (audit / "recompute" / "selection_inventory.json").read_bytes() == (
+        Path(env["PILOT_INPUT_DIR"]) / "selection_inventory.json"
+    ).read_bytes()
+    assert ready["bindings"]["selection_audit_ready_sha256"] == _sha(
+        audit / "selection_audit_ready.json"
+    )
+    assert ready["bindings"]["selection_audit_marker_sha256"] == _sha(
+        audit / "selection_audit.sha256"
+    )
+    assert ready["bindings"]["selection_audit_evidence_sha256"] == _sha(
+        audit / "selection_audit_evidence.json"
+    )
     assert (root / "validator-a" / "manifest.csv").is_symlink()
     assert (root / "validator-b" / "validation").is_symlink()
     assert (root / "validator-a" / "manifest.v4.validated.csv").read_bytes() == (
@@ -964,6 +1580,22 @@ def test_integration_historical_background_probe_does_not_force_replay_category(
     assert ready["production_deployment_authorized"] is False
 
 
+def test_integration_accepts_archived_pilot_code_paths_with_exact_hashes(
+    tmp_path: Path, cohort_base: dict[str, object]
+) -> None:
+    result, env = _run(tmp_path, cohort_base, mode="archived_code_paths")
+    assert result.returncode == 0, result.stderr
+    ready = json.loads(
+        (
+            Path(env["VALIDATION_DIR"])
+            / "control"
+            / "diagnostic_ready.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert ready["status"] == "batch1_validator_ab_reproducibility_passed"
+    assert ready["production_deployment_authorized"] is False
+
+
 @pytest.mark.parametrize(
     "mode",
     [
@@ -976,6 +1608,29 @@ def test_integration_historical_background_probe_does_not_force_replay_category(
         "selected_source_tamper",
         "selected_label_tamper",
         "forged_label_semantics",
+        "forged_selection_blake_score",
+        "forged_observation_priority_membership",
+        "forged_observation_priority_count",
+        "forged_observation_priority_tier_order",
+        "forged_eligible_observation_count",
+        "false_observation_source_contract",
+        "negative_selection_seed",
+        "boolean_ready_seed",
+        "forged_positive_pilot_seed",
+        "pilot_generation_seed_mismatch",
+        "float_generation_selection_seed",
+        "forged_background_eligible_count",
+        "forged_non_top_k_selection",
+        "selection_audit_marker_tamper",
+        "selection_audit_selector_mismatch",
+        "selection_audit_pilot_binding_mismatch",
+        "selection_audit_authority",
+        "selection_audit_evidence_authority",
+        "selection_audit_wrapper_hash_mismatch",
+        "selection_audit_wrapper_hash_missing",
+        "selection_audit_wrapper_file_missing",
+        "selection_audit_extra_root_file",
+        "selection_audit_extra_recompute_directory",
         "generation_inventory_mismatch",
         "foreign_manifest_source",
         "external_crop",

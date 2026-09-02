@@ -39,7 +39,7 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
 CLASS_NAMES = proposal_dataset.CLASS_NAMES
 OUTPUT_STRATA = (*CLASS_NAMES, "background")
 SELECTION_CONTRACT = (
-    "v4_repro_pilot_inputs.gt_stratified_historical_background_probe_blake2b.v2"
+    "v4_repro_pilot_inputs.gt_stratified_historical_observation_priority_blake2b.v3"
 )
 ARTIFACT_ROLE = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
@@ -428,7 +428,13 @@ def _selection_rows(
     seed: int,
     training_quota: int,
     validation_quota: int,
-) -> tuple[list[dict[str, object]], dict[str, int], dict[str, int], dict[str, int]]:
+) -> tuple[
+    list[dict[str, object]],
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+]:
     eligible: dict[tuple[str, str], list[ScannedSource]] = defaultdict(list)
     for record in scanned:
         if not record.reasons:
@@ -449,6 +455,7 @@ def _selection_rows(
     eligible_counts: dict[str, int] = {}
     selected_counts: dict[str, int] = {}
     shortages: dict[str, int] = {}
+    eligible_material_historical_observed_counts: dict[str, int] = {}
     for split in ("training", "validation"):
         quota = training_quota if split == "training" else validation_quota
         material_available = {
@@ -538,6 +545,9 @@ def _selection_rows(
                     limit=max(0, remaining_quota - len(priority)),
                 )
             else:
+                eligible_material_historical_observed_counts[label] = sum(
+                    1 for record in candidates if record.historical_categories
+                )
                 priority = sorted(
                     (
                         record
@@ -547,14 +557,28 @@ def _selection_rows(
                     key=blake_key,
                 )[: min(anchor_priority_cap, remaining_quota)]
                 priority_ids = {id(record) for record in priority}
-                # After the bounded priority slice, ignore anchor status entirely
-                # and fill by the original BLAKE2 score.
-                remainder = [
+                remaining_candidates = [
                     record
                     for record in candidates
                     if id(record) not in explicit_ids
                     and id(record) not in priority_ids
                 ]
+                # Historical observations from the same split are a selection
+                # hint only.  Prefer detector-observed sources after the bounded
+                # drift-anchor slice, while preserving current YOLO GT and the
+                # original BLAKE2 order inside each tier.  Previously unseen
+                # sources remain a deterministic fallback.
+                historically_observed = [
+                    record
+                    for record in remaining_candidates
+                    if record.historical_categories
+                ]
+                unseen = [
+                    record
+                    for record in remaining_candidates
+                    if not record.historical_categories
+                ]
+                remainder = [*historically_observed, *unseen]
             chosen = [
                 *explicit_background,
                 *priority,
@@ -584,6 +608,8 @@ def _selection_rows(
                     selection_reason = "drift_anchor_priority"
                 elif historical_background_probe:
                     selection_reason = "historical_background_probe_blake2"
+                elif stratum != "background" and record.historical_categories:
+                    selection_reason = "historical_observation_priority_blake2"
                 else:
                     selection_reason = "deterministic_blake2"
                 selected_rows.append(
@@ -629,7 +655,13 @@ def _selection_rows(
             str(row["path"]),
         )
     )
-    return selected_rows, eligible_counts, selected_counts, shortages
+    return (
+        selected_rows,
+        eligible_counts,
+        selected_counts,
+        shortages,
+        eligible_material_historical_observed_counts,
+    )
 
 
 def _universe_binding(scanned: Iterable[ScannedSource]) -> tuple[str, int]:
@@ -763,6 +795,18 @@ def _verify_selected_semantics(selected: Iterable[Mapping[str, object]]) -> None
                 or explicit is not (current == "background")
             ):
                 raise RuntimeError("current YOLO ground-truth selection semantics are invalid")
+            reason = row.get("selection_reason")
+            if current == "background":
+                if reason != "current_explicit_empty_label":
+                    raise RuntimeError("explicit background selection reason is invalid")
+            elif reason == "drift_anchor_priority":
+                if row.get("drift_anchor") is not True:
+                    raise RuntimeError("drift anchor priority lacks an anchor")
+            elif categories:
+                if reason != "historical_observation_priority_blake2":
+                    raise RuntimeError("historical observation selection reason is invalid")
+            elif reason != "deterministic_blake2":
+                raise RuntimeError("unseen material selection reason is invalid")
 
 
 def build_pilot_inputs(
@@ -776,7 +820,7 @@ def build_pilot_inputs(
     old_manifest: Path | None = None,
     drift_report: Path | None = None,
 ) -> dict[str, object]:
-    if seed < 0:
+    if type(seed) is not int or seed < 0:
         raise ValueError("seed must be a non-negative integer")
     if training_quota < 1 or validation_quota < 1:
         raise ValueError("training and validation quotas must be positive")
@@ -803,7 +847,13 @@ def build_pilot_inputs(
         _apply_historical_selection_metadata(
             scanned, historical=historical, anchors=anchors
         )
-        selected, eligible_counts, selected_counts, shortages = _selection_rows(
+        (
+            selected,
+            eligible_counts,
+            selected_counts,
+            shortages,
+            eligible_material_historical_observed_counts,
+        ) = _selection_rows(
             scanned,
             seed=seed,
             training_quota=training_quota,
@@ -895,6 +945,7 @@ def build_pilot_inputs(
                 "historical_background_probe_requires_current_single_object_label": True,
                 "historical_background_category_is_selection_only": True,
                 "historical_background_category_is_not_ground_truth": True,
+                "historical_observation_priority_is_selection_only": True,
                 "current_batch1_replay_decides_emitted_category": True,
                 "material_requires_exactly_one_valid_yolo_label": True,
                 "multi_object_excluded": True,
@@ -933,6 +984,15 @@ def build_pilot_inputs(
                     1
                     for row in selected
                     if row["selection_reason"] == "drift_anchor_priority"
+                ),
+                "historical_observation_priority_selected": sum(
+                    1
+                    for row in selected
+                    if row["selection_reason"]
+                    == "historical_observation_priority_blake2"
+                ),
+                "eligible_material_historical_observed_counts": dict(
+                    sorted(eligible_material_historical_observed_counts.items())
                 ),
                 "eligible_current_explicit_empty_counts": dict(
                     sorted(eligible_explicit_empty_counts.items())
