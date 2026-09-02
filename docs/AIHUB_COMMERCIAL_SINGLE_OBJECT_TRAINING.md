@@ -79,8 +79,27 @@ Pi 서버의 2026-08-01 00:00 KST 이후 캡처는 141건, SHA-256 중복 제거
 - 신규 20장: 기존 예측을 정답으로 사용하지 않고 Qwen3-VL 8B의 서로 다른 두
   구조화 판정이 일치한 경우만 후보로 만든다.
 - `client_id`는 NAS 교사 큐에 내보내지 않는다.
+- 2026-08-01 00:00 KST 이전, timestamp가 없거나 timezone이 불명확한 캡처, 심한
+  frame crop, 사람 손·팔 지배, 과도한 배경/다중 물체, 경계 판독 불가 이미지는
+  학습과 calibration에서 제외한다.
 - teacher와 기존 YOLO 클래스가 다르거나 외부 이물질·다중 객체인 이미지는 detector
   학습에서 제외하고 hard-case 분석에만 남긴다.
+- 캔·병·종이 자체의 구김·찌그러짐은 촬영 이상으로 보지 않는다. 대상 경계와 재질을
+  판독할 수 있으면 실제 투입 환경의 유효 hard case로 유지한다.
+- 기존 배포 YOLO bbox는 pseudo-label crop 권한으로 사용하지 않는다. 원본 SHA와 서로
+  다른 두 localizer의 실제 manifest·model·inference-spec SHA 및 source별 출력 SHA가
+  결박되고 bbox IoU가 고정 0.75 이상일 때만 양성 운영 캡처를 crop-ready로 만든다.
+  최종 builder도 이 원본 파일들을 다시 열어 해시와 bbox 합의를 재검산한다.
+- teacher 큐는 capture root 상대경로만 사용한다. root 이탈·외부 symlink·원본 SHA
+  변조와 이전 teacher 계약 checkpoint는 fail-closed로 거부한다.
+- teacher의 전체 prompt/schema/options와 모델 digest를 고정하고, 실제 Ollama
+  `/api/tags` digest를 실행 시작·각 이미지 직전·모든 pass 직후·최종 게시 직전에
+  확인한다. 중간 모델 변경이 감지되면 해당 이미지 checkpoint를 남기지 않고
+  중단한다. trusted known-audit와 capture inventory에서 `teacher_required`가 아닌
+  기존 train/보호 validation SHA는 거부한다.
+- 최종 CSV/JSONL에는 NAS 내부 후속 처리용 절대경로가 포함되므로 portable artifact로
+  배포하지 않으며 lineage에 `portable=false`와
+  `local_only_contains_absolute_paths=true`를 기록한다.
 
 관련 스크립트는 `prepare_operational_capture_queue.py`와
 `label_operational_captures_ollama.py`다.

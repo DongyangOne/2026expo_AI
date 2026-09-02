@@ -20,12 +20,35 @@ import json
 import math
 import os
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 import cv2
 import numpy as np
+
+try:
+    from scripts.operational_teacher_contract import (
+        TEACHER_LABEL_BASE_FIELDS, TEACHER_LABEL_SCHEMA_VERSION,
+        build_teacher_contract, load_known_audit, valid_sha256,
+    )
+    from scripts.build_independent_localization_consensus import (
+        AGGREGATE_METHOD, AGGREGATE_TOLERANCE, CONTRACT_SCHEMA_VERSION,
+        IOU_THRESHOLD, LOCALIZATION_SCHEMA_VERSION, bbox_iou,
+        canonical_json as localization_canonical_json, provider_output_core,
+        _provider_rows,
+    )
+except ModuleNotFoundError:  # direct ``python scripts/...py`` execution
+    from operational_teacher_contract import (  # type: ignore[no-redef]
+        TEACHER_LABEL_BASE_FIELDS, TEACHER_LABEL_SCHEMA_VERSION,
+        build_teacher_contract, load_known_audit, valid_sha256,
+    )
+    from build_independent_localization_consensus import (  # type: ignore[no-redef]
+        AGGREGATE_METHOD, AGGREGATE_TOLERANCE, CONTRACT_SCHEMA_VERSION,
+        IOU_THRESHOLD, LOCALIZATION_SCHEMA_VERSION, bbox_iou,
+        canonical_json as localization_canonical_json, provider_output_core,
+        _provider_rows,
+    )
 
 
 CLASS_NAMES = (
@@ -36,12 +59,32 @@ CLASS_IDS = {name: index for index, name in enumerate(CLASS_NAMES)}
 ACCEPTED_TEACHER_MATERIALS = frozenset((*CLASS_NAMES, "negative"))
 ALLOWED_ROLES = frozenset({"train", "calibration"})
 SHA256_LENGTH = 64
+QUALITY_REASONS = frozenset(
+    {
+        "usable",
+        "severe_frame_crop",
+        "person_occlusion_or_dominance",
+        "clutter_or_multiple_objects",
+        "boundary_unreadable",
+    }
+)
+KST = timezone(timedelta(hours=9))
+OPERATIONAL_CAPTURE_CUTOFF_KST = datetime(2026, 8, 1, 0, 0, 0, tzinfo=KST)
+OPERATIONAL_CAPTURE_CUTOFF_UTC = OPERATIONAL_CAPTURE_CUTOFF_KST.astimezone(
+    timezone.utc
+)
+MINIMUM_IMAGE_WIDTH = 160
+MINIMUM_IMAGE_HEIGHT = 120
+EXTREME_EXPOSURE_FRACTION = 0.995
+UNDEREXPOSED_LUMA_MAX = 5
+OVEREXPOSED_LUMA_MIN = 250
 
 MANIFEST_FIELDS = (
     "sample_id", "role", "split_role", "fold", "filepath", "split",
     "source_id", "source_sha256", "image_sha256", "content_identity",
     "object_group", "capture_session", "origin", "selection_reason",
-    "material", "category", "teacher_material", "dent", "label",
+    "material", "category", "teacher_material", "teacher_training_usable",
+    "teacher_quality_reason", "dent", "label",
     "foreign_material", "source_object_count", "source_path_b64",
     "source_bbox_x", "source_bbox_y", "source_bbox_w", "source_bbox_h",
     "source_width", "source_height", "bbox_x1", "bbox_y1", "bbox_x2",
@@ -153,8 +196,8 @@ def _timestamp(row: Mapping[str, object]) -> datetime | None:
         parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
     return parsed.astimezone(timezone.utc)
 
 
@@ -358,37 +401,224 @@ def _lineage_rows(
     return result
 
 
-def _image_path(row: Mapping[str, object], base: Path) -> Path | None:
-    value = _nested(row, "image_path", "filepath", "image.path", "metadata.image.path")
-    if not value:
-        return None
-    path = Path(str(value))
-    return path if path.is_absolute() else (base / path).resolve()
+def _image_path(
+    row: Mapping[str, object], image_root: Path
+) -> tuple[Path | None, str | None]:
+    value = row.get("image_ref")
+    if not isinstance(value, str) or not value.strip():
+        return None, "image_ref_missing"
+    relative = Path(value.strip())
+    if relative.is_absolute() or relative.drive or ".." in relative.parts:
+        return None, "image_ref_invalid_or_outside_root"
+    resolved = (image_root / relative).resolve(strict=False)
+    try:
+        resolved.relative_to(image_root)
+    except ValueError:
+        return None, "image_ref_invalid_or_outside_root"
+    return resolved, None
 
 
-def _read_dimensions(path: Path) -> tuple[int, int] | None:
+def _read_image(path: Path) -> np.ndarray | None:
     try:
         encoded = np.fromfile(path, dtype=np.uint8)
-        image = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+        image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
     except (OSError, cv2.error):
         return None
-    if image is None or image.ndim < 2:
+    if image is None or image.ndim != 3:
         return None
+    return image
+
+
+def _image_quality_reasons(image: np.ndarray) -> list[str]:
+    """Apply objective pre-teacher checks without blur/model self-filtering."""
+    reasons = []
     height, width = image.shape[:2]
-    return (int(width), int(height)) if width > 0 and height > 0 else None
+    if width < MINIMUM_IMAGE_WIDTH or height < MINIMUM_IMAGE_HEIGHT:
+        reasons.append("image_resolution_below_minimum")
+
+    luma = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    pixels = float(luma.size)
+    if (
+        pixels
+        and np.count_nonzero(luma <= UNDEREXPOSED_LUMA_MAX) / pixels
+        >= EXTREME_EXPOSURE_FRACTION
+    ):
+        reasons.append("image_extreme_underexposure")
+    if (
+        pixels
+        and np.count_nonzero(luma >= OVEREXPOSED_LUMA_MIN) / pixels
+        >= EXTREME_EXPOSURE_FRACTION
+    ):
+        reasons.append("image_extreme_overexposure")
+    return sorted(set(reasons))
 
 
-def _bbox_value(*rows: Mapping[str, object]) -> tuple[object | None, str]:
-    fields = (
-        "bbox", "deployed.bbox", "result.bbox", "metadata.result.bbox",
-        "detection.bbox",
+def _independent_localization(
+    row: Mapping[str, object], *, source_sha256: str, width: int, height: int,
+    trusted_provider_rows: Sequence[Mapping[str, object]],
+    trusted_provider_evidence: Sequence[Mapping[str, object]],
+) -> tuple[object | None, list[str]]:
+    value = row.get("independent_localization")
+    if not isinstance(value, Mapping):
+        return None, ["independent_localization_missing"]
+    reasons = []
+    required = {
+        "schema_version",
+        "source_image_sha256",
+        "bbox_xyxy",
+        "providers",
+        "provider_iou",
+        "contract",
+        "contract_sha256",
+        "deployed_prediction_used",
+        "consensus",
+    }
+    if set(value) != required:
+        reasons.append("independent_localization_invalid_shape")
+    if value.get("schema_version") != LOCALIZATION_SCHEMA_VERSION:
+        reasons.append("independent_localization_schema_version_mismatch")
+    if _valid_sha(value.get("source_image_sha256")) != source_sha256:
+        reasons.append("independent_localization_source_sha256_mismatch")
+    if value.get("deployed_prediction_used") is not False:
+        reasons.append("independent_localization_used_deployed_prediction")
+    if value.get("consensus") is not True:
+        reasons.append("independent_localization_no_consensus")
+    bbox_xyxy = value.get("bbox_xyxy")
+    bbox_shape_valid = not (
+        not isinstance(bbox_xyxy, list)
+        or len(bbox_xyxy) != 4
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in bbox_xyxy
+        )
     )
-    for row in rows:
-        for field in fields:
-            value = _nested(row, field)
-            if value is not None:
-                return value, field
-    return None, ""
+    if not bbox_shape_valid:
+        reasons.append("independent_localization_bbox_invalid_shape")
+    providers = value.get("providers")
+    if not isinstance(providers, list) or len(providers) != 2:
+        reasons.append("independent_localization_requires_two_providers")
+    else:
+        provider_names = []
+        provider_models = []
+        provider_outputs = []
+        normalized_providers = []
+        for provider in providers:
+            if not isinstance(provider, Mapping):
+                reasons.append("independent_localization_invalid_provider")
+                continue
+            try:
+                provider_box = [float(item) for item in provider.get("bbox_xyxy", [])]
+            except (TypeError, ValueError):
+                provider_box = []
+            if (
+                len(provider_box) != 4
+                or not all(math.isfinite(item) for item in provider_box)
+                or min(provider_box[0], provider_box[1]) < 0
+                or provider_box[2] <= provider_box[0]
+                or provider_box[3] <= provider_box[1]
+                or provider_box[2] > width
+                or provider_box[3] > height
+            ):
+                reasons.append("independent_localization_invalid_provider")
+                continue
+            core = provider_output_core(
+                provider=str(provider.get("provider") or ""),
+                source_sha=source_sha256,
+                box=provider_box,
+                model_sha=str(provider.get("model_sha256") or ""),
+                spec_sha=str(provider.get("inference_spec_sha256") or ""),
+            )
+            if set(provider) != {*core, "provider_output_sha256"}:
+                reasons.append("independent_localization_invalid_provider")
+            if any(provider.get(key) != expected for key, expected in core.items()):
+                reasons.append("independent_localization_invalid_provider")
+            expected_output = _sha256_bytes(
+                localization_canonical_json(core).encode("utf-8")
+            )
+            if provider.get("provider_output_sha256") != expected_output:
+                reasons.append("independent_localization_provider_output_sha256_mismatch")
+            name = provider.get("provider")
+            if not isinstance(name, str) or not name.strip():
+                reasons.append("independent_localization_invalid_provider")
+            else:
+                provider_names.append(name.strip().casefold())
+            model_sha = _valid_sha(provider.get("model_sha256"))
+            if model_sha is None:
+                reasons.append("independent_localization_invalid_provider_model_sha256")
+            else:
+                provider_models.append(model_sha)
+            if _valid_sha(provider.get("inference_spec_sha256")) is None:
+                reasons.append("independent_localization_invalid_provider_inference_spec_sha256")
+            provider_outputs.append(str(provider.get("provider_output_sha256") or ""))
+            normalized_providers.append(provider)
+        if len(provider_names) == 2 and len(set(provider_names)) != 2:
+            reasons.append("independent_localization_providers_not_distinct")
+        if len(provider_models) == 2 and len(set(provider_models)) != 2:
+            reasons.append("independent_localization_provider_models_not_distinct")
+        if len(provider_outputs) == 2 and len(set(provider_outputs)) != 2:
+            reasons.append("independent_localization_provider_outputs_not_distinct")
+        if len(normalized_providers) == 2:
+            if list(normalized_providers) != [dict(item) for item in trusted_provider_rows]:
+                reasons.append("independent_localization_provider_files_mismatch")
+            first_box = [float(item) for item in normalized_providers[0]["bbox_xyxy"]]
+            second_box = [float(item) for item in normalized_providers[1]["bbox_xyxy"]]
+            actual_iou = bbox_iou(first_box, second_box)
+            reported_iou = value.get("provider_iou")
+            if (
+                isinstance(reported_iou, bool)
+                or not isinstance(reported_iou, (int, float))
+                or not math.isfinite(float(reported_iou))
+                or abs(float(reported_iou) - actual_iou) > AGGREGATE_TOLERANCE
+            ):
+                reasons.append("independent_localization_provider_iou_mismatch")
+            if actual_iou < IOU_THRESHOLD:
+                reasons.append("independent_localization_iou_below_threshold")
+            expected_bbox = [
+                (first_box[index] + second_box[index]) / 2.0 for index in range(4)
+            ]
+            if bbox_shape_valid:
+                if any(
+                    abs(float(bbox_xyxy[index]) - expected_bbox[index])
+                    > AGGREGATE_TOLERANCE
+                    for index in range(4)
+                ):
+                    reasons.append("independent_localization_aggregate_mismatch")
+
+            contract = value.get("contract")
+            if not isinstance(contract, Mapping):
+                reasons.append("independent_localization_contract_invalid")
+            else:
+                provider_evidence = contract.get("providers")
+                expected_evidence = []
+                if isinstance(provider_evidence, list) and len(provider_evidence) == 2:
+                    for evidence, provider in zip(provider_evidence, normalized_providers):
+                        if not isinstance(evidence, Mapping):
+                            expected_evidence = []
+                            break
+                        expected_evidence.append(
+                            {
+                                "provider": provider["provider"],
+                                "manifest_sha256": evidence.get("manifest_sha256"),
+                                "model_sha256": provider["model_sha256"],
+                                "inference_spec_sha256": provider["inference_spec_sha256"],
+                            }
+                        )
+                expected_contract = {
+                    "schema_version": CONTRACT_SCHEMA_VERSION,
+                    "method": AGGREGATE_METHOD,
+                    "iou_threshold": IOU_THRESHOLD,
+                    "aggregate_tolerance": AGGREGATE_TOLERANCE,
+                    "source_image_sha256": source_sha256,
+                    "providers": [dict(item) for item in trusted_provider_evidence],
+                }
+                if dict(contract) != expected_contract:
+                    reasons.append("independent_localization_contract_invalid")
+                expected_contract_sha = _sha256_bytes(
+                    localization_canonical_json(expected_contract).encode("utf-8")
+                )
+                if value.get("contract_sha256") != expected_contract_sha:
+                    reasons.append("independent_localization_contract_sha256_mismatch")
+    return bbox_xyxy, sorted(set(reasons))
 
 
 def _bbox(
@@ -427,22 +657,74 @@ def _bbox(
     return [x1, y1, x2, y2], area_ratio, None
 
 
-def _decision_tuple(row: Mapping[str, object]) -> tuple[str, bool, bool] | None:
+def _decision_tuple(
+    row: Mapping[str, object],
+) -> tuple[str, bool, bool, bool, str] | None:
     if not isinstance(row.get("material"), str):
         return None
     if not isinstance(row.get("single_object"), bool):
         return None
     if not isinstance(row.get("foreign_material"), bool):
         return None
+    if not isinstance(row.get("training_usable"), bool):
+        return None
+    if row.get("quality_reason") not in QUALITY_REASONS:
+        return None
+    if bool(row["training_usable"]) != (row["quality_reason"] == "usable"):
+        return None
     return (
         str(row["material"]).strip().casefold(),
         bool(row["single_object"]),
         bool(row["foreign_material"]),
+        bool(row["training_usable"]),
+        str(row["quality_reason"]),
     )
 
 
-def _teacher_consensus(row: Mapping[str, object]) -> tuple[dict | None, list[str]]:
+def _teacher_contract_reasons(row: Mapping[str, object]) -> list[str]:
+    contract = row.get("teacher_contract")
+    reported_sha = _valid_sha(row.get("teacher_contract_sha256"))
+    if not isinstance(contract, Mapping):
+        return ["teacher_contract_missing_or_invalid"]
+    model = row.get("model")
+    model_digest = valid_sha256(row.get("model_digest"))
+    if not isinstance(model, str) or not model.strip() or model_digest is None:
+        return ["teacher_contract_model_or_digest_invalid"]
+    try:
+        expected, expected_sha = build_teacher_contract(model, model_digest)
+    except ValueError:
+        return ["teacher_contract_model_or_digest_invalid"]
     reasons = []
+    if dict(contract) != expected:
+        reasons.append("teacher_contract_not_exact_trusted_contract")
+    if reported_sha != expected_sha:
+        reasons.append("teacher_contract_sha256_mismatch")
+    if row.get("model_digest") != model_digest:
+        reasons.append("teacher_model_digest_not_normalized")
+    return sorted(set(reasons))
+
+
+def _confidence(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    normalized = float(value)
+    if not math.isfinite(normalized) or not 0 <= normalized <= 1:
+        return None
+    return normalized
+
+
+def _teacher_consensus(row: Mapping[str, object]) -> tuple[dict | None, list[str]]:
+    reasons = _teacher_contract_reasons(row)
+    base_fields = set(TEACHER_LABEL_BASE_FIELDS)
+    raw_fields = frozenset(set(row) - {"_input_line"})
+    if raw_fields not in {
+        frozenset(base_fields), frozenset(base_fields | {"independent_localization"})
+    }:
+        reasons.append("teacher_label_top_level_shape_mismatch")
+    if {"deployed", "verifier", "bbox"}.intersection(row):
+        reasons.append("teacher_label_contains_forbidden_prediction_or_bbox")
+    if row.get("schema_version") != TEACHER_LABEL_SCHEMA_VERSION:
+        reasons.append("teacher_label_schema_version_mismatch")
     errors = row.get("errors")
     if not isinstance(errors, list) or errors:
         reasons.append("teacher_errors")
@@ -452,47 +734,73 @@ def _teacher_consensus(row: Mapping[str, object]) -> tuple[dict | None, list[str
     passes = row.get("passes")
     if not isinstance(decision, Mapping) or not isinstance(passes, list):
         return None, sorted(set((*reasons, "invalid_consensus_payload")))
+    expected_decision_fields = {
+        "material", "single_object", "foreign_material", "training_usable",
+        "quality_reason", "votes", "pass_count",
+    }
+    if set(decision) != expected_decision_fields:
+        reasons.append("invalid_consensus_payload")
+    if len(passes) not in {2, 3}:
+        reasons.append("invalid_teacher_pass_count")
     decision_tuple = _decision_tuple(decision)
     if decision_tuple is None:
         return None, sorted(set((*reasons, "invalid_consensus_payload")))
     valid_passes = []
     for item in passes:
-        if not isinstance(item, Mapping) or _decision_tuple(item) is None:
+        if (
+            not isinstance(item, Mapping)
+            or set(item)
+            != {
+                "material", "confidence", "single_object", "foreign_material",
+                "training_usable", "quality_reason",
+            }
+            or _decision_tuple(item) is None
+        ):
             reasons.append("invalid_teacher_pass")
             continue
-        try:
-            confidence = float(item["confidence"])
-        except (KeyError, TypeError, ValueError):
-            reasons.append("invalid_teacher_pass")
-            continue
-        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        confidence = _confidence(item.get("confidence"))
+        if confidence is None:
             reasons.append("invalid_teacher_pass")
             continue
         valid_passes.append((_decision_tuple(item), confidence))
     supporting = [confidence for value, confidence in valid_passes if value == decision_tuple]
+    if (
+        len(passes) == 3
+        and len(valid_passes) >= 2
+        and valid_passes[0][0] == valid_passes[1][0]
+    ):
+        reasons.append("unexpected_teacher_adjudication")
     if len(supporting) < 2:
         reasons.append("no_exact_tuple_consensus")
     reported_votes = decision.get("votes")
-    if reported_votes is not None:
-        try:
-            if int(reported_votes) != len(supporting):
-                reasons.append("consensus_vote_mismatch")
-        except (TypeError, ValueError):
-            reasons.append("consensus_vote_mismatch")
-    reported_minimum = row.get("minimum_confidence")
-    try:
-        reported_minimum = float(reported_minimum)
-    except (TypeError, ValueError):
+    if (
+        isinstance(reported_votes, bool)
+        or not isinstance(reported_votes, int)
+        or reported_votes != len(supporting)
+    ):
+        reasons.append("consensus_vote_mismatch")
+    reported_pass_count = decision.get("pass_count")
+    if (
+        isinstance(reported_pass_count, bool)
+        or not isinstance(reported_pass_count, int)
+        or reported_pass_count != len(passes)
+    ):
+        reasons.append("consensus_pass_count_mismatch")
+    reported_minimum = _confidence(row.get("minimum_confidence"))
+    if reported_minimum is None:
         reasons.append("invalid_minimum_confidence")
-        reported_minimum = -1.0
     actual_minimum = min(supporting) if supporting else -1.0
+    if reported_minimum is not None and reported_minimum != actual_minimum:
+        reasons.append("minimum_confidence_mismatch")
     return {
         "material": decision_tuple[0],
         "single_object": decision_tuple[1],
         "foreign_material": decision_tuple[2],
+        "training_usable": decision_tuple[3],
+        "quality_reason": decision_tuple[4],
         "votes": len(supporting),
         "pass_count": len(passes),
-        "minimum_confidence": min(actual_minimum, reported_minimum),
+        "minimum_confidence": actual_minimum,
     }, sorted(set(reasons))
 
 
@@ -518,8 +826,18 @@ def build_operational_teacher_manifest(
     *,
     teacher_queue: Path,
     teacher_labels: Path,
+    image_root: Path,
+    known_audit: Path,
+    provider_a_manifest: Path,
+    provider_a_name: str,
+    provider_a_model: Path,
+    provider_a_spec: Path,
+    provider_b_manifest: Path,
+    provider_b_name: str,
+    provider_b_model: Path,
+    provider_b_spec: Path,
     output_dir: Path,
-    capture_inventory: Path | None = None,
+    capture_inventory: Path,
     role: str = "train",
     fold: str = "operational_teacher_v1",
     minimum_confidence: float = 0.80,
@@ -540,11 +858,37 @@ def build_operational_teacher_manifest(
         raise ValueError("burst_gap_seconds must be non-negative")
     if not 0 < minimum_bbox_area_ratio < maximum_bbox_area_ratio <= 1:
         raise ValueError("bbox area ratios must satisfy 0 < minimum < maximum <= 1")
+    image_root = image_root.resolve(strict=True)
+    if not image_root.is_dir():
+        raise NotADirectoryError(f"image_root is not a directory: {image_root}")
+
+    input_paths = {
+        "teacher_queue": teacher_queue, "teacher_labels": teacher_labels,
+        "capture_inventory": capture_inventory, "known_audit": known_audit,
+        "provider_a_manifest": provider_a_manifest,
+        "provider_a_model": provider_a_model, "provider_a_spec": provider_a_spec,
+        "provider_b_manifest": provider_b_manifest,
+        "provider_b_model": provider_b_model, "provider_b_spec": provider_b_spec,
+    }
+    input_snapshot = {name: _sha256_file(path) for name, path in input_paths.items()}
 
     queue_rows = _load_jsonl(teacher_queue, kind="teacher queue")
     label_rows = _load_jsonl(teacher_labels, kind="teacher labels")
     inventory_rows = _load_inventory(capture_inventory)
     inventory_map = _inventory_by_sha(inventory_rows)
+    known = load_known_audit(known_audit)
+    if provider_a_name.strip().casefold() == provider_b_name.strip().casefold():
+        raise ValueError("provider names must be distinct")
+    provider_a_rows, provider_a_evidence = _provider_rows(
+        provider_a_manifest, provider=provider_a_name,
+        model_file=provider_a_model, spec_file=provider_a_spec,
+    )
+    provider_b_rows, provider_b_evidence = _provider_rows(
+        provider_b_manifest, provider=provider_b_name,
+        model_file=provider_b_model, spec_file=provider_b_spec,
+    )
+    if provider_a_evidence["model_sha256"] == provider_b_evidence["model_sha256"]:
+        raise ValueError("provider model SHA values must be distinct")
 
     queue_groups: dict[str, list[dict]] = defaultdict(list)
     invalid_queue = []
@@ -588,6 +932,18 @@ def build_operational_teacher_manifest(
             )
             continue
         queue_row = queue_candidates[0]
+        if sha in known:
+            reasons.append("known_train_or_validation_sha_forbidden")
+        if set(queue_row) - {"_input_line"} != {
+            "sha256", "timestamp", "image_ref", "decision"
+        }:
+            reasons.append("teacher_queue_row_shape_not_exact")
+        if queue_row.get("decision") != "teacher_required":
+            reasons.append("teacher_queue_decision_mismatch")
+        if {
+            "client_id", "device_id", "deployed", "verifier", "image_path", "filepath"
+        }.intersection(queue_row):
+            reasons.append("teacher_queue_contains_forbidden_private_prediction_or_path")
         teacher_candidates = label_groups.get(sha, [])
         if not teacher_candidates:
             rejected.append({"sha256": sha, "reasons": ["missing_teacher_label"]})
@@ -604,6 +960,8 @@ def build_operational_teacher_manifest(
         teacher_row = teacher_candidates[0]
         decision, consensus_reasons = _teacher_consensus(teacher_row)
         reasons.extend(consensus_reasons)
+        if _valid_sha(teacher_row.get("input_image_sha256")) != sha:
+            reasons.append("teacher_input_image_sha256_mismatch")
         if decision is not None:
             is_negative_decision = decision["material"] == "negative"
             if decision["minimum_confidence"] < minimum_confidence:
@@ -612,30 +970,81 @@ def build_operational_teacher_manifest(
             # scene.  Only positive material labels require one primary item.
             if not is_negative_decision and decision["single_object"] is not True:
                 reasons.append("not_single_object")
+            if is_negative_decision and decision["single_object"] is not False:
+                reasons.append("negative_single_object_must_be_false")
+            if is_negative_decision and decision["foreign_material"] is not False:
+                reasons.append("negative_foreign_material_must_be_false")
             if decision["material"] not in ACCEPTED_TEACHER_MATERIALS:
                 reasons.append("unsupported_teacher_material")
             if is_negative_decision and role != "train":
                 reasons.append("negative_source_must_be_train")
+            if decision["training_usable"] is not True:
+                reasons.append(
+                    f"training_unusable_{decision['quality_reason']}"
+                )
 
-        image_path = _image_path(queue_row, teacher_queue.parent)
+        queue_timestamp = _timestamp(queue_row)
+        if queue_timestamp is None:
+            reasons.append("queue_capture_timestamp_missing_invalid_or_naive")
+        elif queue_timestamp < OPERATIONAL_CAPTURE_CUTOFF_UTC:
+            reasons.append("queue_capture_before_operational_cutoff")
+
+        matching_inventory = inventory_map.get(sha, [])
+        if len(matching_inventory) != 1:
+            reasons.append("capture_inventory_row_missing_or_duplicate")
+        for inventory_row in matching_inventory:
+            if inventory_row.get("decision") != "teacher_required":
+                reasons.append("capture_inventory_decision_mismatch")
+            for field in ("sha256", "timestamp", "image_ref"):
+                if inventory_row.get(field) != queue_row.get(field):
+                    reasons.append(f"capture_inventory_{field}_mismatch")
+            inventory_timestamp = _timestamp(inventory_row)
+            if inventory_timestamp is None:
+                reasons.append(
+                    "inventory_capture_timestamp_missing_invalid_or_naive"
+                )
+            elif inventory_timestamp < OPERATIONAL_CAPTURE_CUTOFF_UTC:
+                reasons.append("inventory_capture_before_operational_cutoff")
+
+        image_path, image_path_problem = _image_path(queue_row, image_root)
+        if image_path_problem:
+            reasons.append(image_path_problem)
         if image_path is None or not image_path.is_file():
             reasons.append("image_missing")
             actual_sha = None
+            image = None
             dimensions = None
         else:
             actual_sha = _sha256_file(image_path)
             if actual_sha != sha:
                 reasons.append("image_sha256_mismatch")
-            dimensions = _read_dimensions(image_path)
-            if dimensions is None:
+            image = _read_image(image_path)
+            if image is None:
                 reasons.append("image_unreadable")
+                dimensions = None
+            else:
+                height, width = image.shape[:2]
+                dimensions = (int(width), int(height))
+                reasons.extend(_image_quality_reasons(image))
 
         box = None
         area_ratio = None
         bbox_source = ""
         if decision is not None and decision["material"] in CLASS_IDS and dimensions:
-            inventory_row = inventory_map.get(sha, [{}])[0]
-            raw_box, bbox_source = _bbox_value(teacher_row, queue_row, inventory_row)
+            raw_box, localization_reasons = _independent_localization(
+                teacher_row,
+                source_sha256=sha,
+                width=dimensions[0],
+                height=dimensions[1],
+                trusted_provider_rows=[
+                    provider_a_rows.get(sha, {}), provider_b_rows.get(sha, {})
+                ],
+                trusted_provider_evidence=[
+                    provider_a_evidence, provider_b_evidence
+                ],
+            )
+            reasons.extend(localization_reasons)
+            bbox_source = "independent_localization_consensus"
             box, area_ratio, bbox_problem = _bbox(
                 raw_box,
                 width=dimensions[0],
@@ -647,14 +1056,16 @@ def build_operational_teacher_manifest(
                 reasons.append(bbox_problem)
 
         if reasons:
-            rejected.append(
-                {
-                    "sha256": sha,
-                    "queue_line": queue_row["_input_line"],
-                    "label_line": teacher_row["_input_line"],
-                    "reasons": sorted(set(reasons)),
-                }
-            )
+            rejection = {
+                "sha256": sha,
+                "queue_line": queue_row["_input_line"],
+                "label_line": teacher_row["_input_line"],
+                "reasons": sorted(set(reasons)),
+            }
+            if decision is not None:
+                rejection["teacher_training_usable"] = decision["training_usable"]
+                rejection["teacher_quality_reason"] = decision["quality_reason"]
+            rejected.append(rejection)
             continue
 
         assert decision is not None and image_path is not None and dimensions is not None
@@ -688,6 +1099,8 @@ def build_operational_teacher_manifest(
                     "material": 9,
                     "category": "background",
                     "teacher_material": "negative",
+                    "teacher_training_usable": "true",
+                    "teacher_quality_reason": decision["quality_reason"],
                     "dent": -1,
                     "label": -1,
                     "foreign_material": int(decision["foreign_material"]),
@@ -749,6 +1162,8 @@ def build_operational_teacher_manifest(
                 "material": material,
                 "category": category,
                 "teacher_material": decision["material"],
+                "teacher_training_usable": "true",
+                "teacher_quality_reason": decision["quality_reason"],
                 "dent": -1,
                 "label": -1,
                 "foreign_material": int(decision["foreign_material"]),
@@ -824,10 +1239,13 @@ def build_operational_teacher_manifest(
     }
     lineage_report = {
         "builder": "scripts/build_operational_teacher_manifest.py",
+        "portable": False,
+        "local_only_contains_absolute_paths": True,
         "policy": {
             "allowed_roles": sorted(ALLOWED_ROLES),
             "blind_test_eligible": False,
             "ground_truth_authority": "vlm_teacher_pseudo_label_train_only",
+            "teacher_label_schema_version": TEACHER_LABEL_SCHEMA_VERSION,
             "negative_source_role": "train",
             "negative_source_is_training_crop": False,
             "negative_source_requires_runtime_proposal_mining": True,
@@ -837,11 +1255,24 @@ def build_operational_teacher_manifest(
             "burst_gap_seconds": burst_gap_seconds,
             "minimum_bbox_area_ratio": minimum_bbox_area_ratio,
             "maximum_bbox_area_ratio": maximum_bbox_area_ratio,
+            "operational_capture_cutoff_kst": (
+                OPERATIONAL_CAPTURE_CUTOFF_KST.isoformat()
+            ),
+            "operational_capture_cutoff_utc": (
+                OPERATIONAL_CAPTURE_CUTOFF_UTC.isoformat().replace("+00:00", "Z")
+            ),
+            "minimum_image_width": MINIMUM_IMAGE_WIDTH,
+            "minimum_image_height": MINIMUM_IMAGE_HEIGHT,
+            "extreme_exposure_fraction": EXTREME_EXPOSURE_FRACTION,
+            "underexposed_luma_max": UNDEREXPOSED_LUMA_MAX,
+            "overexposed_luma_min": OVEREXPOSED_LUMA_MIN,
+            "blur_filter_enabled": False,
+            "deployed_prediction_filter_enabled": False,
         },
         "inputs": {
-            "teacher_queue_sha256": _sha256_file(teacher_queue),
-            "teacher_labels_sha256": _sha256_file(teacher_labels),
-            "capture_inventory_sha256": _sha256_file(capture_inventory) if capture_inventory else None,
+            **{f"{name}_sha256": digest for name, digest in input_snapshot.items()},
+            "provider_a_name": provider_a_name,
+            "provider_b_name": provider_b_name,
         },
         "counts": {
             "accepted": len(accepted) + len(empty_scene_inventory),
@@ -878,6 +1309,11 @@ def build_operational_teacher_manifest(
     if not dry_run and existing and not overwrite:
         raise FileExistsError(f"output artifacts already exist; use --overwrite: {existing}")
     if not dry_run:
+        final_snapshot = {
+            name: _sha256_file(path) for name, path in input_paths.items()
+        }
+        if final_snapshot != input_snapshot:
+            raise ValueError("builder input changed before final publish")
         output_dir.mkdir(parents=True, exist_ok=True)
         for name, content in (
             ("csv", csv_content),
@@ -900,6 +1336,8 @@ def build_operational_teacher_manifest(
         "unique_object_groups": lineage_report["counts"]["unique_object_groups"],
         "output_digests": output_digests,
         "blind_test_eligible": False,
+        "operational_capture_cutoff_kst": OPERATIONAL_CAPTURE_CUTOFF_KST.isoformat(),
+        "teacher_label_schema_version": TEACHER_LABEL_SCHEMA_VERSION,
     }
 
 
@@ -909,7 +1347,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--teacher-queue", required=True, type=Path)
     parser.add_argument("--teacher-labels", required=True, type=Path)
-    parser.add_argument("--capture-inventory", type=Path)
+    parser.add_argument("--image-root", required=True, type=Path)
+    parser.add_argument("--known-audit", required=True, type=Path)
+    parser.add_argument("--capture-inventory", required=True, type=Path)
+    for prefix in ("a", "b"):
+        parser.add_argument(f"--provider-{prefix}-manifest", required=True, type=Path)
+        parser.add_argument(f"--provider-{prefix}-name", required=True)
+        parser.add_argument(f"--provider-{prefix}-model", required=True, type=Path)
+        parser.add_argument(f"--provider-{prefix}-spec", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--role", choices=sorted(ALLOWED_ROLES), default="train")
     parser.add_argument("--fold", default="operational_teacher_v1")
@@ -923,6 +1368,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = build_operational_teacher_manifest(
         teacher_queue=args.teacher_queue,
         teacher_labels=args.teacher_labels,
+        image_root=args.image_root,
+        known_audit=args.known_audit,
+        provider_a_manifest=args.provider_a_manifest,
+        provider_a_name=args.provider_a_name,
+        provider_a_model=args.provider_a_model,
+        provider_a_spec=args.provider_a_spec,
+        provider_b_manifest=args.provider_b_manifest,
+        provider_b_name=args.provider_b_name,
+        provider_b_model=args.provider_b_model,
+        provider_b_spec=args.provider_b_spec,
         capture_inventory=args.capture_inventory,
         output_dir=args.output_dir,
         role=args.role,
