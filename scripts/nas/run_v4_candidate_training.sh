@@ -3653,22 +3653,517 @@ PY
 verify_inputs || fail "bound inputs changed after preflight" 65
 
 DRY_RUN_REPORT=$CONTROL/training_dry_run.json
-if ! "$PYTHON_BIN" - "$PREFLIGHT" "$DRY_RUN_REPORT" "$CANDIDATE" dry-run <<'PY'
+run_verified_trainer() {
+  mode=$1
+  "$PYTHON_BIN" - "$PREFLIGHT" "$DRY_RUN_REPORT" "$CANDIDATE" "$mode" <<'PY'
+import hashlib
+import io
 import json
 import os
+import stat
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
-preflight = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+VERIFIED_WORKER_BOOTSTRAP = r'''
+import hashlib as _hashlib
+import importlib.machinery as _machinery
+import json as _json
+import os as _os
+import sys as _sys
+import types as _types
+import zipfile as _zipfile
+
+_ENTRY_NAMES = (
+    "__main__.py",
+    "scripts/__init__.py",
+    "scripts/train_verifier.py",
+    "trainer.py",
+    "verified_contract.json",
+)
+_suffix = "/__main__.py"
+_bootstrap_file = globals().get("__file__")
+if not isinstance(_bootstrap_file, str) or not _bootstrap_file.endswith(_suffix):
+    raise RuntimeError("verified worker bootstrap did not start from its sealed archive")
+_archive_path = _bootstrap_file[:-len(_suffix)]
+with _zipfile.ZipFile(_archive_path, "r") as _archive:
+    _infos = _archive.infolist()
+    if [item.filename for item in _infos] != list(_ENTRY_NAMES):
+        raise RuntimeError("verified worker archive entry set/order mismatch")
+    if any(
+        item.is_dir()
+        or item.compress_type != _zipfile.ZIP_STORED
+        or item.file_size > 16 * 1024 * 1024
+        for item in _infos
+    ):
+        raise RuntimeError("verified worker archive contains an invalid entry")
+    _entries = {item.filename: _archive.read(item) for item in _infos}
+if _entries["scripts/__init__.py"] != b"":
+    raise RuntimeError("verified scripts package marker must be empty")
+_contract = _json.loads(_entries["verified_contract.json"].decode("utf-8"))
+if not isinstance(_contract, dict) or set(_contract) != {
+    "schema", "trainer_path", "trainer_sha256",
+    "legacy_path", "legacy_sha256",
+}:
+    raise RuntimeError("verified worker contract schema mismatch")
+if _contract.get("schema") != "v4_verified_trainer_archive.v1":
+    raise RuntimeError("unsupported verified worker contract")
+
+def _require_sha256(value, description):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"{description} is not a lowercase SHA-256")
+    return value
+
+_trainer_path = _contract.get("trainer_path")
+_legacy_path = _contract.get("legacy_path")
+if not isinstance(_trainer_path, str) or not _os.path.isabs(_trainer_path):
+    raise RuntimeError("verified trainer path is not absolute")
+if not isinstance(_legacy_path, str) or not _os.path.isabs(_legacy_path):
+    raise RuntimeError("verified legacy dependency path is not absolute")
+_trainer_sha256 = _require_sha256(
+    _contract.get("trainer_sha256"), "verified trainer SHA-256"
+)
+_legacy_sha256 = _require_sha256(
+    _contract.get("legacy_sha256"), "verified legacy dependency SHA-256"
+)
+_trainer_source = _entries["trainer.py"]
+_legacy_source = _entries["scripts/train_verifier.py"]
+if _hashlib.sha256(_trainer_source).hexdigest() != _trainer_sha256:
+    raise RuntimeError("sealed worker trainer bytes differ from the bound SHA-256")
+if _hashlib.sha256(_legacy_source).hexdigest() != _legacy_sha256:
+    raise RuntimeError("sealed worker dependency bytes differ from the code inventory")
+
+_trainer_parent = _os.path.dirname(_trainer_path)
+if not _sys.argv:
+    _sys.argv = [_trainer_path]
+else:
+    _sys.argv[0] = _trainer_path
+if not _sys.path or _sys.path[0] != _archive_path:
+    raise RuntimeError("spawn worker did not enter through the sealed archive")
+# Keep the direct-script import context while leaving one archive entry for
+# runpy.run_path() to remove after this bootstrap returns.
+_sys.path[0] = _trainer_parent
+_sys.path.insert(1, _archive_path)
+if hasattr(_sys, "orig_argv"):
+    _sys.orig_argv = [_sys.executable, *_sys.argv]
+
+_scripts_package = _types.ModuleType("scripts")
+_scripts_package.__file__ = None
+_scripts_package.__package__ = "scripts"
+_scripts_package.__path__ = [_trainer_parent]
+_scripts_package.__loader__ = None
+_scripts_package.__spec__ = _machinery.ModuleSpec(
+    "scripts", loader=None, is_package=True
+)
+_scripts_package.__spec__.submodule_search_locations = [_trainer_parent]
+_sys.modules["scripts"] = _scripts_package
+_legacy_module = _types.ModuleType("scripts.train_verifier")
+_legacy_module.__file__ = _legacy_path
+_legacy_module.__cached__ = None
+_legacy_module.__package__ = "scripts"
+_legacy_module.__loader__ = None
+_legacy_module.__spec__ = _machinery.ModuleSpec(
+    "scripts.train_verifier", loader=None
+)
+_sys.modules["scripts.train_verifier"] = _legacy_module
+_sys.modules["train_verifier"] = _legacy_module
+exec(
+    compile(_legacy_source, _legacy_path, "exec", dont_inherit=True),
+    _legacy_module.__dict__,
+    _legacy_module.__dict__,
+)
+
+globals()["__file__"] = _trainer_path
+globals()["__cached__"] = None
+globals()["__package__"] = None
+globals()["__loader__"] = None
+globals()["__spec__"] = None
+exec(
+    compile(_trainer_source, _trainer_path, "exec", dont_inherit=True),
+    globals(),
+    globals(),
+)
+'''
+
+VERIFIED_TRAINER_LOADER = r'''
+import hashlib
+import importlib.machinery
+import io
+import json
+import os
+import stat
+import sys
+import types
+import zipfile
+
+(
+    expected_archive_sha256,
+    expected_bootstrap_sha256,
+    expected_trainer_sha256,
+    trainer_path,
+    expected_legacy_sha256,
+    legacy_path,
+    *trainer_argv,
+) = sys.argv[1:]
+
+def require_sha256(value, description):
+    if (
+        len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{description} is invalid")
+    return value
+
+for value, description in (
+    (expected_archive_sha256, "expected archive SHA-256"),
+    (expected_bootstrap_sha256, "expected bootstrap SHA-256"),
+    (expected_trainer_sha256, "expected trainer SHA-256"),
+    (expected_legacy_sha256, "expected legacy dependency SHA-256"),
+):
+    require_sha256(value, description)
+if not os.path.isabs(trainer_path) or not os.path.isabs(legacy_path):
+    raise ValueError("verified trainer and dependency paths must be absolute")
+
+archive_bytes = sys.stdin.buffer.read(40 * 1024 * 1024 + 1)
+if not archive_bytes or len(archive_bytes) > 40 * 1024 * 1024:
+    raise ValueError("verified trainer archive is empty or oversized")
+if hashlib.sha256(archive_bytes).hexdigest() != expected_archive_sha256:
+    raise ValueError("verified trainer archive transfer SHA-256 mismatch")
+expected_names = (
+    "__main__.py",
+    "scripts/__init__.py",
+    "scripts/train_verifier.py",
+    "trainer.py",
+    "verified_contract.json",
+)
+with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as archive:
+    infos = archive.infolist()
+    if [item.filename for item in infos] != list(expected_names):
+        raise ValueError("verified trainer archive entry set/order mismatch")
+    if any(
+        item.is_dir()
+        or item.compress_type != zipfile.ZIP_STORED
+        or item.file_size > 16 * 1024 * 1024
+        for item in infos
+    ):
+        raise ValueError("verified trainer archive contains an invalid entry")
+    entries = {item.filename: archive.read(item) for item in infos}
+if entries["scripts/__init__.py"] != b"":
+    raise ValueError("verified scripts package marker must be empty")
+if hashlib.sha256(entries["__main__.py"]).hexdigest() != expected_bootstrap_sha256:
+    raise ValueError("verified worker bootstrap SHA-256 mismatch")
+if hashlib.sha256(entries["trainer.py"]).hexdigest() != expected_trainer_sha256:
+    raise ValueError("verified trainer source SHA-256 mismatch")
+if (
+    hashlib.sha256(entries["scripts/train_verifier.py"]).hexdigest()
+    != expected_legacy_sha256
+):
+    raise ValueError("verified legacy dependency SHA-256 mismatch")
+contract = json.loads(entries["verified_contract.json"].decode("utf-8"))
+if contract != {
+    "schema": "v4_verified_trainer_archive.v1",
+    "trainer_path": trainer_path,
+    "trainer_sha256": expected_trainer_sha256,
+    "legacy_path": legacy_path,
+    "legacy_sha256": expected_legacy_sha256,
+}:
+    raise ValueError("verified trainer archive contract mismatch")
+
+archive_descriptor = None
+archive_path = None
+if sys.platform.startswith("linux"):
+    import fcntl
+    import multiprocessing.popen_spawn_posix as popen_spawn_posix
+    import multiprocessing.spawn as multiprocessing_spawn
+
+    required_os_names = ("memfd_create", "MFD_ALLOW_SEALING", "MFD_CLOEXEC")
+    required_fcntl_names = (
+        "F_ADD_SEALS", "F_GET_SEALS", "F_SEAL_SEAL",
+        "F_SEAL_SHRINK", "F_SEAL_GROW", "F_SEAL_WRITE",
+    )
+    if any(not hasattr(os, name) for name in required_os_names):
+        raise RuntimeError("Linux runtime lacks sealed memfd support")
+    if any(not hasattr(fcntl, name) for name in required_fcntl_names):
+        raise RuntimeError("Linux runtime lacks required memfd seal constants")
+    archive_descriptor = os.memfd_create(
+        "v4-verified-trainer",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+    )
+    try:
+        offset = 0
+        while offset < len(archive_bytes):
+            written = os.write(archive_descriptor, archive_bytes[offset:])
+            if written <= 0:
+                raise OSError("verified trainer archive memfd write made no progress")
+            offset += written
+        os.lseek(archive_descriptor, 0, os.SEEK_SET)
+        required_seals = (
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE
+        )
+        fcntl.fcntl(archive_descriptor, fcntl.F_ADD_SEALS, required_seals)
+        actual_seals = fcntl.fcntl(archive_descriptor, fcntl.F_GET_SEALS)
+        if actual_seals & required_seals != required_seals:
+            raise RuntimeError("verified trainer archive memfd is not fully sealed")
+        sealed_copy = bytearray()
+        while len(sealed_copy) < len(archive_bytes):
+            chunk = os.read(
+                archive_descriptor,
+                min(1024 * 1024, len(archive_bytes) - len(sealed_copy)),
+            )
+            if not chunk:
+                break
+            sealed_copy.extend(chunk)
+        if bytes(sealed_copy) != archive_bytes:
+            raise RuntimeError("sealed trainer archive bytes changed")
+        os.lseek(archive_descriptor, 0, os.SEEK_SET)
+        archive_path = f"/proc/self/fd/{archive_descriptor}"
+        with zipfile.ZipFile(archive_path, "r") as sealed_archive:
+            if sealed_archive.namelist() != list(expected_names):
+                raise RuntimeError("sealed trainer archive cannot be reopened exactly")
+    except BaseException:
+        os.close(archive_descriptor)
+        raise
+
+    original_get_preparation_data = multiprocessing_spawn.get_preparation_data
+    original_launch = popen_spawn_posix.Popen._launch
+    if not callable(original_get_preparation_data) or not callable(original_launch):
+        raise RuntimeError("pinned multiprocessing spawn hooks are unavailable")
+
+    def verified_get_preparation_data(process_name):
+        data = original_get_preparation_data(process_name)
+        if "init_main_from_name" in data:
+            raise RuntimeError("spawn unexpectedly selected module-name main import")
+        original_main = data.get("init_main_from_path")
+        if (
+            not isinstance(original_main, str)
+            or os.path.normpath(original_main) != os.path.normpath(trainer_path)
+        ):
+            raise RuntimeError("spawn main path differs from the verified trainer")
+        data["init_main_from_path"] = archive_path
+        return data
+
+    def verified_launch(self, process_object):
+        descriptors = getattr(self, "_fds", None)
+        if not isinstance(descriptors, list):
+            raise RuntimeError("pinned spawn Popen descriptor list is unavailable")
+        if archive_descriptor not in descriptors:
+            descriptors.append(archive_descriptor)
+        return original_launch(self, process_object)
+
+    multiprocessing_spawn.get_preparation_data = verified_get_preparation_data
+    popen_spawn_posix.Popen._launch = verified_launch
+
+trainer_source = entries["trainer.py"]
+legacy_source = entries["scripts/train_verifier.py"]
+trainer_parent = os.path.dirname(trainer_path)
+sys.argv = [trainer_path, *trainer_argv]
+if hasattr(sys, "orig_argv"):
+    sys.orig_argv = [sys.executable, trainer_path, *trainer_argv]
+if sys.path:
+    sys.path[0] = trainer_parent
+else:
+    sys.path.append(trainer_parent)
+
+scripts_package = types.ModuleType("scripts")
+scripts_package.__file__ = None
+scripts_package.__package__ = "scripts"
+scripts_package.__path__ = [trainer_parent]
+scripts_package.__loader__ = None
+scripts_package.__spec__ = importlib.machinery.ModuleSpec(
+    "scripts", loader=None, is_package=True
+)
+scripts_package.__spec__.submodule_search_locations = [trainer_parent]
+sys.modules["scripts"] = scripts_package
+legacy_module = types.ModuleType("scripts.train_verifier")
+legacy_module.__file__ = legacy_path
+legacy_module.__cached__ = None
+legacy_module.__package__ = "scripts"
+legacy_module.__loader__ = None
+legacy_module.__spec__ = importlib.machinery.ModuleSpec(
+    "scripts.train_verifier", loader=None
+)
+sys.modules["scripts.train_verifier"] = legacy_module
+sys.modules["train_verifier"] = legacy_module
+exec(
+    compile(legacy_source, legacy_path, "exec", dont_inherit=True),
+    legacy_module.__dict__,
+    legacy_module.__dict__,
+)
+
+main_module = types.ModuleType("__main__")
+main_module.__file__ = trainer_path
+main_module.__cached__ = None
+main_module.__package__ = None
+main_module.__loader__ = None
+main_module.__spec__ = None
+sys.modules["__main__"] = main_module
+exec(
+    compile(trainer_source, trainer_path, "exec", dont_inherit=True),
+    main_module.__dict__,
+    main_module.__dict__,
+)
+'''
+
+def stable_file_bytes(path, description, maximum_bytes=16 * 1024 * 1024):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not 0 < before.st_size <= maximum_bytes
+        ):
+            raise ValueError(f"{description} must be a bounded regular file")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if identity(before) != identity(after):
+        raise ValueError(f"{description} changed while its bytes were read")
+    content = b"".join(chunks)
+    if len(content) != before.st_size:
+        raise ValueError(f"{description} read was incomplete")
+    return content
+
+def require_sha256(value, description):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{description} is not a lowercase SHA-256")
+    return value
+
+preflight_path = Path(sys.argv[1])
+preflight = json.loads(
+    stable_file_bytes(preflight_path, "training preflight", 32 * 1024 * 1024)
+)
 report_path = Path(sys.argv[2])
 output_dir = Path(sys.argv[3])
 mode = sys.argv[4]
+if mode not in {"dry-run", "train"}:
+    raise ValueError("unsupported verified trainer mode")
 config = preflight["training_config"]
 manifests = {row["role"]: row["path"] for row in preflight["manifests"]}
+code_root = Path(preflight["code_root"])
+trainer_path = Path(preflight["trainer_path"])
+legacy_path = code_root / "scripts" / "train_verifier.py"
+if not code_root.is_absolute() or not trainer_path.is_absolute():
+    raise ValueError("verified code/trainer paths must be absolute")
+if trainer_path != code_root / "scripts" / "train_multitask_verifier.py":
+    raise ValueError("preflight trainer path differs from the fixed trainer")
+expected_trainer_sha256 = require_sha256(
+    preflight["trainer_sha256"], "preflight trainer SHA-256"
+)
+if (
+    preflight.get("dataset_consumption_contract", {}).get("trainer_sha256")
+    != expected_trainer_sha256
+):
+    raise ValueError("preflight consumption contract trainer SHA mismatch")
+inventory_bytes = stable_file_bytes(
+    Path(preflight["code_inventory"]), "code inventory", 32 * 1024 * 1024
+)
+if hashlib.sha256(inventory_bytes).hexdigest() != require_sha256(
+    preflight["code_inventory_sha256"], "preflight code inventory SHA-256"
+):
+    raise ValueError("code inventory differs from the preflight SHA-256")
+inventory = json.loads(inventory_bytes)
+if not isinstance(inventory, dict) or inventory.get("schema") != "v4_candidate_code_inventory.v1":
+    raise ValueError("unsupported verified code inventory")
+inventory_rows = inventory.get("files")
+if not isinstance(inventory_rows, list):
+    raise ValueError("verified code inventory files are absent")
+inventory_by_path = {}
+for row in inventory_rows:
+    if not isinstance(row, dict) or set(row) != {"path", "size", "sha256"}:
+        raise ValueError("verified code inventory row is malformed")
+    relative = row["path"]
+    if not isinstance(relative, str) or relative in inventory_by_path:
+        raise ValueError("verified code inventory path is invalid or duplicated")
+    inventory_by_path[relative] = row
+trainer_row = inventory_by_path.get("scripts/train_multitask_verifier.py")
+legacy_row = inventory_by_path.get("scripts/train_verifier.py")
+if not isinstance(trainer_row, dict) or not isinstance(legacy_row, dict):
+    raise ValueError("trainer or legacy dependency is absent from the code inventory")
+if require_sha256(
+    trainer_row.get("sha256"), "inventoried trainer SHA-256"
+) != expected_trainer_sha256:
+    raise ValueError("trainer preflight and code inventory SHA-256 differ")
+expected_legacy_sha256 = require_sha256(
+    legacy_row.get("sha256"), "inventoried legacy dependency SHA-256"
+)
+trainer_source = stable_file_bytes(trainer_path, "trainer source")
+legacy_source = stable_file_bytes(legacy_path, "legacy trainer dependency")
+if (
+    len(trainer_source) != trainer_row.get("size")
+    or hashlib.sha256(trainer_source).hexdigest() != expected_trainer_sha256
+):
+    raise ValueError("trainer source differs from its verified inventory bytes")
+if (
+    len(legacy_source) != legacy_row.get("size")
+    or hashlib.sha256(legacy_source).hexdigest() != expected_legacy_sha256
+):
+    raise ValueError("legacy dependency differs from its verified inventory bytes")
+
+archive_contract = {
+    "schema": "v4_verified_trainer_archive.v1",
+    "trainer_path": trainer_path.as_posix(),
+    "trainer_sha256": expected_trainer_sha256,
+    "legacy_path": legacy_path.as_posix(),
+    "legacy_sha256": expected_legacy_sha256,
+}
+archive_entries = {
+    "__main__.py": VERIFIED_WORKER_BOOTSTRAP.encode("utf-8"),
+    "scripts/__init__.py": b"",
+    "scripts/train_verifier.py": legacy_source,
+    "trainer.py": trainer_source,
+    "verified_contract.json": json.dumps(
+        archive_contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8"),
+}
+archive_buffer = io.BytesIO()
+with zipfile.ZipFile(
+    archive_buffer, "w", compression=zipfile.ZIP_STORED, allowZip64=False
+) as archive:
+    for name in sorted(archive_entries):
+        info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_STORED
+        info.create_system = 3
+        info.external_attr = 0o100444 << 16
+        archive.writestr(info, archive_entries[name])
+archive_bytes = archive_buffer.getvalue()
+archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
+bootstrap_sha256 = hashlib.sha256(archive_entries["__main__.py"]).hexdigest()
+
 args = [
-    sys.executable,
-    preflight["trainer_path"],
     "--manifest", manifests["train"],
     "--manifest", manifests["model_validation"],
     "--backbone", config["backbone"],
@@ -3701,14 +4196,28 @@ for origin, weight in sorted(config["origin_weights"].items()):
     args.extend(("--origin-weight", f"{origin}={weight}"))
 env = os.environ.copy()
 env["TORCH_HOME"] = preflight["torch_home"]
+command = [
+    sys.executable,
+    "-c",
+    VERIFIED_TRAINER_LOADER,
+    archive_sha256,
+    bootstrap_sha256,
+    expected_trainer_sha256,
+    trainer_path.as_posix(),
+    expected_legacy_sha256,
+    legacy_path.as_posix(),
+    *args,
+]
 if mode == "dry-run":
-    args.append("--dry-run")
-    result = subprocess.run(args, env=env, text=True, capture_output=True, check=False)
+    command.append("--dry-run")
+    result = subprocess.run(
+        command, env=env, input=archive_bytes, capture_output=True, check=False
+    )
     if result.returncode != 0:
-        sys.stderr.write(result.stdout)
-        sys.stderr.write(result.stderr)
+        os.write(2, result.stdout)
+        os.write(2, result.stderr)
         raise SystemExit(result.returncode)
-    value = json.loads(result.stdout)
+    value = json.loads(result.stdout.decode("utf-8"))
     if set(value) != {
         "ok", "mode", "seed", "manifest", "condition_heads",
         "class_weights", "sampling", "output_contract",
@@ -3749,9 +4258,15 @@ if mode == "dry-run":
     os.link(temporary, report_path)
     temporary.unlink()
 else:
-    args.extend(("--output-dir", output_dir.as_posix()))
-    raise SystemExit(subprocess.run(args, env=env, check=False).returncode)
+    command.extend(("--output-dir", output_dir.as_posix()))
+    raise SystemExit(
+        subprocess.run(
+            command, env=env, input=archive_bytes, check=False
+        ).returncode
+    )
 PY
+}
+if ! run_verified_trainer dry-run
 then
   fail "candidate trainer dry-run failed" 65
 fi
@@ -3864,48 +4379,7 @@ PY
 }
 
 verify_candidate_dir || fail "candidate output directory changed before training" 65
-if ! "$PYTHON_BIN" - "$PREFLIGHT" "$DRY_RUN_REPORT" "$CANDIDATE" train <<'PY'
-import json
-import os
-import subprocess
-import sys
-from pathlib import Path
-
-preflight = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-config = preflight["training_config"]
-manifests = {row["role"]: row["path"] for row in preflight["manifests"]}
-args = [
-    sys.executable, preflight["trainer_path"],
-    "--manifest", manifests["train"],
-    "--manifest", manifests["model_validation"],
-    "--output-dir", Path(sys.argv[3]).as_posix(),
-    "--backbone", config["backbone"], "--size", str(config["input_size"]),
-    "--epochs", str(config["epochs"]), "--patience", str(config["patience"]),
-    "--batch", str(config["batch"]), "--workers", str(config["workers"]),
-    "--lr", str(config["lr"]), "--backbone-lr", str(config["backbone_lr"]),
-    "--head-lr", str(config["head_lr"]),
-    "--label-smoothing", str(config["label_smoothing"]),
-    "--class-weight-mode", config["class_weight_mode"],
-    "--class-weight-beta", str(config["class_weight_beta"]),
-    "--objectness-weight", str(config["objectness_weight"]),
-    "--material-weight", str(config["material_weight"]),
-    "--condition-weight", str(config["condition_weight"]),
-    "--seed", str(config["seed"]), "--device", "cuda",
-    "--dataset-snapshot-report-sha256",
-    preflight["dataset_consumption_contract"]["dataset_snapshot_report_sha256"],
-    "--dataset-snapshot-tree-sha256",
-    preflight["dataset_consumption_contract"]["dataset_snapshot_tree_sha256"],
-    "--manifest-payload-set-sha256",
-    preflight["dataset_consumption_contract"]["manifest_payload_set_sha256"],
-]
-for head in config["condition_heads"]:
-    args.extend(("--condition-head", head))
-for origin, weight in sorted(config["origin_weights"].items()):
-    args.extend(("--origin-weight", f"{origin}={weight}"))
-env = os.environ.copy()
-env["TORCH_HOME"] = preflight["torch_home"]
-raise SystemExit(subprocess.run(args, env=env, check=False).returncode)
-PY
+if ! run_verified_trainer train
 then
   fail "candidate-only verifier training failed"
 fi

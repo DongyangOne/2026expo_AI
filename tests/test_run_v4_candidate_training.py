@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import io
 import json
+import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -21,6 +25,78 @@ IMAGE_ID = "sha256:" + "a" * 64
 
 def _text() -> str:
     return SCRIPT.read_text(encoding="utf-8")
+
+
+def _embedded_raw_string(name: str) -> str:
+    text = _text()
+    marker = f"{name} = r'''\n"
+    start = text.index(marker) + len(marker)
+    end = text.index("\n'''", start)
+    return text[start:end]
+
+
+def _verified_archive(
+    *, trainer_path: Path, trainer_source: bytes,
+    legacy_path: Path, legacy_source: bytes,
+) -> tuple[bytes, str, str, str]:
+    bootstrap = _embedded_raw_string("VERIFIED_WORKER_BOOTSTRAP").encode("utf-8")
+    trainer_sha = hashlib.sha256(trainer_source).hexdigest()
+    legacy_sha = hashlib.sha256(legacy_source).hexdigest()
+    contract = {
+        "schema": "v4_verified_trainer_archive.v1",
+        "trainer_path": trainer_path.as_posix(),
+        "trainer_sha256": trainer_sha,
+        "legacy_path": legacy_path.as_posix(),
+        "legacy_sha256": legacy_sha,
+    }
+    entries = {
+        "__main__.py": bootstrap,
+        "scripts/__init__.py": b"",
+        "scripts/train_verifier.py": legacy_source,
+        "trainer.py": trainer_source,
+        "verified_contract.json": json.dumps(
+            contract, sort_keys=True, separators=(",", ":")
+        ).encode(),
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(
+        buffer, "w", compression=zipfile.ZIP_STORED, allowZip64=False
+    ) as archive:
+        for entry_name in sorted(entries):
+            info = zipfile.ZipInfo(entry_name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 3
+            info.external_attr = 0o100444 << 16
+            archive.writestr(info, entries[entry_name])
+    return (
+        buffer.getvalue(),
+        hashlib.sha256(bootstrap).hexdigest(),
+        trainer_sha,
+        legacy_sha,
+    )
+
+
+def _run_verified_loader(
+    archive: bytes, bootstrap_sha: str, trainer_sha: str, trainer_path: Path,
+    legacy_sha: str, legacy_path: Path, *trainer_args: str,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _embedded_raw_string("VERIFIED_TRAINER_LOADER"),
+            hashlib.sha256(archive).hexdigest(),
+            bootstrap_sha,
+            trainer_sha,
+            trainer_path.as_posix(),
+            legacy_sha,
+            legacy_path.as_posix(),
+            *trainer_args,
+        ],
+        input=archive,
+        capture_output=True,
+        check=False,
+    )
 
 
 def _integration_bash(tmp_path: Path) -> str:
@@ -94,6 +170,179 @@ def test_shell_syntax_when_bash_is_available() -> None:
     if bash is None:
         pytest.skip("bash is not installed")
     subprocess.run([bash, "-n"], input=_text().encode(), check=True)
+
+
+def test_verified_loader_executes_bound_bytes_with_direct_script_context(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    trainer_path = scripts / "train_multitask_verifier.py"
+    legacy_path = scripts / "train_verifier.py"
+    helper_path = scripts / "verified_sibling.py"
+    output_path = tmp_path / "trusted.json"
+    malicious_marker = tmp_path / "malicious.txt"
+    legacy_source = b"LEGACY_TOKEN = 'sealed-legacy'\n"
+    trainer_source = b"""from __future__ import annotations
+import json
+import os
+import sys
+from pathlib import Path
+import verified_sibling
+from scripts.train_verifier import LEGACY_TOKEN
+
+Path(sys.argv[1]).write_text(json.dumps({
+    'file': __file__,
+    'argv0': sys.argv[0],
+    'argv': sys.argv[1:],
+    'path0': sys.path[0],
+    'sibling': verified_sibling.VALUE,
+    'legacy': LEGACY_TOKEN,
+    'torch_home': os.environ.get('TORCH_HOME'),
+}), encoding='utf-8')
+print('trusted-stdout')
+sys.stderr.write('trusted-stderr\\n')
+raise SystemExit(int(sys.argv[2]))
+"""
+    trainer_path.write_bytes(trainer_source)
+    legacy_path.write_bytes(legacy_source)
+    helper_path.write_text("VALUE = 'sibling-import-ok'\n", encoding="utf-8")
+    archive, bootstrap_sha, trainer_sha, legacy_sha = _verified_archive(
+        trainer_path=trainer_path,
+        trainer_source=trainer_source,
+        legacy_path=legacy_path,
+        legacy_source=legacy_source,
+    )
+    trainer_path.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(malicious_marker)!r}).write_text('MALICIOUS')\n"
+        "raise SystemExit(91)\n",
+        encoding="utf-8",
+    )
+    env_home = tmp_path / "torch-home"
+    previous_torch_home = os.environ.get("TORCH_HOME")
+    os.environ["TORCH_HOME"] = str(env_home)
+    try:
+        result = _run_verified_loader(
+            archive,
+            bootstrap_sha,
+            trainer_sha,
+            trainer_path,
+            legacy_sha,
+            legacy_path,
+            output_path.as_posix(),
+            "7",
+        )
+    finally:
+        if previous_torch_home is None:
+            os.environ.pop("TORCH_HOME", None)
+        else:
+            os.environ["TORCH_HOME"] = previous_torch_home
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [b"trusted-stdout"]
+    assert result.stderr.splitlines() == [b"trusted-stderr"]
+    assert not malicious_marker.exists()
+    observed = json.loads(output_path.read_text(encoding="utf-8"))
+    assert Path(observed["file"]) == trainer_path
+    assert Path(observed["argv0"]) == trainer_path
+    assert observed["argv"] == [output_path.as_posix(), "7"]
+    assert Path(observed["path0"]) == scripts
+    assert observed["sibling"] == "sibling-import-ok"
+    assert observed["legacy"] == "sealed-legacy"
+    assert Path(observed["torch_home"]) == env_home
+
+
+def test_verified_loader_rejects_wrong_bound_sha_before_execution(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    trainer_path = scripts / "train_multitask_verifier.py"
+    legacy_path = scripts / "train_verifier.py"
+    marker = tmp_path / "executed.txt"
+    trainer_source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('EXECUTED')\n"
+    ).encode()
+    legacy_source = b"VALUE = 1\n"
+    trainer_path.write_bytes(trainer_source)
+    legacy_path.write_bytes(legacy_source)
+    archive, bootstrap_sha, _trainer_sha, legacy_sha = _verified_archive(
+        trainer_path=trainer_path,
+        trainer_source=trainer_source,
+        legacy_path=legacy_path,
+        legacy_source=legacy_source,
+    )
+    result = _run_verified_loader(
+        archive,
+        bootstrap_sha,
+        "0" * 64,
+        trainer_path,
+        legacy_sha,
+        legacy_path,
+    )
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="sealed memfd spawn-worker replay is a Linux/QNAP contract",
+)
+def test_linux_spawn_worker_uses_sealed_archive_after_path_swap(
+    tmp_path: Path,
+) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    trainer_path = scripts / "train_multitask_verifier.py"
+    legacy_path = scripts / "train_verifier.py"
+    approved_marker = tmp_path / "approved-worker.txt"
+    malicious_marker = tmp_path / "malicious-worker.txt"
+    trainer_source = b"""from __future__ import annotations
+import multiprocessing as mp
+import sys
+from pathlib import Path
+
+def worker(path):
+    Path(path).write_text('APPROVED', encoding='utf-8')
+
+if __name__ == '__main__':
+    malicious = (
+        "from pathlib import Path\\n"
+        f"Path({sys.argv[2]!r}).write_text('MALICIOUS', encoding='utf-8')\\n"
+    )
+    Path(__file__).write_text(malicious, encoding='utf-8')
+    context = mp.get_context('spawn')
+    process = context.Process(target=worker, args=(sys.argv[1],))
+    process.start()
+    process.join()
+    print(context.get_start_method())
+    raise SystemExit(process.exitcode)
+"""
+    legacy_source = b"VALUE = 1\n"
+    trainer_path.write_bytes(trainer_source)
+    legacy_path.write_bytes(legacy_source)
+    archive, bootstrap_sha, trainer_sha, legacy_sha = _verified_archive(
+        trainer_path=trainer_path,
+        trainer_source=trainer_source,
+        legacy_path=legacy_path,
+        legacy_source=legacy_source,
+    )
+    result = _run_verified_loader(
+        archive,
+        bootstrap_sha,
+        trainer_sha,
+        trainer_path,
+        legacy_sha,
+        legacy_path,
+        approved_marker.as_posix(),
+        malicious_marker.as_posix(),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == b"spawn\n"
+    assert approved_marker.read_text(encoding="utf-8") == "APPROVED"
+    assert not malicious_marker.exists()
+    assert b"MALICIOUS" in trainer_path.read_bytes()
 
 
 def test_authority_and_marker_contract_is_fail_closed() -> None:
@@ -350,9 +599,27 @@ def test_linux_output_verifier_imports_every_identity_module() -> None:
 
 def test_training_is_two_manifest_dry_run_then_candidate_only() -> None:
     text = _text()
-    assert text.count('"--manifest", manifests["train"]') == 2
-    assert text.count('"--manifest", manifests["model_validation"]') == 2
-    assert text.count('"--condition-head", head') == 2
+    assert text.count('"--manifest", manifests["train"]') == 1
+    assert text.count('"--manifest", manifests["model_validation"]') == 1
+    assert text.count('"--condition-head", head') == 1
+    assert text.count("run_verified_trainer dry-run") == 1
+    assert text.count("run_verified_trainer train") == 1
+    assert '[sys.executable, preflight["trainer_path"]' not in text
+    for fragment in (
+        "VERIFIED_WORKER_BOOTSTRAP = r'''",
+        "VERIFIED_TRAINER_LOADER = r'''",
+        "v4_verified_trainer_archive.v1",
+        "os.memfd_create(",
+        "fcntl.F_ADD_SEALS",
+        "multiprocessing_spawn.get_preparation_data = verified_get_preparation_data",
+        "popen_spawn_posix.Popen._launch = verified_launch",
+        'data["init_main_from_path"] = archive_path',
+        "compile(trainer_source, trainer_path, \"exec\", dont_inherit=True)",
+        'sys.modules["__main__"] = main_module',
+        'sys.path[0] = trainer_parent',
+        'input=archive_bytes',
+    ):
+        assert fragment in text
     assert text.index('mode = sys.argv[4]') < text.index('DRY_MARKER=$CONTROL/dry_run.sha256')
     assert text.index('DRY_MARKER=$CONTROL/dry_run.sha256') < text.index(
         'candidate-only verifier training failed'

@@ -915,6 +915,11 @@ torch.onnx.export(
         encoding="utf-8",
         newline="\n",
     )
+    (code_root / "scripts" / "train_verifier.py").write_text(
+        "# Minimal inventoried dependency for verified-byte launcher tests.\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     auditor = code_root / authority_builder.NEAR_DUPLICATE_AUDITOR_PATH
     auditor.parent.mkdir(parents=True, exist_ok=True)
     auditor.write_bytes(
@@ -2428,6 +2433,9 @@ def test_producer_output_runs_through_launcher_candidate_only(tmp_path: Path) ->
         "onnxruntime_providers"
     ]
     assert preflight["cuda_runtime_contract"]["required"] is False
+    trainer_path = fixture["trainer"]
+    assert isinstance(trainer_path, Path)
+    assert preflight["trainer_sha256"] == _sha(trainer_path.read_bytes())
     ready = json.loads((control / "candidate_training_ready.json").read_text())
     assert ready["dataset_consumption_contract"] == preflight[
         "dataset_consumption_contract"
@@ -2436,6 +2444,7 @@ def test_producer_output_runs_through_launcher_candidate_only(tmp_path: Path) ->
         authority_builder._canonical_json(preflight["dataset_consumption_contract"])
     )
     assert ready["candidate_only"] is True
+    assert ready["bindings"]["trainer_sha256"] == preflight["trainer_sha256"]
     assert ready["requires_independent_blind_hardware_gate"] is True
     assert ready["production_deployment_authorized"] is False
     assert not (control / "failed.txt").exists()
