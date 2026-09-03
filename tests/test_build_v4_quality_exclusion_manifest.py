@@ -9,10 +9,19 @@ from pathlib import Path
 
 import pytest
 
+from scripts.build_v4_candidate_training_authority import (
+    QUALITY_REASONS as AUTHORITY_QUALITY_REASONS,
+    _validate_quality_manifest,
+)
 from scripts.build_v4_quality_exclusion_manifest import (
+    QUALITY_EXCLUSION_REASON_ALIASES,
     QUALITY_EXCLUSION_REASONS,
     build_quality_exclusion_manifest,
     build_single_quality_exclusion_manifest,
+)
+from scripts.build_v4_repro_pilot_inputs import (
+    QUALITY_EXCLUSION_REASONS as REPRO_QUALITY_EXCLUSION_REASONS,
+    _read_quality_exclusion_manifest,
 )
 
 
@@ -21,6 +30,20 @@ SCRIPT = (
     / "scripts"
     / "build_v4_quality_exclusion_manifest.py"
 )
+EXPECTED_CANONICAL_REASONS = {
+    "severe_frame_crop",
+    "person_occlusion_or_dominance",
+    "excessive_background_or_multi_object",
+    "unreadable_boundary",
+    "too_low_resolution",
+    "extreme_exposure",
+}
+EXPECTED_REASON_ALIASES = {
+    "clutter_or_multiple_objects": "excessive_background_or_multi_object",
+    "boundary_unreadable": "unreadable_boundary",
+    "objective_unreadable": "unreadable_boundary",
+    "resolution_too_low": "too_low_resolution",
+}
 
 
 def _sha(path: Path) -> str:
@@ -44,16 +67,16 @@ def _entries_sha(entries: list[dict[str, str]]) -> str:
 def test_builder_emits_sha_reason_only_and_preserves_dented_object(tmp_path: Path) -> None:
     root = tmp_path / "images"
     root.mkdir()
-    old = root / "old.jpg"
+    low_resolution = root / "low-resolution.jpg"
     weird = root / "weird.jpg"
     dented = root / "dented-can.jpg"
-    old.write_bytes(b"old-capture")
+    low_resolution.write_bytes(b"low-resolution")
     weird.write_bytes(b"bad-crop")
     dented.write_bytes(b"valid-dented-object")
     source_list = tmp_path / "quality.csv"
     source_list.write_text(
         "path,reason\n"
-        "old.jpg,captured_before_2026_08_01\n"
+        "low-resolution.jpg,too_low_resolution\n"
         "weird.jpg,severe_frame_crop\n",
         encoding="utf-8",
     )
@@ -65,21 +88,21 @@ def test_builder_emits_sha_reason_only_and_preserves_dented_object(tmp_path: Pat
 
     assert value["entries"] == sorted(
         [
-            {"source_sha256": _sha(old), "reason": "captured_before_2026_08_01"},
+            {"source_sha256": _sha(low_resolution), "reason": "too_low_resolution"},
             {"source_sha256": _sha(weird), "reason": "severe_frame_crop"},
         ],
         key=lambda row: row["source_sha256"],
     )
     assert _sha(dented) not in {row["source_sha256"] for row in value["entries"]}
     assert value["reason_counts"] == {
-        "captured_before_2026_08_01": 1,
         "severe_frame_crop": 1,
+        "too_low_resolution": 1,
     }
     assert value["source_list_sha256"] == _entries_sha(value["entries"])
     assert set(value["authority"].values()) == {False}
     rendered = output.read_text(encoding="utf-8")
     assert str(root) not in rendered
-    assert "old.jpg" not in rendered
+    assert "low-resolution.jpg" not in rendered
     assert "weird.jpg" not in rendered
     assert "dented-can.jpg" not in rendered
 
@@ -96,7 +119,7 @@ def test_single_source_helper_builds_manifest_without_csv_or_path_leak(
         output_path=output,
     )
     assert value["entries"] == [
-        {"source_sha256": _sha(source), "reason": "boundary_unreadable"}
+        {"source_sha256": _sha(source), "reason": "unreadable_boundary"}
     ]
     assert value["excluded_source_count"] == 1
     assert value["max_excluded_sources"] == 100
@@ -142,9 +165,123 @@ def test_single_source_helper_rejects_ancestor_symlink(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="single source path.*symlink components"):
         build_single_quality_exclusion_manifest(
             source_path=linked / "bad.jpg",
-            reason="boundary_unreadable",
+            reason="unreadable_boundary",
             output_path=tmp_path / "manifest.json",
         )
+
+
+def test_producer_output_is_accepted_by_candidate_and_repro_consumers(
+    tmp_path: Path,
+) -> None:
+    assert set(QUALITY_EXCLUSION_REASONS) == EXPECTED_CANONICAL_REASONS
+    assert AUTHORITY_QUALITY_REASONS == EXPECTED_CANONICAL_REASONS
+    assert QUALITY_EXCLUSION_REASON_ALIASES == EXPECTED_REASON_ALIASES
+    assert EXPECTED_CANONICAL_REASONS <= set(REPRO_QUALITY_EXCLUSION_REASONS)
+    root = tmp_path / "images"
+    root.mkdir()
+    image = root / "source.bin"
+    image.write_bytes(b"legacy-alias-input")
+    source_list = tmp_path / "source.csv"
+    source_list.write_text(
+        "path,reason\nsource.bin,clutter_or_multiple_objects\n", encoding="utf-8"
+    )
+    output = tmp_path / "quality.json"
+
+    value = build_quality_exclusion_manifest(
+        source_list=source_list, image_root=root, output_path=output
+    )
+
+    expected = {_sha(image): "excessive_background_or_multi_object"}
+    published = json.loads(output.read_text(encoding="utf-8"))
+    assert published == value
+    assert _validate_quality_manifest(published) == expected
+    assert _read_quality_exclusion_manifest(output)[0] == expected
+
+
+@pytest.mark.parametrize(
+    ("legacy", "canonical"), EXPECTED_REASON_ALIASES.items()
+)
+def test_legacy_reason_input_is_canonicalized_before_hashing(
+    tmp_path: Path, legacy: str, canonical: str
+) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(legacy.encode())
+    output = tmp_path / "quality.json"
+
+    value = build_single_quality_exclusion_manifest(
+        source_path=source, reason=legacy, output_path=output
+    )
+
+    assert value["entries"] == [{"source_sha256": _sha(source), "reason": canonical}]
+    assert value["reason_counts"] == {canonical: 1}
+    assert value["source_list_sha256"] == _entries_sha(value["entries"])
+    assert legacy not in output.read_text(encoding="utf-8")
+
+
+def test_aliases_that_share_a_canonical_reason_aggregate_counts(tmp_path: Path) -> None:
+    root = tmp_path / "images"
+    root.mkdir()
+    (root / "boundary.bin").write_bytes(b"boundary")
+    (root / "objective.bin").write_bytes(b"objective")
+    source_list = tmp_path / "source.csv"
+    source_list.write_text(
+        "path,reason\n"
+        "boundary.bin,boundary_unreadable\n"
+        "objective.bin,objective_unreadable\n",
+        encoding="utf-8",
+    )
+
+    value = build_quality_exclusion_manifest(
+        source_list=source_list,
+        image_root=root,
+        output_path=tmp_path / "quality.json",
+    )
+
+    assert value["reason_counts"] == {"unreadable_boundary": 2}
+    assert {entry["reason"] for entry in value["entries"]} == {
+        "unreadable_boundary"
+    }
+    assert value["source_list_sha256"] == _entries_sha(value["entries"])
+
+
+def test_operational_cutoff_reason_is_rejected_in_favor_of_captured_at(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "images"
+    root.mkdir()
+    image = root / "source.bin"
+    image.write_bytes(b"old-capture")
+    source_list = tmp_path / "source.csv"
+    source_list.write_text(
+        "path,reason\nsource.bin,captured_before_2026_08_01\n", encoding="utf-8"
+    )
+    batch_output = tmp_path / "batch.json"
+    single_output = tmp_path / "single.json"
+
+    with pytest.raises(ValueError, match="captured_at"):
+        build_quality_exclusion_manifest(
+            source_list=source_list, image_root=root, output_path=batch_output
+        )
+    with pytest.raises(ValueError, match="captured_at"):
+        build_single_quality_exclusion_manifest(
+            source_path=image,
+            reason="captured_before_2026_08_01",
+            output_path=single_output,
+        )
+    assert not batch_output.exists()
+    assert not single_output.exists()
+
+
+@pytest.mark.parametrize("reason", ["dent", "crush", "object_dented"])
+def test_object_condition_reason_is_rejected(tmp_path: Path, reason: str) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(reason.encode())
+    output = tmp_path / "quality.json"
+    with pytest.raises(ValueError, match="condition"):
+        build_single_quality_exclusion_manifest(
+            source_path=source, reason=reason, output_path=output
+        )
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("reason", QUALITY_EXCLUSION_REASONS)
@@ -166,7 +303,7 @@ def test_all_contract_reasons_are_accepted(tmp_path: Path, reason: str) -> None:
 @pytest.mark.parametrize(
     ("rows", "message"),
     [
-        ("a.bin,object_dented\n", "unknown reason"),
+        ("a.bin,mystery_quality\n", "unknown reason"),
         (
             "a.bin,severe_frame_crop\na.bin,severe_frame_crop\n",
             "duplicates a path",

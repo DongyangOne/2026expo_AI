@@ -51,6 +51,8 @@ QUALITY_EXCLUSION_ROLE = (
     "v4_capture_quality_exclusion_manifest_selection_only_"
     "not_ground_truth_or_authority"
 )
+# Contract v1 readers retain immutable legacy manifests while accepting the
+# canonical vocabulary emitted by the current producer.
 QUALITY_EXCLUSION_REASONS = (
     "captured_before_2026_08_01",
     "severe_frame_crop",
@@ -60,6 +62,9 @@ QUALITY_EXCLUSION_REASONS = (
     "objective_unreadable",
     "resolution_too_low",
     "extreme_exposure",
+    "excessive_background_or_multi_object",
+    "unreadable_boundary",
+    "too_low_resolution",
 )
 QUALITY_EXCLUSION_MAX_SOURCES = 100
 QUALITY_EXCLUSION_AUTHORITY = {

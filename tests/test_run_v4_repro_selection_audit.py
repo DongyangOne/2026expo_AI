@@ -259,7 +259,10 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
     excluded_source.parent.mkdir(parents=True)
     excluded_source.write_bytes(b"bad-vinyl-capture")
     quality_entries = [
-        {"source_sha256": _sha(excluded_source), "reason": "severe_frame_crop"}
+        {
+            "source_sha256": _sha(excluded_source),
+            "reason": "excessive_background_or_multi_object",
+        }
     ]
     quality_manifest = tmp_path / "quality-exclusions.json"
     quality_manifest.write_bytes(
@@ -274,7 +277,7 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
                 "status": "quality_exclusions_ready",
                 "excluded_source_count": 1,
                 "max_excluded_sources": 100,
-                "reason_counts": {"severe_frame_crop": 1},
+                "reason_counts": {"excessive_background_or_multi_object": 1},
                 "source_list_sha256": _entries_sha(quality_entries),
                 "entries": quality_entries,
                 "authority": {
@@ -394,7 +397,7 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
             "excluded_source_count": 1,
             "max_excluded_sources": 100,
             "matched_resolved_sources": 1,
-            "reason_counts": {"severe_frame_crop": 1},
+            "reason_counts": {"excessive_background_or_multi_object": 1},
             "selection_authority": False,
             "ground_truth_authority": False,
             "replay_authority": False,
@@ -578,6 +581,15 @@ def test_wrapper_contract_is_cpu_only_immutable_and_fail_closed() -> None:
     assert "proposal_arg.is_symlink()" in text
     assert '"status": "selection_audit_ready"' in text
     assert "selection_audit.sha256" in text
+    for reason in (
+        "severe_frame_crop",
+        "person_occlusion_or_dominance",
+        "excessive_background_or_multi_object",
+        "unreadable_boundary",
+        "too_low_resolution",
+        "extreme_exposure",
+    ):
+        assert f'"{reason}"' in text
     for field in (
         '"raw_generation_authorized": False',
         '"validator_authority": False',
@@ -629,7 +641,7 @@ def test_integration_success_seals_exact_external_contract(tmp_path: Path) -> No
                 "source_sha256": _sha(
                     Path(env["FIXTURE_DATASET_DIR"]) / "excluded" / "bad-vinyl.jpg"
                 ),
-                "reason": "severe_frame_crop",
+                "reason": "excessive_background_or_multi_object",
             }
         ]
     )

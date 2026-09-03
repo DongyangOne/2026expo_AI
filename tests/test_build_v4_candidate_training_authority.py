@@ -15,7 +15,6 @@ import pytest
 
 import scripts.audit_v4_near_duplicate_leakage as near_duplicate_auditor
 import scripts.build_v4_candidate_training_authority as authority_builder
-
 from scripts.build_v4_candidate_training_authority import (
     AUTHORITY_ROLE,
     AUTHORITY_SCHEMA,
@@ -32,6 +31,9 @@ from scripts.build_v4_candidate_training_authority import (
     QX3_REPORT_ROLE,
     TRUST_ROOT_CODE_PATHS,
     build_training_authority,
+)
+from scripts.build_v4_quality_exclusion_manifest import (
+    build_quality_exclusion_manifest,
 )
 
 
@@ -1745,6 +1747,42 @@ def test_quality_reason_and_unknown_sha_fail_but_dent_is_preserved(tmp_path: Pat
     _refresh(fixture)
     with pytest.raises(ValueError, match="absent from the full-data"):
         _run(fixture)
+
+
+def test_published_producer_manifest_is_accepted_and_uses_canonical_reason(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    bad_row = fixture["bad_row"]
+    data_root = fixture["data_root"]
+    global_root = fixture["global_root"]
+    assert isinstance(bad_row, dict)
+    assert isinstance(data_root, Path)
+    assert isinstance(global_root, Path)
+    bad_source = Path(str(bad_row["source_filepath"]))
+    source_list = global_root / "producer-quality.csv"
+    source_list.write_text(
+        f"path,reason\n{bad_source.name},clutter_or_multiple_objects\n",
+        encoding="utf-8",
+    )
+    published = global_root / "producer-quality.json"
+    build_quality_exclusion_manifest(
+        source_list=source_list,
+        image_root=data_root,
+        output_path=published,
+    )
+    fixture["quality"] = published
+    _refresh(fixture)
+
+    authority = _run(fixture)
+
+    assert authority["counts"]["excluded"] == {  # type: ignore[index]
+        "operational/before_2026_08_01_kst": 1,
+        "quality/excessive_background_or_multi_object": 1,
+    }
+    rendered = published.read_text(encoding="utf-8")
+    assert "excessive_background_or_multi_object" in rendered
+    assert "clutter_or_multiple_objects" not in rendered
 
 
 def test_quality_manifest_limit_is_exactly_100(tmp_path: Path) -> None:

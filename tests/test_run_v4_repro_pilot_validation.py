@@ -537,7 +537,7 @@ print(json.dumps(report,sort_keys=True))
     quality_reason = (
         "unknown_capture_quality_reason"
         if mode == "quality_unknown_reason"
-        else "severe_frame_crop"
+        else "too_low_resolution"
     )
     quality_entries = (
         sorted(
@@ -1604,6 +1604,15 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
     assert "quality exclusion reason is not allowlisted" in text
     assert "quality exclusion source-list canonical hash mismatch" in text
     assert "quality exclusion manifest entries must contain 1..100 rows" in text
+    for reason in (
+        "severe_frame_crop",
+        "person_occlusion_or_dominance",
+        "excessive_background_or_multi_object",
+        "unreadable_boundary",
+        "too_low_resolution",
+        "extreme_exposure",
+    ):
+        assert f'"{reason}"' in text
     assert "subprocess.run" not in text
     assert "raw manifest contains a source outside the selected pilot cohort" in text
     assert "raw manifest selected-source coverage is below 99 percent" in text

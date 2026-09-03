@@ -339,6 +339,7 @@ quality_role = (
     "v4_capture_quality_exclusion_manifest_selection_only_"
     "not_ground_truth_or_authority"
 )
+# Contract v1 retains legacy immutable manifests and accepts current canonical reasons.
 quality_reasons = {
     "captured_before_2026_08_01",
     "severe_frame_crop",
@@ -348,6 +349,9 @@ quality_reasons = {
     "objective_unreadable",
     "resolution_too_low",
     "extreme_exposure",
+    "excessive_background_or_multi_object",
+    "unreadable_boundary",
+    "too_low_resolution",
 }
 materials = (
     "can", "pet", "paper", "plastic", "styrofoam", "vinyl", "glass",

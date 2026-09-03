@@ -25,15 +25,25 @@ QUALITY_EXCLUSION_ROLE = (
     "not_ground_truth_or_authority"
 )
 QUALITY_EXCLUSION_REASONS = (
-    "captured_before_2026_08_01",
     "severe_frame_crop",
     "person_occlusion_or_dominance",
-    "clutter_or_multiple_objects",
-    "boundary_unreadable",
-    "objective_unreadable",
-    "resolution_too_low",
+    "excessive_background_or_multi_object",
+    "unreadable_boundary",
+    "too_low_resolution",
     "extreme_exposure",
 )
+QUALITY_EXCLUSION_REASON_ALIASES = {
+    "clutter_or_multiple_objects": "excessive_background_or_multi_object",
+    "boundary_unreadable": "unreadable_boundary",
+    "objective_unreadable": "unreadable_boundary",
+    "resolution_too_low": "too_low_resolution",
+}
+QUALITY_EXCLUSION_INPUT_REASONS = (
+    *QUALITY_EXCLUSION_REASONS,
+    *QUALITY_EXCLUSION_REASON_ALIASES,
+)
+OPERATIONAL_CUTOFF_REASON = "captured_before_2026_08_01"
+OBJECT_CONDITION_REASONS = frozenset({"dent", "crush", "object_dented"})
 QUALITY_EXCLUSION_MAX_SOURCES = 100
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -87,6 +97,23 @@ def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _canonical_quality_reason(reason: str, *, description: str) -> str:
+    if reason == OPERATIONAL_CUTOFF_REASON:
+        raise ValueError(
+            f"{description} uses {OPERATIONAL_CUTOFF_REASON}; the operational "
+            "cutoff is enforced from captured_at, not as a quality reason"
+        )
+    if reason in OBJECT_CONDITION_REASONS:
+        raise ValueError(
+            f"{description} uses a dent/crush/object condition, "
+            "not a capture-quality reason"
+        )
+    canonical = QUALITY_EXCLUSION_REASON_ALIASES.get(reason, reason)
+    if canonical not in QUALITY_EXCLUSION_REASONS:
+        raise ValueError(f"{description} has unknown reason")
+    return canonical
+
+
 def _reject_symlink_components(path: Path, *, description: str) -> None:
     absolute = Path(os.path.abspath(path))
     cursor = Path(absolute.anchor)
@@ -97,6 +124,8 @@ def _reject_symlink_components(path: Path, *, description: str) -> None:
 
 
 def _manifest_value(entries: list[dict[str, str]]) -> dict[str, object]:
+    if any(entry.get("reason") not in QUALITY_EXCLUSION_REASONS for entry in entries):
+        raise ValueError("quality exclusion manifest entries must use canonical reasons")
     entries = sorted(entries, key=lambda item: item["source_sha256"])
     if not entries:
         raise ValueError("quality exclusion manifest must contain at least one source")
@@ -210,9 +239,9 @@ def build_quality_exclusion_manifest(
     for row_number, row in enumerate(rows, start=2):
         if set(row) != {"path", "reason"} or None in row:
             raise ValueError(f"quality exclusion source row {row_number} is malformed")
-        reason = row["reason"]
-        if reason not in QUALITY_EXCLUSION_REASONS:
-            raise ValueError(f"quality exclusion source row {row_number} has unknown reason")
+        reason = _canonical_quality_reason(
+            row["reason"], description=f"quality exclusion source row {row_number}"
+        )
         source = _resolve_source(image_root, row["path"], row_number=row_number)
         if source in seen_paths:
             raise ValueError(f"quality exclusion source row {row_number} duplicates a path")
@@ -245,8 +274,9 @@ def build_quality_exclusion_manifest(
 def build_single_quality_exclusion_manifest(
     *, source_path: Path, reason: str, output_path: Path
 ) -> dict[str, object]:
-    if reason not in QUALITY_EXCLUSION_REASONS:
-        raise ValueError("single-source quality exclusion reason is unknown")
+    reason = _canonical_quality_reason(
+        reason, description="single-source quality exclusion reason"
+    )
     source_arg = source_path
     if source_arg.is_symlink() or not source_arg.is_file():
         raise ValueError("single source must be a regular non-symlink file")
@@ -269,7 +299,7 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--source-list", type=Path)
     source.add_argument("--source", type=Path)
     parser.add_argument("--image-root", type=Path)
-    parser.add_argument("--reason", choices=QUALITY_EXCLUSION_REASONS)
+    parser.add_argument("--reason", choices=QUALITY_EXCLUSION_INPUT_REASONS)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     if args.source_list is not None:
