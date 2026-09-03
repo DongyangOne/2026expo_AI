@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
@@ -7,12 +8,18 @@ import cv2
 import numpy as np
 import pytest
 
+import scripts.assemble_operational_quality_exclusions as quality_assembler
 from scripts.build_operational_teacher_manifest import (
     ARTIFACT_NAMES,
     TEACHER_LABEL_SCHEMA_VERSION,
     build_operational_teacher_manifest as _real_build_operational_teacher_manifest,
     main,
 )
+from scripts.assemble_operational_quality_exclusions import (
+    ASSEMBLY_FILES,
+    assemble_operational_quality_exclusions,
+)
+from scripts.build_v4_candidate_training_authority import _validate_quality_manifest
 from scripts.audit_verifier_dataset import audit_manifest
 import scripts.label_operational_captures_ollama as teacher
 from scripts.build_independent_localization_consensus import (
@@ -1058,3 +1065,530 @@ def test_dry_run_overwrite_guard_role_boundary_and_deterministic_outputs(tmp_pat
                 "blind_test",
             ]
         )
+
+
+def _quality_assembly_fixture(
+    tmp_path: Path,
+    reasons: tuple[str, ...] = (
+        "severe_frame_crop",
+        "person_occlusion_or_dominance",
+        "clutter_or_multiple_objects",
+        "boundary_unreadable",
+    ),
+) -> tuple[dict, list[Path]]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    image_paths: list[Path] = []
+    queue_rows: list[dict] = []
+    label_rows: list[dict] = []
+    for index, reason in enumerate(reasons):
+        image_path, sha = _image(tmp_path, f"quality-{index}", 70 + index * 20)
+        image_paths.append(image_path)
+        queue_rows.append(
+            _queue_row(
+                image_path,
+                sha,
+                f"2026-08-01T01:0{index}:00Z",
+                [10, 10, 100, 90],
+            )
+        )
+        label_rows.append(
+            _teacher_row(
+                image_path,
+                sha,
+                training_usable=False,
+                quality_reason=reason,
+            )
+        )
+    usable_path, usable_sha = _image(tmp_path, "usable-control", 170)
+    queue_rows.append(
+        _queue_row(
+            usable_path,
+            usable_sha,
+            "2026-08-01T02:00:00Z",
+            [10, 10, 100, 90],
+        )
+    )
+    label_rows.append(_teacher_row(usable_path, usable_sha))
+    queue_path, labels_path = _build_inputs(tmp_path, queue_rows, label_rows)
+    inventory_path = tmp_path / "capture_inventory.json"
+    inventory_rows = json.loads(inventory_path.read_text(encoding="utf-8"))
+    for index, row in enumerate(inventory_rows):
+        row["request"] = {"client_id": f"private-client-{index}"}
+    inventory_path.write_text(json.dumps(inventory_rows), encoding="utf-8")
+    teacher_output = tmp_path / "teacher-output"
+    build_operational_teacher_manifest(
+        teacher_queue=queue_path,
+        teacher_labels=labels_path,
+        image_root=tmp_path,
+        output_dir=teacher_output,
+    )
+    evidence = _evidence_args(tmp_path)
+    args = {
+        "teacher_output_dir": teacher_output,
+        "teacher_queue": queue_path,
+        "teacher_labels": labels_path,
+        "capture_inventory": inventory_path,
+        "known_audit": evidence["known_audit"],
+        "provider_a_manifest": evidence["provider_a_manifest"],
+        "provider_a_model": evidence["provider_a_model"],
+        "provider_a_spec": evidence["provider_a_spec"],
+        "provider_b_manifest": evidence["provider_b_manifest"],
+        "provider_b_model": evidence["provider_b_model"],
+        "provider_b_spec": evidence["provider_b_spec"],
+        "image_root": tmp_path,
+        "output_dir": tmp_path / "quality-assembly",
+    }
+    return args, image_paths
+
+
+def _rewrite_bound_lineage_input(args: dict, name: str, path: Path) -> None:
+    lineage_path = args["teacher_output_dir"] / ARTIFACT_NAMES["lineage"]
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    lineage["inputs"][f"{name}_sha256"] = hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+    lineage_path.write_text(
+        json.dumps(lineage, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _candidate_authority_test_helpers():
+    helper_path = Path(__file__).with_name(
+        "test_build_v4_candidate_training_authority.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_operational_quality_candidate_test_helpers", helper_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_operational_quality_assembler_emits_only_sha_and_canonical_reason(
+    tmp_path: Path,
+) -> None:
+    args, image_paths = _quality_assembly_fixture(tmp_path)
+
+    receipt = assemble_operational_quality_exclusions(**args)
+
+    output = args["output_dir"]
+    assert {path.name for path in output.iterdir()} == set(ASSEMBLY_FILES.values())
+    manifest_path = output / ASSEMBLY_FILES["manifest"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = {
+        hashlib.sha256(image_paths[0].read_bytes()).hexdigest(): "severe_frame_crop",
+        hashlib.sha256(image_paths[1].read_bytes()).hexdigest(): (
+            "person_occlusion_or_dominance"
+        ),
+        hashlib.sha256(image_paths[2].read_bytes()).hexdigest(): (
+            "excessive_background_or_multi_object"
+        ),
+        hashlib.sha256(image_paths[3].read_bytes()).hexdigest(): "unreadable_boundary",
+    }
+    assert _validate_quality_manifest(manifest) == expected
+    persisted_receipt = json.loads(
+        (output / ASSEMBLY_FILES["receipt"]).read_text(encoding="utf-8")
+    )
+    assert persisted_receipt == receipt
+    assert receipt["selected_source_count"] == 4
+    assert set(receipt["authority"].values()) == {False}
+    assert receipt["scope"] == {
+        "teacher_subjective_quality_only": True,
+        "objective_queue_rejections_recoverable": False,
+        "paths_or_private_ids_exported": False,
+        "trusted_policy_pinned": False,
+        "executed_code_cryptographically_attested": False,
+    }
+    rendered = "".join(
+        path.read_text(encoding="utf-8") for path in output.iterdir()
+    )
+    assert "private-client" not in rendered
+    assert not any(path.name in rendered for path in image_paths)
+    input_paths = {
+        name: args[name]
+        for name in (
+            "teacher_queue",
+            "teacher_labels",
+            "capture_inventory",
+            "known_audit",
+            "provider_a_manifest",
+            "provider_a_model",
+            "provider_a_spec",
+            "provider_b_manifest",
+            "provider_b_model",
+            "provider_b_spec",
+        )
+    }
+    expected_input_hashes = {
+        name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for name, path in input_paths.items()
+    }
+    expected_input_hashes.update(
+        {
+            f"teacher_output_{name}": hashlib.sha256(
+                (args["teacher_output_dir"] / filename).read_bytes()
+            ).hexdigest()
+            for name, filename in ARTIFACT_NAMES.items()
+        }
+    )
+    assert receipt["input_sha256"] == dict(sorted(expected_input_hashes.items()))
+    marker_sources = {
+        name: (output / name).read_bytes()
+        for name in (ASSEMBLY_FILES["manifest"], ASSEMBLY_FILES["receipt"])
+    }
+    expected_marker = "".join(
+        f"{hashlib.sha256(content).hexdigest()}  {name}\n"
+        for name, content in sorted(marker_sources.items())
+    )
+    assert (output / ASSEMBLY_FILES["marker"]).read_text(
+        encoding="ascii"
+    ) == expected_marker
+    before = {path.name: path.read_bytes() for path in output.iterdir()}
+    with pytest.raises(FileExistsError, match="overwrite immutable output"):
+        assemble_operational_quality_exclusions(**args)
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == before
+
+
+def test_operational_quality_assembly_is_consumed_by_full_candidate_authority(
+    tmp_path: Path,
+) -> None:
+    args, image_paths = _quality_assembly_fixture(
+        tmp_path / "assembly", ("clutter_or_multiple_objects",)
+    )
+    assemble_operational_quality_exclusions(**args)
+    quality_manifest = args["output_dir"] / ASSEMBLY_FILES["manifest"]
+    selected_bytes = image_paths[0].read_bytes()
+    selected_sha = hashlib.sha256(selected_bytes).hexdigest()
+
+    candidate = _candidate_authority_test_helpers()
+    fixture = candidate._fixture(tmp_path / "candidate")
+    bad_row = fixture["bad_row"]
+    bad_source = Path(bad_row["source_filepath"])
+    bad_source.write_bytes(selected_bytes)
+    bad_row["source_sha256"] = selected_sha
+    bad_row["origin"] = "ops"
+    bad_row["captured_at"] = "2026-08-01T00:00:00+09:00"
+    bad_row["auditor_sha256"] = candidate._fake_sha("ops-auditor")
+    bad_row["teacher_output_sha256"] = candidate._fake_sha("ops-teacher")
+    bad_row["localizer_output_sha256"] = candidate._fake_sha("ops-localizer")
+    fixture["quality"] = quality_manifest
+    candidate._refresh(fixture)
+
+    authority = candidate._run(fixture)
+
+    assert authority["counts"]["excluded"] == {
+        "operational/before_2026_08_01_kst": 1,
+        "quality/excessive_background_or_multi_object": 1,
+    }
+
+
+def test_operational_quality_assembler_rejects_extra_decision_reason(
+    tmp_path: Path,
+) -> None:
+    args, _ = _quality_assembly_fixture(tmp_path, ("severe_frame_crop",))
+    rejection_path = args["teacher_output_dir"] / ARTIFACT_NAMES["rejections"]
+    rejection_report = json.loads(rejection_path.read_text(encoding="utf-8"))
+    rejection_report["rejections"][0]["reasons"].append(
+        "minimum_confidence_below_threshold"
+    )
+    rejection_report["rejections"][0]["reasons"].sort()
+    rejection_report["reason_counts"]["minimum_confidence_below_threshold"] = 1
+    rejection_path.write_text(
+        json.dumps(rejection_report, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    lineage_path = args["teacher_output_dir"] / ARTIFACT_NAMES["lineage"]
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    lineage["output_digests"]["rejections_sha256"] = hashlib.sha256(
+        rejection_path.read_bytes()
+    ).hexdigest()
+    lineage_path.write_text(
+        json.dumps(lineage, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="additional rejection reasons"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_operational_quality_assembler_rechecks_cutoff_after_bound_input_change(
+    tmp_path: Path,
+) -> None:
+    args, _ = _quality_assembly_fixture(tmp_path, ("boundary_unreadable",))
+    queue_rows = [
+        json.loads(line)
+        for line in args["teacher_queue"].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    queue_rows[0]["timestamp"] = "2026-07-31T14:59:59Z"
+    _jsonl(args["teacher_queue"], queue_rows)
+    inventory_rows = json.loads(args["capture_inventory"].read_text(encoding="utf-8"))
+    inventory_rows[0]["timestamp"] = "2026-07-31T14:59:59Z"
+    args["capture_inventory"].write_text(
+        json.dumps(inventory_rows), encoding="utf-8"
+    )
+    _rewrite_bound_lineage_input(args, "teacher_queue", args["teacher_queue"])
+    _rewrite_bound_lineage_input(
+        args, "capture_inventory", args["capture_inventory"]
+    )
+
+    with pytest.raises(ValueError, match="before the operational cutoff"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_operational_quality_assembler_rejects_forged_path_and_changed_bytes(
+    tmp_path: Path,
+) -> None:
+    args, image_paths = _quality_assembly_fixture(tmp_path, ("boundary_unreadable",))
+    image_paths[0].write_bytes(b"changed-after-teacher-output")
+    with pytest.raises(ValueError, match="bytes do not match teacher SHA"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+    # Rebuild a clean fixture in a separate directory for a self-consistently
+    # rebound path traversal attempt.
+    forged_root = tmp_path / "forged"
+    forged_root.mkdir()
+    forged_args, _ = _quality_assembly_fixture(
+        forged_root, ("boundary_unreadable",)
+    )
+    queue_rows = [
+        json.loads(line)
+        for line in forged_args["teacher_queue"].read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    label_rows = [
+        json.loads(line)
+        for line in forged_args["teacher_labels"].read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    inventory_rows = json.loads(
+        forged_args["capture_inventory"].read_text(encoding="utf-8")
+    )
+    for row in (*queue_rows, *label_rows, *inventory_rows):
+        row["image_ref"] = "../outside.png"
+    _jsonl(forged_args["teacher_queue"], queue_rows)
+    _jsonl(forged_args["teacher_labels"], label_rows)
+    forged_args["capture_inventory"].write_text(
+        json.dumps(inventory_rows), encoding="utf-8"
+    )
+    for name in ("teacher_queue", "teacher_labels", "capture_inventory"):
+        _rewrite_bound_lineage_input(forged_args, name, forged_args[name])
+
+    with pytest.raises(ValueError, match="normalized and relative"):
+        assemble_operational_quality_exclusions(**forged_args)
+    assert not forged_args["output_dir"].exists()
+
+
+def test_operational_quality_assembler_refuses_empty_quality_selection(
+    tmp_path: Path,
+) -> None:
+    args, _ = _quality_assembly_fixture(tmp_path, ())
+
+    with pytest.raises(ValueError, match="no eligible post-cutoff"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_operational_quality_assembler_rejects_known_audit_overlap(
+    tmp_path: Path,
+) -> None:
+    args, image_paths = _quality_assembly_fixture(tmp_path, ("severe_frame_crop",))
+    selected_sha = hashlib.sha256(image_paths[0].read_bytes()).hexdigest()
+    args["known_audit"].write_text(
+        json.dumps({selected_sha: {"split": "train"}}), encoding="utf-8"
+    )
+    _rewrite_bound_lineage_input(args, "known_audit", args["known_audit"])
+
+    with pytest.raises(ValueError, match="already in known audit"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_operational_quality_assembler_rehashes_inputs_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _ = _quality_assembly_fixture(tmp_path, ("severe_frame_crop",))
+    real_builder = quality_assembler.build_quality_exclusion_manifest
+
+    def mutate_bound_input_after_manifest(**kwargs):
+        result = real_builder(**kwargs)
+        args["teacher_queue"].write_bytes(
+            args["teacher_queue"].read_bytes() + b"\n"
+        )
+        return result
+
+    monkeypatch.setattr(
+        quality_assembler,
+        "build_quality_exclusion_manifest",
+        mutate_bound_input_after_manifest,
+    )
+    with pytest.raises(RuntimeError, match="input changed before publish"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+    assert not list(tmp_path.glob(f".{args['output_dir'].name}.*"))
+
+
+def test_operational_quality_assembler_never_replaces_racing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _ = _quality_assembly_fixture(tmp_path, ("severe_frame_crop",))
+    real_stable_directory = quality_assembler._stable_directory
+
+    def create_destination_after_initial_check(path: Path, *, description: str):
+        resolved = real_stable_directory(path, description=description)
+        if description == "output parent":
+            args["output_dir"].mkdir()
+            (args["output_dir"] / "sentinel.txt").write_text(
+                "do-not-replace", encoding="utf-8"
+            )
+        return resolved
+
+    monkeypatch.setattr(
+        quality_assembler,
+        "_stable_directory",
+        create_destination_after_initial_check,
+    )
+    with pytest.raises(FileExistsError, match="overwrite immutable output"):
+        assemble_operational_quality_exclusions(**args)
+    assert {
+        path.name: path.read_text(encoding="utf-8")
+        for path in args["output_dir"].iterdir()
+    } == {"sentinel.txt": "do-not-replace"}
+    assert not list(tmp_path.glob(f".{args['output_dir'].name}.*"))
+
+
+def test_operational_quality_assembler_recomputes_forged_usable_decision(
+    tmp_path: Path,
+) -> None:
+    args, _ = _quality_assembly_fixture(tmp_path, ("severe_frame_crop",))
+    rejection_path = args["teacher_output_dir"] / ARTIFACT_NAMES["rejections"]
+    rejection_report = json.loads(rejection_path.read_text(encoding="utf-8"))
+    rejection = rejection_report["rejections"][0]
+    old_reason = rejection["reasons"][0]
+    rejection["teacher_training_usable"] = True
+    rejection["teacher_quality_reason"] = "usable"
+    rejection["reasons"] = ["minimum_confidence_below_threshold"]
+    del rejection_report["reason_counts"][old_reason]
+    rejection_report["reason_counts"] = {"minimum_confidence_below_threshold": 1}
+    rejection_path.write_text(
+        json.dumps(rejection_report, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    lineage_path = args["teacher_output_dir"] / ARTIFACT_NAMES["lineage"]
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    lineage["output_digests"]["rejections_sha256"] = hashlib.sha256(
+        rejection_path.read_bytes()
+    ).hexdigest()
+    lineage_path.write_text(
+        json.dumps(lineage, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="decision does not match rejection"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_operational_quality_assembler_rejects_output_inside_teacher_authority(
+    tmp_path: Path,
+) -> None:
+    args, _ = _quality_assembly_fixture(tmp_path, ("severe_frame_crop",))
+    teacher_files = {
+        path.name: path.read_bytes() for path in args["teacher_output_dir"].iterdir()
+    }
+    args["output_dir"] = args["teacher_output_dir"] / "nested-output"
+
+    with pytest.raises(ValueError, match="inside teacher output authority"):
+        assemble_operational_quality_exclusions(**args)
+    assert {
+        path.name: path.read_bytes() for path in args["teacher_output_dir"].iterdir()
+    } == teacher_files
+
+
+def test_operational_quality_assembler_requires_complete_queue_partition(
+    tmp_path: Path,
+) -> None:
+    args, _ = _quality_assembly_fixture(
+        tmp_path, ("severe_frame_crop", "boundary_unreadable")
+    )
+    rejection_path = args["teacher_output_dir"] / ARTIFACT_NAMES["rejections"]
+    rejection_report = json.loads(rejection_path.read_text(encoding="utf-8"))
+    removed = rejection_report["rejections"].pop(0)
+    removed_reason = removed["reasons"][0]
+    rejection_report["rejected_records"] -= 1
+    rejection_report["reason_counts"][removed_reason] -= 1
+    if rejection_report["reason_counts"][removed_reason] == 0:
+        del rejection_report["reason_counts"][removed_reason]
+    rejection_path.write_text(
+        json.dumps(rejection_report, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    lineage_path = args["teacher_output_dir"] / ARTIFACT_NAMES["lineage"]
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    lineage["counts"]["rejected_records"] -= 1
+    lineage["output_digests"]["rejections_sha256"] = hashlib.sha256(
+        rejection_path.read_bytes()
+    ).hexdigest()
+    lineage_path.write_text(
+        json.dumps(lineage, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="do not partition the queue"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_operational_quality_assembler_requires_decision_rejection_for_unusable_label(
+    tmp_path: Path,
+) -> None:
+    args, _ = _quality_assembly_fixture(
+        tmp_path, ("severe_frame_crop", "boundary_unreadable")
+    )
+    rejection_path = args["teacher_output_dir"] / ARTIFACT_NAMES["rejections"]
+    rejection_report = json.loads(rejection_path.read_text(encoding="utf-8"))
+    replaced = rejection_report["rejections"][0]
+    old_reason = replaced["reasons"][0]
+    rejection_report["rejections"][0] = {
+        "sha256": replaced["sha256"],
+        "reasons": ["missing_teacher_label"],
+    }
+    rejection_report["reason_counts"][old_reason] -= 1
+    if rejection_report["reason_counts"][old_reason] == 0:
+        del rejection_report["reason_counts"][old_reason]
+    rejection_report["reason_counts"]["missing_teacher_label"] = 1
+    rejection_report["reason_counts"] = dict(
+        sorted(rejection_report["reason_counts"].items())
+    )
+    rejection_path.write_text(
+        json.dumps(rejection_report, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    lineage_path = args["teacher_output_dir"] / ARTIFACT_NAMES["lineage"]
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    lineage["output_digests"]["rejections_sha256"] = hashlib.sha256(
+        rejection_path.read_bytes()
+    ).hexdigest()
+    lineage_path.write_text(
+        json.dumps(lineage, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not match its exact consensus"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
