@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+import scripts.audit_v4_near_duplicate_leakage as near_duplicate_auditor
 import scripts.build_v4_candidate_training_authority as authority_builder
 
 from scripts.build_v4_candidate_training_authority import (
@@ -49,6 +50,39 @@ def _dump(path: Path, value: object) -> Path:
     )
     return path
 
+
+def _dump_compact(path: Path, value: object) -> Path:
+    path.write_bytes(authority_builder._canonical_compact_payload(value) + b"\n")
+    return path
+
+
+def _near_duplicate_entry(
+    *, role: str, cohort: str, view_kind: str, sample_id: str,
+    source_sha256: str, image_sha256: str, size: int,
+) -> dict[str, object]:
+    identity = {
+        "cohort": cohort,
+        "image_sha256": image_sha256,
+        "role": role,
+        "sample_id": sample_id,
+        "source_sha256": source_sha256,
+        "view_kind": view_kind,
+    }
+    asset_id = _sha(authority_builder._canonical_compact_payload(identity))
+    phash = _fake_sha(f"phash:{asset_id}")
+    return {
+        "asset_id": asset_id,
+        "role": role,
+        "cohort": cohort,
+        "view_kind": view_kind,
+        "sample_id": sample_id,
+        "source_sha256": source_sha256,
+        "image_sha256": image_sha256,
+        "size": size,
+        "width": 1,
+        "height": 1,
+        "phash_rot4": [phash[index:index + 16] for index in range(0, 64, 16)],
+    }
 
 def _qnap_inventory_tree(
     source_root: str, container_root: str, library_name: str
@@ -122,6 +156,8 @@ def _policy_bindings(fixture: dict[str, object]) -> dict[str, str]:
         "license_allowlist_sha256": "license_path",
         "quality_exclusions_sha256": "quality",
         "protected_sources_sha256": "protected",
+        "candidate_near_duplicate_audit_sha256": "near_duplicate_audit",
+        "protected_reference_inventory_sha256": "protected_inventory",
         "code_inventory_sha256": "inventory",
         "training_config_sha256": "config",
         "host_launch_contract_sha256": "host",
@@ -331,6 +367,191 @@ def _refresh(fixture: dict[str, object]) -> None:
             authority_builder._canonical_json(consumption_contract)
         ),
     }
+    protected_path = fixture["protected"]
+    protected_inventory_path = fixture["protected_inventory"]
+    auditor_path = fixture["auditor"]
+    near_duplicate_path = fixture["near_duplicate_audit"]
+    assert all(
+        isinstance(path, Path)
+        for path in (
+            protected_path,
+            protected_inventory_path,
+            auditor_path,
+            near_duplicate_path,
+        )
+    )
+    protected_value = json.loads(protected_path.read_text(encoding="utf-8"))
+    protected_union = sorted(
+        {
+            digest
+            for field in PROTECTED_FIELDS
+            for digest in protected_value[field]
+        }
+    )
+    protected_inventory_value = json.loads(
+        protected_inventory_path.read_text(encoding="utf-8")
+    )
+    crop_sizes = {
+        str(item["sha256"]): int(item["size"])
+        for item in snapshot_plan
+    }
+    candidate_entries: list[dict[str, object]] = []
+    for role, role_rows in selected.items():
+        for row in role_rows:
+            source_sha = row["source_sha256"]
+            image_sha = row["image_sha256"]
+            candidate_entries.append(
+                _near_duplicate_entry(
+                    role=role,
+                    cohort="candidate",
+                    view_kind="source",
+                    sample_id=f"source:{role}:{source_sha}",
+                    source_sha256=source_sha,
+                    image_sha256=source_sha,
+                    size=Path(row["source_filepath"]).stat().st_size,
+                )
+            )
+            candidate_entries.append(
+                _near_duplicate_entry(
+                    role=role,
+                    cohort="candidate",
+                    view_kind="crop",
+                    sample_id=row["sample_id"],
+                    source_sha256=source_sha,
+                    image_sha256=image_sha,
+                    size=crop_sizes[image_sha],
+                )
+            )
+    protected_entries = [
+        _near_duplicate_entry(
+            role=str(item["cohort"]),
+            cohort=str(item["cohort"]),
+            view_kind=str(item["view_kind"]),
+            sample_id=(
+                f"protected:{item['cohort']}:{item['view_kind']}:"
+                f"{str(item['image_sha256'])[:16]}:"
+                f"{_sha(str(item['path']).encode('utf-8'))[:16]}"
+            ),
+            source_sha256=str(item["source_sha256"]),
+            image_sha256=str(item["image_sha256"]),
+            size=int(item["size"]),
+        )
+        for item in protected_inventory_value["objects"]
+    ]
+    near_duplicate_entries = sorted(
+        candidate_entries + protected_entries,
+        key=lambda item: str(item["asset_id"]),
+    )
+    near_duplicate_edges, near_duplicate_clusters = (
+        authority_builder._reconstruct_near_duplicate_graph(
+            near_duplicate_entries
+        )
+    )
+    near_duplicate_report = {
+        "schema": authority_builder.NEAR_DUPLICATE_REPORT_SCHEMA,
+        "status": "passed",
+        "ok": True,
+        "artifact_role": "candidate_dataset_separation_evidence_only",
+        "authority": {
+            "candidate_only": True,
+            "label_authority": False,
+            "blind_authority": False,
+            "promotion_authority": False,
+            "deployment_authority": False,
+            "automatic_delete_or_relabel": False,
+        },
+        "algorithm": {
+            "id": authority_builder.NEAR_DUPLICATE_ALGORITHM_ID,
+            "threshold": authority_builder.NEAR_DUPLICATE_PHASH_DISTANCE,
+            "decode": "verified_bytes_cv2_grayscale_ignore_exif_orientation",
+            "views": ["rot0", "rot90", "rot180", "rot270"],
+            "resize": {"width": 32, "height": 32, "interpolation": "INTER_AREA"},
+            "dct": {"dtype": "float32", "low_frequency_block": [8, 8]},
+            "bit_rule": (
+                "row_major_msb_first; median(coefficients[1:]); "
+                "coefficient>median; dc=0"
+            ),
+            "byte_cap": authority_builder.IMAGE_CONSUMPTION_MAX_BYTES,
+            "pixel_cap": authority_builder.NEAR_DUPLICATE_PIXEL_CAP,
+            "exact_right_angle_rotation_invariant": True,
+            "crop_invariant": False,
+            "graph_edge_cap": authority_builder.NEAR_DUPLICATE_GRAPH_EDGE_CAP,
+            "runtime": {
+                "python": "3.12.0",
+                "opencv": "4.10.0",
+                "numpy": "2.0.0",
+                "pillow": "11.0.0",
+                "opencv_build_information_sha256": _fake_sha("opencv-build"),
+            },
+        },
+        "bindings": {
+            "candidate_manifest_sha256": {
+                "train": candidate_manifest_bindings[
+                    "candidate_train_manifest_sha256"
+                ],
+                "model_validation": candidate_manifest_bindings[
+                    "candidate_model_validation_manifest_sha256"
+                ],
+            },
+            "candidate_payload_set_sha256": _sha(
+                authority_builder._canonical_compact_payload(
+                    sorted({entry["image_sha256"] for entry in candidate_entries})
+                )
+            ),
+            "protected_payload_set_sha256": _sha(
+                authority_builder._canonical_compact_payload(
+                    sorted({entry["image_sha256"] for entry in protected_entries})
+                )
+            ),
+            "protected_sources": {
+                "file_sha256": _sha(protected_path.read_bytes()),
+                "payload_sha256": _sha(
+                    authority_builder._canonical_compact_payload(protected_value)
+                ),
+                "canonical_union_sha256": _sha(
+                    authority_builder._canonical_compact_payload(protected_union)
+                ),
+            },
+            "protected_inventory": {
+                "file_sha256": _sha(protected_inventory_path.read_bytes()),
+                "payload_sha256": _sha(
+                    authority_builder._canonical_compact_payload(
+                        protected_inventory_value
+                    )
+                ),
+            },
+            "auditor": {
+                "path": authority_builder.NEAR_DUPLICATE_AUDITOR_PATH,
+                "sha256": _sha(auditor_path.read_bytes()),
+                "runtime_code_sha256": (
+                    near_duplicate_auditor.runtime_code_fingerprint_sha256()
+                ),
+            },
+        },
+        "coverage": {
+            "candidate_assets": len(candidate_entries),
+            "protected_assets": len(protected_entries),
+            "protected_source_union": len(protected_union),
+            "verified_assets": (
+                len(candidate_entries) + len(protected_entries)
+            ),
+            "complete": True,
+        },
+        "summary": {
+            "edges": len(near_duplicate_edges),
+            "clusters": len(near_duplicate_clusters),
+            "blocking_multi_role_clusters": 0,
+            "same_role_duplicate_clusters_nonblocking": sum(
+                1
+                for cluster in near_duplicate_clusters
+                if not cluster["blocking"] and int(cluster["edge_count"]) > 0
+            ),
+        },
+        "entries": near_duplicate_entries,
+        "edges": near_duplicate_edges,
+        "clusters": near_duplicate_clusters,
+    }
+    _dump_compact(near_duplicate_path, near_duplicate_report)
     license_path = fixture["license_path"]
     assert isinstance(license_path, Path)
     license_origins = json.loads(
@@ -694,6 +915,14 @@ torch.onnx.export(
         encoding="utf-8",
         newline="\n",
     )
+    auditor = code_root / authority_builder.NEAR_DUPLICATE_AUDITOR_PATH
+    auditor.parent.mkdir(parents=True, exist_ok=True)
+    auditor.write_bytes(
+        (
+            Path(__file__).resolve().parents[1]
+            / authority_builder.NEAR_DUPLICATE_AUDITOR_PATH
+        ).read_bytes()
+    )
 
     rows: list[dict[str, str]] = []
 
@@ -836,6 +1065,48 @@ torch.onnx.export(
         "blind_test_source_sha256": [],
     }
     protected = _dump(global_root / "protected.json", protected_value)
+    protected_inventory = _dump(
+        global_root / "protected_reference_inventory.json",
+        {
+            "schema": authority_builder.PROTECTED_REFERENCE_INVENTORY_SCHEMA,
+            "root": "protected_objects",
+            "objects": [
+                {
+                    "cohort": "qx3_diagnostic",
+                    "view_kind": view_kind,
+                    "path": f"qx3/{index:04d}-{view_kind}-{digest}.jpg",
+                    "size": 1,
+                    "image_sha256": (
+                        digest
+                        if view_kind == "source"
+                        else _fake_sha(f"qx3-crop-{index}")
+                    ),
+                    "source_sha256": digest,
+                }
+                for index, digest in enumerate(qx3_diagnostic_sources)
+                for view_kind in ("source", "crop")
+            ]
+            + [
+                {
+                    "cohort": "hardware41",
+                    "view_kind": view_kind,
+                    "path": f"hardware41/{index:04d}-{view_kind}-{digest}.jpg",
+                    "size": 1,
+                    "image_sha256": (
+                        digest
+                        if view_kind == "source"
+                        else _fake_sha(f"hardware-crop-{index}")
+                    ),
+                    "source_sha256": digest,
+                }
+                for index, digest in enumerate(
+                    protected_value["hardware41_source_sha256"]
+                )
+                for view_kind in ("source", "crop")
+            ],
+        },
+    )
+    near_duplicate_audit = global_root / "near_duplicate_audit.json"
     code_files = sorted(
         path
         for path in code_root.rglob("*")
@@ -1067,7 +1338,10 @@ torch.onnx.export(
     return result
 
 
-def _run(fixture: dict[str, object], *, output_name: str = "authority") -> dict[str, object]:
+def _run(
+    fixture: dict[str, object], *, output_name: str = "authority",
+    preaudit_proposal_dir: Path | None = None,
+) -> dict[str, object]:
     policy = fixture["policy"]
     global_root = fixture["global_root"]
     code_root = fixture["code_root"]
@@ -1098,13 +1372,32 @@ def _run(fixture: dict[str, object], *, output_name: str = "authority") -> dict[
             license_allowlist=fixture["license_path"],  # type: ignore[arg-type]
             quality_exclusions=fixture["quality"],  # type: ignore[arg-type]
             protected_sources=fixture["protected"],  # type: ignore[arg-type]
+            near_duplicate_audit_report=fixture["near_duplicate_audit"],  # type: ignore[arg-type]
+            protected_reference_inventory=fixture["protected_inventory"],  # type: ignore[arg-type]
             code_inventory=fixture["inventory"],  # type: ignore[arg-type]
             pretrained_backbone=fixture["backbone"],  # type: ignore[arg-type]
             training_config=fixture["config"],  # type: ignore[arg-type]
             host_launch_contract=fixture["host"],  # type: ignore[arg-type]
             container_image_id=fixture["image_id"],  # type: ignore[arg-type]
             output_dir=global_root / output_name,
+            preaudit_proposal_dir=preaudit_proposal_dir,
         )
+
+
+def _build_preaudit_proposal(
+    fixture: dict[str, object], *, output_name: str = "preaudit-proposal",
+) -> dict[str, object]:
+    global_root = fixture["global_root"]
+    assert isinstance(global_root, Path)
+    return authority_builder.build_preaudit_candidate_proposal(
+        source_manifests=[fixture["manifest"]],  # type: ignore[list-item]
+        full_data_validator_reports=[fixture["full_report"]],  # type: ignore[list-item]
+        license_allowlist=fixture["license_path"],  # type: ignore[arg-type]
+        quality_exclusions=fixture["quality"],  # type: ignore[arg-type]
+        protected_sources=fixture["protected"],  # type: ignore[arg-type]
+        training_config=fixture["config"],  # type: ignore[arg-type]
+        output_dir=global_root / output_name,
+    )
 
 
 def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None:
@@ -1182,6 +1475,19 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
         emitted_sha = _sha((output / filename).read_bytes())
         assert policy_value[binding] == emitted_sha
         assert authority["bindings"][binding] == emitted_sha  # type: ignore[index]
+    near_duplicate_path = fixture["near_duplicate_audit"]
+    protected_inventory_path = fixture["protected_inventory"]
+    assert isinstance(near_duplicate_path, Path)
+    assert isinstance(protected_inventory_path, Path)
+    assert authority["near_duplicate_audit"] == json.loads(
+        near_duplicate_path.read_text(encoding="utf-8")
+    )
+    assert authority["bindings"]["candidate_near_duplicate_audit_sha256"] == _sha(  # type: ignore[index]
+        near_duplicate_path.read_bytes()
+    )
+    assert authority["bindings"]["protected_reference_inventory_sha256"] == _sha(  # type: ignore[index]
+        protected_inventory_path.read_bytes()
+    )
     for entry in content_inventory:
         assert set(entry) == {
             "sample_id", "role", "source_path", "source_size", "source_sha256",
@@ -1226,6 +1532,104 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
     assert authority["bindings"]["dataset_snapshot_publish_receipt_sha256"] == _sha(  # type: ignore[index]
         authority_builder._canonical_json(receipt)
     )
+
+
+def test_preaudit_proposal_is_non_authoritative_and_final_bytes_match(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    proposal = _build_preaudit_proposal(fixture)
+    proposal_root = fixture["global_root"] / "preaudit-proposal"  # type: ignore[operator]
+    assert set(path.name for path in proposal_root.iterdir()) == {
+        "preaudit_proposal.json",
+        "preaudit_proposal.sha256",
+        "train_manifest.csv",
+        "model_validation_manifest.csv",
+        "candidate_dataset_snapshot.json",
+        "dataset_snapshot",
+    }
+    assert proposal["schema"] == authority_builder.PREAUDIT_PROPOSAL_SCHEMA
+    assert proposal["near_duplicate_audit_input_ready"] is True
+    for field in (
+        "candidate_training_input_authorized", "training_authority",
+        "lineage_execution_authorized", "ready_for_lineage_upgrade",
+        "blind_test_authority", "candidate_promotion_authorized",
+        "production_deployment_authorized", "pi_deployment_authorized",
+    ):
+        assert proposal[field] is False
+    assert proposal["counts"]["excluded"] == {  # type: ignore[index]
+        "operational/before_2026_08_01_kst": 1,
+        "quality/severe_frame_crop": 1,
+    }
+
+    authority = _run(
+        fixture,
+        output_name="authority-from-proposal",
+        preaudit_proposal_dir=proposal_root,
+    )
+    authority_root = fixture["global_root"] / "authority-from-proposal"  # type: ignore[operator]
+    for filename in (
+        "train_manifest.csv", "model_validation_manifest.csv",
+        "candidate_dataset_snapshot.json",
+    ):
+        assert (proposal_root / filename).read_bytes() == (
+            authority_root / filename
+        ).read_bytes()
+    snapshot = json.loads(
+        (proposal_root / "candidate_dataset_snapshot.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for item in snapshot["objects"]:
+        relative = Path(item["path"])
+        assert (proposal_root / relative).read_bytes() == (
+            authority_root / relative
+        ).read_bytes()
+    assert authority["bindings"]["candidate_train_manifest_sha256"] == _sha(  # type: ignore[index]
+        (proposal_root / "train_manifest.csv").read_bytes()
+    )
+
+
+def test_preaudit_proposal_cli_publishes_the_same_sealed_inputs(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    output = fixture["global_root"] / "preaudit-cli"  # type: ignore[operator]
+    script = Path(authority_builder.__file__).resolve()
+    result = subprocess.run(
+        [
+            sys.executable, os.fspath(script),
+            "--mode", "preaudit-proposal",
+            "--source-manifest", os.fspath(fixture["manifest"]),
+            "--full-data-validator-report", os.fspath(fixture["full_report"]),
+            "--license-allowlist", os.fspath(fixture["license_path"]),
+            "--quality-exclusions", os.fspath(fixture["quality"]),
+            "--protected-sources", os.fspath(fixture["protected"]),
+            "--training-config", os.fspath(fixture["config"]),
+            "--output-dir", os.fspath(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    rendered = json.loads(result.stdout)
+    assert rendered["training_authority"] is False
+    assert (output / "preaudit_proposal.sha256").is_file()
+
+
+def test_final_builder_rejects_tampered_preaudit_manifest(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _build_preaudit_proposal(fixture)
+    proposal_root = fixture["global_root"] / "preaudit-proposal"  # type: ignore[operator]
+    train = proposal_root / "train_manifest.csv"
+    train.write_bytes(train.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="differs from regenerated bytes"):
+        _run(
+            fixture,
+            output_name="authority-tampered-proposal",
+            preaudit_proposal_dir=proposal_root,
+        )
 
 
 def test_dataset_snapshot_rejects_an_object_above_the_consumption_cap() -> None:
@@ -1707,6 +2111,136 @@ def test_pinned_policy_rejects_different_sanitized_manifest_hash(tmp_path: Path)
     with pytest.raises(ValueError, match="candidate_train_manifest_sha256 binding mismatch"):
         _run(fixture)
     assert not (fixture["global_root"] / "authority").exists()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("candidate_manifest", "candidate manifest binding mismatch"),
+        ("protected_sources", "protected-source binding mismatch"),
+        ("auditor", "auditor binding mismatch"),
+        ("auditor_runtime", "auditor binding mismatch"),
+        ("coverage", "coverage is incomplete"),
+        ("candidate_entry", "candidate entries differ from exact manifest rows"),
+        ("protected_entry", "protected entries differ from exact inventory rows"),
+        ("blocked", "did not pass"),
+        ("authority", "separation evidence only"),
+        ("omitted_cross_role_edge", "edge set is incomplete"),
+    ),
+)
+def test_near_duplicate_audit_fails_closed(
+    tmp_path: Path, mutation: str, message: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+    path = fixture["near_duplicate_audit"]
+    assert isinstance(path, Path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "candidate_manifest":
+        value["bindings"]["candidate_manifest_sha256"]["train"] = _fake_sha(
+            "stale-candidate-manifest"
+        )
+    elif mutation == "protected_sources":
+        value["bindings"]["protected_sources"]["canonical_union_sha256"] = _fake_sha(
+            "stale-protected-union"
+        )
+    elif mutation == "auditor":
+        value["bindings"]["auditor"]["sha256"] = _fake_sha("different-auditor")
+    elif mutation == "auditor_runtime":
+        value["bindings"]["auditor"]["runtime_code_sha256"] = _fake_sha(
+            "different-runtime-auditor"
+        )
+    elif mutation == "coverage":
+        value["coverage"]["complete"] = False
+    elif mutation == "candidate_entry":
+        entry = next(
+            item
+            for item in value["entries"]
+            if item["cohort"] == "candidate" and item["view_kind"] == "crop"
+        )
+        entry["sample_id"] = str(entry["sample_id"]) + "-tampered"
+        entry["asset_id"] = _sha(authority_builder._canonical_compact_payload({
+            "cohort": entry["cohort"],
+            "image_sha256": entry["image_sha256"],
+            "role": entry["role"],
+            "sample_id": entry["sample_id"],
+            "source_sha256": entry["source_sha256"],
+            "view_kind": entry["view_kind"],
+        }))
+    elif mutation == "protected_entry":
+        entry = next(
+            item
+            for item in value["entries"]
+            if item["cohort"] != "candidate" and item["view_kind"] == "crop"
+        )
+        entry["image_sha256"] = _fake_sha("tampered-protected-crop")
+        entry["asset_id"] = _sha(authority_builder._canonical_compact_payload({
+            "cohort": entry["cohort"],
+            "image_sha256": entry["image_sha256"],
+            "role": entry["role"],
+            "sample_id": entry["sample_id"],
+            "source_sha256": entry["source_sha256"],
+            "view_kind": entry["view_kind"],
+        }))
+    elif mutation == "blocked":
+        value["status"] = "blocked"
+        value["ok"] = False
+    elif mutation == "omitted_cross_role_edge":
+        train_entry = next(
+            entry for entry in value["entries"] if entry["role"] == "train"
+        )
+        validation_entry = next(
+            entry
+            for entry in value["entries"]
+            if entry["role"] == "model_validation"
+        )
+        validation_entry["phash_rot4"] = list(train_entry["phash_rot4"])
+    else:
+        value["authority"]["automatic_delete_or_relabel"] = True
+    _dump_compact(path, value)
+    with pytest.raises(ValueError, match=message):
+        _run(fixture)
+    assert not (fixture["global_root"] / "authority").exists()  # type: ignore[operator]
+
+
+def test_near_duplicate_inventory_and_policy_hashes_are_pinned(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    inventory = fixture["protected_inventory"]
+    assert isinstance(inventory, Path)
+    inventory.write_bytes(inventory.read_bytes() + b" \n")
+    with pytest.raises(ValueError, match="protected-inventory binding mismatch"):
+        _run(fixture)
+
+    fixture = _fixture(tmp_path / "policy")
+    policy = fixture["policy"]
+    assert isinstance(policy, Path)
+    value = json.loads(policy.read_text(encoding="utf-8"))
+    value["candidate_near_duplicate_audit_sha256"] = _fake_sha("different-audit")
+    _dump(policy, value)
+    with pytest.raises(
+        ValueError, match="candidate_near_duplicate_audit_sha256 binding mismatch"
+    ):
+        _run(fixture)
+
+
+def test_near_duplicate_protected_inventory_requires_source_and_crop(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    inventory = fixture["protected_inventory"]
+    assert isinstance(inventory, Path)
+    value = json.loads(inventory.read_text(encoding="utf-8"))
+    value["objects"] = [
+        item
+        for item in value["objects"]
+        if not (
+            item["view_kind"] == "crop"
+            and item["source_sha256"]
+            == fixture["qx3_diagnostic_sources"][0]  # type: ignore[index]
+        )
+    ]
+    _dump(inventory, value)
+    with pytest.raises(ValueError, match="exactly one source and one crop"):
+        _run(fixture)
 
 
 def test_producer_requires_private_ipc_namespace(tmp_path: Path) -> None:

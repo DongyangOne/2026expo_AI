@@ -22,15 +22,22 @@ import shutil
 import stat
 import sys
 import tempfile
+import types
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-AUTHORITY_SCHEMA = "v4_candidate_training_authority.v2"
+AUTHORITY_SCHEMA = "v4_candidate_training_authority.v3"
 AUTHORITY_ROLE = "v4_candidate_training_input_authority_not_blind_or_deployment"
 AUTHORITY_STATUS = "candidate_training_inputs_ready"
+PREAUDIT_PROPOSAL_SCHEMA = "v4_candidate_preaudit_proposal.v1"
+PREAUDIT_PROPOSAL_ROLE = (
+    "v4_candidate_near_duplicate_preaudit_proposal_"
+    "not_training_or_blind_or_deployment_authority"
+)
+PREAUDIT_PROPOSAL_STATUS = "candidate_preaudit_inputs_ready"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRUSTED_POLICY_RELATIVE_PATH = Path(
     "configs/v4_candidate_training_trusted_policy.json"
@@ -118,7 +125,18 @@ POLICY_BINDING_FIELDS = {
     "candidate_model_validation_manifest_sha256",
     "candidate_dataset_snapshot_sha256",
     "candidate_dataset_consumption_contract_sha256",
+    "candidate_near_duplicate_audit_sha256",
+    "protected_reference_inventory_sha256",
 }
+NEAR_DUPLICATE_REPORT_SCHEMA = "v4_near_duplicate_leakage_audit.v1"
+NEAR_DUPLICATE_AUDITOR_PATH = "scripts/audit_v4_near_duplicate_leakage.py"
+NEAR_DUPLICATE_ALGORITHM_ID = "oneexpo_phash_rot4_v1"
+NEAR_DUPLICATE_PHASH_DISTANCE = 4
+NEAR_DUPLICATE_PIXEL_CAP = 16_000_000
+NEAR_DUPLICATE_GRAPH_EDGE_CAP = 1_000_000
+PROTECTED_REFERENCE_INVENTORY_SCHEMA = (
+    "v4_near_duplicate_protected_inventory.v1"
+)
 TRUST_ROOT_CODE_PATHS = {
     "configs/v4_candidate_training_trusted_policy.json",
     "scripts/build_v4_candidate_training_authority.py",
@@ -302,6 +320,55 @@ def _stable_bytes(path: Path, description: str) -> bytes:
     ):
         raise RuntimeError(f"{description} changed while being read: {resolved}")
     return content
+
+
+def _load_auditor_runtime_fingerprint(
+    path: Path, expected_sha256: str,
+) -> str:
+    """Execute the exact verified auditor bytes and fingerprint live code.
+
+    Loading from the already verified byte string, instead of importing the
+    path, closes the load/restore race where Python could execute one auditor
+    while the report and code inventory name another.
+    """
+    content = _stable_bytes(path, "near-duplicate auditor runtime source")
+    if _sha256_bytes(content) != expected_sha256:
+        raise ValueError("near-duplicate auditor runtime source SHA mismatch")
+    module_name = f"_v4_near_duplicate_auditor_{expected_sha256}"
+    module = types.ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        code = compile(
+            content,
+            str(path),
+            "exec",
+            dont_inherit=True,
+        )
+        exec(code, module.__dict__)
+        fingerprint_function = module.__dict__.get(
+            "runtime_code_fingerprint_sha256"
+        )
+        if not callable(fingerprint_function):
+            raise ValueError(
+                "near-duplicate auditor runtime fingerprint function is absent"
+            )
+        fingerprint = fingerprint_function()
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+    result = _require_sha256(
+        fingerprint, "near-duplicate auditor runtime code SHA"
+    )
+    if _sha256_bytes(
+        _stable_bytes(path, "near-duplicate auditor runtime source final rehash")
+    ) != expected_sha256:
+        raise ValueError("near-duplicate auditor changed during runtime validation")
+    return result
 
 
 def _dataset_stat_contract(value: os.stat_result) -> dict[str, int]:
@@ -976,6 +1043,760 @@ def _validate_protected_sources(value: Mapping[str, object]) -> set[str]:
     for current in per_field.values():
         protected.update(current)
     return protected
+
+
+def _canonical_compact_payload(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _validate_protected_reference_inventory(
+    value: Mapping[str, object], protected_sources: set[str],
+) -> int:
+    if set(value) != {"schema", "root", "objects"}:
+        raise ValueError("protected reference inventory top-level fields mismatch")
+    if value.get("schema") != PROTECTED_REFERENCE_INVENTORY_SCHEMA:
+        raise ValueError("protected reference inventory schema mismatch")
+    _require_normalized_posix_relative_path(
+        value.get("root"), "protected reference inventory root"
+    )
+    objects = value.get("objects")
+    if type(objects) is not list or not objects:
+        raise ValueError("protected reference inventory objects must be nonempty")
+    allowed_cohorts = {
+        "qx3_diagnostic", "hardware41", "known_audit", "calibration", "blind_test",
+    }
+    seen_paths: set[str] = set()
+    source_view_counts: Counter[str] = Counter()
+    crop_view_counts: Counter[str] = Counter()
+    for index, row in enumerate(objects):
+        if type(row) is not dict or set(row) != {
+            "cohort", "view_kind", "path", "size", "image_sha256", "source_sha256",
+        }:
+            raise ValueError(
+                f"protected reference inventory object {index} fields mismatch"
+            )
+        cohort = row.get("cohort")
+        if type(cohort) is not str or cohort not in allowed_cohorts:
+            raise ValueError(
+                f"protected reference inventory object {index} cohort is invalid"
+            )
+        view_kind = row.get("view_kind")
+        if type(view_kind) is not str or view_kind not in {"source", "crop"}:
+            raise ValueError(
+                f"protected reference inventory object {index} view_kind is invalid"
+            )
+        relative = _require_normalized_posix_relative_path(
+            row.get("path"), f"protected reference inventory object {index} path"
+        )
+        if relative in seen_paths:
+            raise ValueError("protected reference inventory contains duplicate paths")
+        seen_paths.add(relative)
+        size = row.get("size")
+        if type(size) is not int or not 0 < size <= IMAGE_CONSUMPTION_MAX_BYTES:
+            raise ValueError(
+                f"protected reference inventory object {index} size is invalid"
+            )
+        image_sha = _require_sha256(
+            row.get("image_sha256"),
+            f"protected reference inventory object {index} image SHA",
+        )
+        source_sha = _require_sha256(
+            row.get("source_sha256"),
+            f"protected reference inventory object {index} source SHA",
+        )
+        if source_sha not in protected_sources:
+            raise ValueError(
+                "protected holdout reference inventory contains an extra source SHA"
+            )
+        if view_kind == "source":
+            if image_sha != source_sha:
+                raise ValueError(
+                    "protected reference source view image SHA must equal source SHA"
+                )
+            source_view_counts[source_sha] += 1
+        else:
+            crop_view_counts[source_sha] += 1
+    if (
+        set(source_view_counts) != protected_sources
+        or any(count != 1 for count in source_view_counts.values())
+        or set(crop_view_counts) != protected_sources
+        or any(count != 1 for count in crop_view_counts.values())
+    ):
+        raise ValueError(
+            "protected reference inventory must cover every protected source with "
+            "exactly one source and one crop view"
+        )
+    return len(objects)
+
+
+def _phash_bucket_keys(value: int) -> tuple[tuple[int, int], ...]:
+    """Return the auditor's lossless pigeonhole keys for distance <= 4."""
+
+    widths = [64 // (NEAR_DUPLICATE_PHASH_DISTANCE + 1)] * (
+        NEAR_DUPLICATE_PHASH_DISTANCE + 1
+    )
+    for index in range(64 % (NEAR_DUPLICATE_PHASH_DISTANCE + 1)):
+        widths[index] += 1
+    keys: list[tuple[int, int]] = []
+    offset = 0
+    for index, width in enumerate(widths):
+        keys.append((index, (value >> offset) & ((1 << width) - 1)))
+        offset += width
+    return tuple(keys)
+
+
+def _reconstruct_near_duplicate_graph(
+    entries: Sequence[Mapping[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Rebuild every auditor edge and connected component from report entries.
+
+    Merely checking supplied edges would let a forged report omit the one edge
+    that crosses train, validation, or a protected cohort.  This uses the same
+    complete radius search and exact/source identity joins as the pinned
+    auditor, while avoiding a quadratic scan for normal datasets.
+    """
+
+    ordered = sorted(entries, key=lambda entry: str(entry["asset_id"]))
+    signatures: list[tuple[int, ...]] = [
+        tuple(int(str(value), 16) for value in entry["phash_rot4"])  # type: ignore[index]
+        for entry in ordered
+    ]
+    edge_values: dict[tuple[int, int], dict[str, object]] = {}
+    buckets: dict[tuple[int, int], set[int]] = {}
+    for right, signature in enumerate(signatures):
+        unique_hashes = tuple(sorted(set(signature)))
+        candidates: set[int] = set()
+        for value in unique_hashes:
+            for key in _phash_bucket_keys(value):
+                candidates.update(buckets.get(key, ()))
+        for left in sorted(candidates):
+            distance = min(
+                (left_value ^ right_value).bit_count()
+                for left_value in signatures[left]
+                for right_value in unique_hashes
+            )
+            if distance <= NEAR_DUPLICATE_PHASH_DISTANCE:
+                edge_values[(left, right)] = {
+                    "distance": distance,
+                    "evidence": {"perceptual_hash"},
+                }
+                if len(edge_values) > NEAR_DUPLICATE_GRAPH_EDGE_CAP:
+                    raise ValueError("near-duplicate audit graph exceeds edge cap")
+        for value in unique_hashes:
+            for key in _phash_bucket_keys(value):
+                buckets.setdefault(key, set()).add(right)
+
+    for evidence_name, field in (
+        ("exact_image_sha256", "image_sha256"),
+        ("source_sha256", "source_sha256"),
+    ):
+        groups: dict[str, list[int]] = {}
+        for index, entry in enumerate(ordered):
+            groups.setdefault(str(entry[field]), []).append(index)
+        for indexes in groups.values():
+            for position, left in enumerate(indexes):
+                for right in indexes[position + 1:]:
+                    edge = edge_values.setdefault(
+                        (left, right), {"distance": None, "evidence": set()}
+                    )
+                    if len(edge_values) > NEAR_DUPLICATE_GRAPH_EDGE_CAP:
+                        raise ValueError("near-duplicate audit graph exceeds edge cap")
+                    evidence = edge["evidence"]
+                    assert type(evidence) is set
+                    evidence.add(evidence_name)
+                    if evidence_name == "exact_image_sha256":
+                        edge["distance"] = 0
+
+    parent = list(range(len(ordered)))
+
+    def find(item: int) -> int:
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            low, high = sorted((left_root, right_root))
+            parent[high] = low
+
+    for left, right in sorted(edge_values):
+        union(left, right)
+
+    rendered_edges: list[dict[str, object]] = []
+    for (left, right), raw in sorted(
+        edge_values.items(),
+        key=lambda item: (
+            str(ordered[item[0][0]]["asset_id"]),
+            str(ordered[item[0][1]]["asset_id"]),
+        ),
+    ):
+        left_id, right_id = sorted(
+            (
+                str(ordered[left]["asset_id"]),
+                str(ordered[right]["asset_id"]),
+            )
+        )
+        evidence = raw["evidence"]
+        assert type(evidence) is set
+        rendered_edges.append({
+            "left_asset_id": left_id,
+            "right_asset_id": right_id,
+            "distance": raw["distance"],
+            "evidence": sorted(evidence),
+            "blocking": ordered[left]["role"] != ordered[right]["role"],
+        })
+
+    members_by_root: dict[int, list[int]] = {}
+    for index in range(len(ordered)):
+        members_by_root.setdefault(find(index), []).append(index)
+    edge_count_by_root: Counter[int] = Counter()
+    for left, _right in edge_values:
+        edge_count_by_root[find(left)] += 1
+
+    clusters: list[dict[str, object]] = []
+    for root, indexes in members_by_root.items():
+        member_image_shas = sorted(
+            {str(ordered[index]["image_sha256"]) for index in indexes}
+        )
+        roles = sorted({str(ordered[index]["role"]) for index in indexes})
+        clusters.append({
+            "cluster_id": _sha256_bytes(
+                _canonical_compact_payload({
+                    "algorithm_id": NEAR_DUPLICATE_ALGORITHM_ID,
+                    "threshold": NEAR_DUPLICATE_PHASH_DISTANCE,
+                    "member_image_sha256s": member_image_shas,
+                })
+            ),
+            "member_asset_ids": sorted(
+                str(ordered[index]["asset_id"]) for index in indexes
+            ),
+            "member_image_sha256s": member_image_shas,
+            "roles": roles,
+            "cohorts": sorted(
+                {str(ordered[index]["cohort"]) for index in indexes}
+            ),
+            "view_kinds": sorted(
+                {str(ordered[index]["view_kind"]) for index in indexes}
+            ),
+            "edge_count": edge_count_by_root[root],
+            "multi_role": len(roles) > 1,
+            "blocking": len(roles) > 1,
+        })
+    clusters.sort(key=lambda item: str(item["cluster_id"]))
+    return rendered_edges, clusters
+
+
+def _validate_near_duplicate_audit(
+    value: Mapping[str, object], content: bytes, *,
+    candidate_manifest_sha256: Mapping[str, str],
+    candidate_rows_by_role: Mapping[str, Sequence[Mapping[str, str]]],
+    candidate_asset_count: int,
+    protected_sources_value: Mapping[str, object],
+    protected_sources_content: bytes,
+    protected_sources: set[str],
+    protected_inventory_value: Mapping[str, object],
+    protected_inventory_content: bytes,
+    protected_asset_count: int,
+    auditor_sha256: str,
+    auditor_runtime_code_sha256: str,
+) -> None:
+    expected_fields = {
+        "schema", "status", "ok", "artifact_role", "authority", "algorithm",
+        "bindings", "coverage", "summary", "entries", "edges", "clusters",
+    }
+    if set(value) != expected_fields:
+        raise ValueError("near-duplicate audit top-level fields mismatch")
+    # The auditor has a deterministic canonical renderer. Requiring those exact
+    # bytes lets downstream consumers recompute the policy-pinned report hash
+    # from the report embedded in this authority.
+    if content != _canonical_compact_payload(value) + b"\n":
+        raise ValueError("near-duplicate audit is not canonical auditor output")
+    if value.get("schema") != NEAR_DUPLICATE_REPORT_SCHEMA:
+        raise ValueError("near-duplicate audit schema mismatch")
+    if value.get("status") != "passed" or value.get("ok") is not True:
+        raise ValueError("near-duplicate audit did not pass")
+    if value.get("artifact_role") != "candidate_dataset_separation_evidence_only":
+        raise ValueError("near-duplicate audit artifact_role mismatch")
+
+    authority = value.get("authority")
+    expected_authority = {
+        "candidate_only": True,
+        "label_authority": False,
+        "blind_authority": False,
+        "promotion_authority": False,
+        "deployment_authority": False,
+        "automatic_delete_or_relabel": False,
+    }
+    if authority != expected_authority:
+        raise ValueError("near-duplicate audit authority must be separation evidence only")
+
+    algorithm = value.get("algorithm")
+    if type(algorithm) is not dict or set(algorithm) != {
+        "id", "threshold", "decode", "views", "resize", "dct", "bit_rule",
+        "byte_cap", "pixel_cap", "exact_right_angle_rotation_invariant",
+        "crop_invariant", "graph_edge_cap", "runtime",
+    }:
+        raise ValueError("near-duplicate audit algorithm schema mismatch")
+    fixed_algorithm = {
+        "id": NEAR_DUPLICATE_ALGORITHM_ID,
+        "threshold": NEAR_DUPLICATE_PHASH_DISTANCE,
+        "decode": "verified_bytes_cv2_grayscale_ignore_exif_orientation",
+        "views": ["rot0", "rot90", "rot180", "rot270"],
+        "resize": {"width": 32, "height": 32, "interpolation": "INTER_AREA"},
+        "dct": {"dtype": "float32", "low_frequency_block": [8, 8]},
+        "bit_rule": (
+            "row_major_msb_first; median(coefficients[1:]); "
+            "coefficient>median; dc=0"
+        ),
+        "byte_cap": IMAGE_CONSUMPTION_MAX_BYTES,
+        "pixel_cap": NEAR_DUPLICATE_PIXEL_CAP,
+        "exact_right_angle_rotation_invariant": True,
+        "crop_invariant": False,
+        "graph_edge_cap": NEAR_DUPLICATE_GRAPH_EDGE_CAP,
+    }
+    for field, expected in fixed_algorithm.items():
+        if algorithm.get(field) != expected:
+            raise ValueError(f"near-duplicate audit algorithm {field} mismatch")
+    runtime = algorithm.get("runtime")
+    if type(runtime) is not dict or set(runtime) != {
+        "python", "opencv", "numpy", "pillow", "opencv_build_information_sha256",
+    }:
+        raise ValueError("near-duplicate audit runtime schema mismatch")
+    for field in ("python", "opencv", "numpy", "pillow"):
+        if type(runtime.get(field)) is not str or not runtime[field]:
+            raise ValueError(f"near-duplicate audit runtime {field} is invalid")
+    _require_sha256(
+        runtime.get("opencv_build_information_sha256"),
+        "near-duplicate audit OpenCV build information SHA",
+    )
+
+    bindings = value.get("bindings")
+    if type(bindings) is not dict or set(bindings) != {
+        "candidate_manifest_sha256", "candidate_payload_set_sha256",
+        "protected_payload_set_sha256", "protected_sources",
+        "protected_inventory", "auditor",
+    }:
+        raise ValueError("near-duplicate audit binding schema mismatch")
+    expected_candidate_bindings = {
+        role: _require_sha256(digest, f"candidate {role} manifest SHA")
+        for role, digest in sorted(candidate_manifest_sha256.items())
+    }
+    if set(expected_candidate_bindings) != set(ROLE_SPLITS):
+        raise ValueError("near-duplicate audit producer candidate role schema mismatch")
+    if bindings.get("candidate_manifest_sha256") != expected_candidate_bindings:
+        raise ValueError("near-duplicate audit candidate manifest binding mismatch")
+    _require_sha256(
+        bindings.get("candidate_payload_set_sha256"),
+        "near-duplicate audit candidate payload-set SHA",
+    )
+    _require_sha256(
+        bindings.get("protected_payload_set_sha256"),
+        "near-duplicate audit protected payload-set SHA",
+    )
+
+    protected_binding = bindings.get("protected_sources")
+    if type(protected_binding) is not dict or set(protected_binding) != {
+        "file_sha256", "payload_sha256", "canonical_union_sha256",
+    }:
+        raise ValueError("near-duplicate audit protected-source binding schema mismatch")
+    expected_union_sha = _sha256_bytes(
+        _canonical_compact_payload(sorted(protected_sources))
+    )
+    if protected_binding != {
+        "file_sha256": _sha256_bytes(protected_sources_content),
+        "payload_sha256": _sha256_bytes(
+            _canonical_compact_payload(protected_sources_value)
+        ),
+        "canonical_union_sha256": expected_union_sha,
+    }:
+        raise ValueError("near-duplicate audit protected-source binding mismatch")
+
+    inventory_binding = bindings.get("protected_inventory")
+    if type(inventory_binding) is not dict or set(inventory_binding) != {
+        "file_sha256", "payload_sha256",
+    }:
+        raise ValueError("near-duplicate audit protected-inventory binding schema mismatch")
+    if inventory_binding != {
+        "file_sha256": _sha256_bytes(protected_inventory_content),
+        "payload_sha256": _sha256_bytes(
+            _canonical_compact_payload(protected_inventory_value)
+        ),
+    }:
+        raise ValueError("near-duplicate audit protected-inventory binding mismatch")
+    if bindings.get("auditor") != {
+        "path": NEAR_DUPLICATE_AUDITOR_PATH,
+        "sha256": auditor_sha256,
+        "runtime_code_sha256": auditor_runtime_code_sha256,
+    }:
+        raise ValueError("near-duplicate audit auditor binding mismatch")
+
+    coverage = value.get("coverage")
+    expected_coverage = {
+        "candidate_assets": candidate_asset_count,
+        "protected_assets": protected_asset_count,
+        "protected_source_union": len(protected_sources),
+        "verified_assets": candidate_asset_count + protected_asset_count,
+        "complete": True,
+    }
+    if coverage != expected_coverage or not protected_sources or protected_asset_count < 1:
+        raise ValueError("near-duplicate audit coverage is incomplete")
+
+    entries = value.get("entries")
+    edges = value.get("edges")
+    clusters = value.get("clusters")
+    summary = value.get("summary")
+    if type(entries) is not list or type(edges) is not list or type(clusters) is not list:
+        raise ValueError("near-duplicate audit evidence arrays are invalid")
+    if len(entries) != expected_coverage["verified_assets"]:
+        raise ValueError("near-duplicate audit entry coverage is incomplete")
+    if len(edges) > NEAR_DUPLICATE_GRAPH_EDGE_CAP:
+        raise ValueError("near-duplicate supplied edge array exceeds its graph edge cap")
+    entries_by_id: dict[str, dict[str, object]] = {}
+    candidate_source_views: Counter[tuple[str, str]] = Counter()
+    candidate_crop_views: Counter[tuple[str, str]] = Counter()
+    protected_source_views: Counter[str] = Counter()
+    protected_crop_views: Counter[str] = Counter()
+    candidate_roles = set(ROLE_SPLITS)
+    protected_roles = {
+        "qx3_diagnostic", "hardware41", "known_audit", "calibration", "blind_test",
+    }
+    expected_candidate_source_entries: set[tuple[str, str, str, str]] = set()
+    expected_candidate_crop_entries: set[tuple[str, str, str, str]] = set()
+    expected_candidate_rows = 0
+    if set(candidate_rows_by_role) != candidate_roles:
+        raise ValueError("near-duplicate audit producer candidate rows are incomplete")
+    for role, rows in candidate_rows_by_role.items():
+        for row in rows:
+            expected_candidate_rows += 1
+            source_sha = _require_sha256(
+                row.get("source_sha256"), "candidate manifest source SHA"
+            )
+            image_sha = _require_sha256(
+                row.get("image_sha256"), "candidate manifest image SHA"
+            )
+            sample_id = row.get("sample_id")
+            if type(sample_id) is not str or not sample_id:
+                raise ValueError("candidate manifest sample ID is invalid")
+            expected_candidate_source_entries.add(
+                (role, f"source:{role}:{source_sha}", source_sha, source_sha)
+            )
+            expected_candidate_crop_entries.add(
+                (role, sample_id, source_sha, image_sha)
+            )
+    if (
+        candidate_asset_count != 2 * expected_candidate_rows
+        or len(expected_candidate_source_entries) != expected_candidate_rows
+        or len(expected_candidate_crop_entries) != expected_candidate_rows
+    ):
+        raise ValueError(
+            "near-duplicate audit producer candidate rows violate one-source/one-crop"
+        )
+
+    expected_protected_entries: set[
+        tuple[str, str, str, str, str, int]
+    ] = set()
+    protected_objects = protected_inventory_value.get("objects")
+    if type(protected_objects) is not list:
+        raise ValueError("protected reference inventory objects are invalid")
+    for index, row in enumerate(protected_objects):
+        assert type(row) is dict
+        cohort = str(row["cohort"])
+        view_kind = str(row["view_kind"])
+        relative = _require_normalized_posix_relative_path(
+            row.get("path"), f"protected reference inventory object {index} path"
+        )
+        source_sha = _require_sha256(
+            row.get("source_sha256"),
+            f"protected reference inventory object {index} source SHA",
+        )
+        image_sha = _require_sha256(
+            row.get("image_sha256"),
+            f"protected reference inventory object {index} image SHA",
+        )
+        size = row.get("size")
+        assert type(size) is int
+        sample_suffix = _sha256_bytes(relative.encode("utf-8"))[:16]
+        expected_protected_entries.add((
+            cohort,
+            view_kind,
+            f"protected:{cohort}:{view_kind}:{image_sha[:16]}:{sample_suffix}",
+            source_sha,
+            image_sha,
+            size,
+        ))
+    if len(expected_protected_entries) != protected_asset_count:
+        raise ValueError("protected reference inventory identities are duplicated")
+
+    candidate_source_entries: set[tuple[str, str, str, str]] = set()
+    candidate_crop_entries: set[tuple[str, str, str, str]] = set()
+    protected_entries: set[tuple[str, str, str, str, str, int]] = set()
+    for index, entry in enumerate(entries):
+        if type(entry) is not dict or set(entry) != {
+            "asset_id", "role", "cohort", "view_kind", "sample_id",
+            "source_sha256", "image_sha256", "size", "width", "height",
+            "phash_rot4",
+        }:
+            raise ValueError(f"near-duplicate audit entry {index} fields mismatch")
+        role = entry.get("role")
+        cohort = entry.get("cohort")
+        view_kind = entry.get("view_kind")
+        sample_id = entry.get("sample_id")
+        if type(role) is not str or role not in candidate_roles | protected_roles:
+            raise ValueError(f"near-duplicate audit entry {index} role is invalid")
+        if type(cohort) is not str or (
+            (role in candidate_roles and cohort != "candidate")
+            or (role in protected_roles and cohort != role)
+        ):
+            raise ValueError(f"near-duplicate audit entry {index} cohort is invalid")
+        if type(view_kind) is not str or view_kind not in {"source", "crop"}:
+            raise ValueError(f"near-duplicate audit entry {index} view_kind is invalid")
+        if type(sample_id) is not str or not sample_id:
+            raise ValueError(f"near-duplicate audit entry {index} sample_id is invalid")
+        source_sha = _require_sha256(
+            entry.get("source_sha256"), f"near-duplicate audit entry {index} source SHA"
+        )
+        image_sha = _require_sha256(
+            entry.get("image_sha256"), f"near-duplicate audit entry {index} image SHA"
+        )
+        asset_id = _require_sha256(
+            entry.get("asset_id"), f"near-duplicate audit entry {index} asset ID"
+        )
+        expected_asset_id = _sha256_bytes(
+            _canonical_compact_payload(
+                {
+                    "cohort": cohort,
+                    "image_sha256": image_sha,
+                    "role": role,
+                    "sample_id": sample_id,
+                    "source_sha256": source_sha,
+                    "view_kind": view_kind,
+                }
+            )
+        )
+        if asset_id != expected_asset_id or asset_id in entries_by_id:
+            raise ValueError("near-duplicate audit asset identity is invalid or duplicated")
+        entries_by_id[asset_id] = entry
+        for field in ("size", "width", "height"):
+            number = entry.get(field)
+            if type(number) is not int or number < 1:
+                raise ValueError(f"near-duplicate audit entry {index} {field} is invalid")
+        if entry["size"] > IMAGE_CONSUMPTION_MAX_BYTES or (
+            entry["width"] * entry["height"] > NEAR_DUPLICATE_PIXEL_CAP
+        ):
+            raise ValueError("near-duplicate audit entry exceeds resource limits")
+        signatures = entry.get("phash_rot4")
+        if type(signatures) is not list or len(signatures) != 4 or any(
+            type(signature) is not str
+            or re.fullmatch(r"[0-9a-f]{16}", signature) is None
+            for signature in signatures
+        ):
+            raise ValueError(f"near-duplicate audit entry {index} pHash is invalid")
+        if role in candidate_roles:
+            if source_sha in protected_sources:
+                raise ValueError("near-duplicate audit candidate uses a protected source")
+            if view_kind == "source":
+                if image_sha != source_sha:
+                    raise ValueError("near-duplicate candidate source view SHA mismatch")
+                candidate_source_views[(role, source_sha)] += 1
+                candidate_source_entries.add(
+                    (role, sample_id, source_sha, image_sha)
+                )
+            else:
+                candidate_crop_views[(role, source_sha)] += 1
+                candidate_crop_entries.add(
+                    (role, sample_id, source_sha, image_sha)
+                )
+        else:
+            if source_sha not in protected_sources:
+                raise ValueError("near-duplicate audit protected entry source is unknown")
+            if view_kind == "source":
+                if image_sha != source_sha:
+                    raise ValueError("near-duplicate protected source view SHA mismatch")
+                protected_source_views[source_sha] += 1
+            else:
+                protected_crop_views[source_sha] += 1
+            protected_entries.add((
+                role,
+                view_kind,
+                sample_id,
+                source_sha,
+                image_sha,
+                int(entry["size"]),
+            ))
+    if (
+        len(candidate_source_views) != candidate_asset_count // 2
+        or any(count != 1 for count in candidate_source_views.values())
+        or candidate_crop_views != candidate_source_views
+        or set(protected_source_views) != protected_sources
+        or any(count != 1 for count in protected_source_views.values())
+        or protected_crop_views != protected_source_views
+    ):
+        raise ValueError("near-duplicate audit source/crop evidence coverage is incomplete")
+    if (
+        candidate_source_entries != expected_candidate_source_entries
+        or candidate_crop_entries != expected_candidate_crop_entries
+    ):
+        raise ValueError(
+            "near-duplicate audit candidate entries differ from exact manifest rows"
+        )
+    if protected_entries != expected_protected_entries:
+        raise ValueError(
+            "near-duplicate audit protected entries differ from exact inventory rows"
+        )
+    if entries != sorted(entries, key=lambda entry: str(entry["asset_id"])):
+        raise ValueError("near-duplicate audit entries are not deterministically ordered")
+    reconstructed_edges, reconstructed_clusters = _reconstruct_near_duplicate_graph(
+        entries
+    )
+    if edges != reconstructed_edges:
+        raise ValueError("near-duplicate audit edge set is incomplete or inconsistent")
+    if clusters != reconstructed_clusters:
+        raise ValueError("near-duplicate audit cluster graph is incomplete or inconsistent")
+    candidate_payload_sha = _sha256_bytes(
+        _canonical_compact_payload(
+            sorted(
+                {
+                    str(entry["image_sha256"])
+                    for entry in entries
+                    if entry["role"] in candidate_roles
+                }
+            )
+        )
+    )
+    protected_payload_sha = _sha256_bytes(
+        _canonical_compact_payload(
+            sorted(
+                {
+                    str(entry["image_sha256"])
+                    for entry in entries
+                    if entry["role"] in protected_roles
+                }
+            )
+        )
+    )
+    if (
+        bindings["candidate_payload_set_sha256"] != candidate_payload_sha
+        or bindings["protected_payload_set_sha256"] != protected_payload_sha
+    ):
+        raise ValueError("near-duplicate audit payload-set binding mismatch")
+    if type(summary) is not dict or set(summary) != {
+        "edges", "clusters", "blocking_multi_role_clusters",
+        "same_role_duplicate_clusters_nonblocking",
+    }:
+        raise ValueError("near-duplicate audit summary schema mismatch")
+    for field in summary:
+        if type(summary[field]) is not int or summary[field] < 0:
+            raise ValueError(f"near-duplicate audit summary {field} is invalid")
+    if summary["edges"] != len(edges) or summary["clusters"] != len(clusters):
+        raise ValueError("near-duplicate audit summary evidence counts mismatch")
+    edge_pairs: set[tuple[str, str]] = set()
+    for edge in edges:
+        if type(edge) is not dict or set(edge) != {
+            "left_asset_id", "right_asset_id", "distance", "evidence", "blocking",
+        }:
+            raise ValueError("near-duplicate audit edge is invalid")
+        left = edge.get("left_asset_id")
+        right = edge.get("right_asset_id")
+        if (
+            type(left) is not str
+            or type(right) is not str
+            or left not in entries_by_id
+            or right not in entries_by_id
+            or left >= right
+            or (left, right) in edge_pairs
+        ):
+            raise ValueError("near-duplicate audit edge endpoints are invalid")
+        edge_pairs.add((left, right))
+        distance = edge.get("distance")
+        if distance is not None and (
+            type(distance) is not int
+            or not 0 <= distance <= NEAR_DUPLICATE_PHASH_DISTANCE
+        ):
+            raise ValueError("near-duplicate audit edge distance is invalid")
+        evidence = edge.get("evidence")
+        if (
+            type(evidence) is not list
+            or not evidence
+            or evidence != sorted(evidence)
+            or len(set(evidence)) != len(evidence)
+            or set(evidence).difference(
+                {"perceptual_hash", "exact_image_sha256", "source_sha256"}
+            )
+        ):
+            raise ValueError("near-duplicate audit edge evidence is invalid")
+        cross_role = entries_by_id[left]["role"] != entries_by_id[right]["role"]
+        if edge.get("blocking") is not cross_role or cross_role:
+            raise ValueError("near-duplicate audit contains a forbidden cross-role edge")
+    blocking_clusters = 0
+    same_role_clusters = 0
+    clustered_asset_ids: set[str] = set()
+    for cluster in clusters:
+        if type(cluster) is not dict or set(cluster) != {
+            "cluster_id", "member_asset_ids", "member_image_sha256s", "roles",
+            "cohorts", "view_kinds", "edge_count", "multi_role", "blocking",
+        }:
+            raise ValueError("near-duplicate audit cluster is invalid")
+        member_ids = cluster.get("member_asset_ids")
+        if (
+            type(member_ids) is not list
+            or not member_ids
+            or any(type(member) is not str for member in member_ids)
+            or member_ids != sorted(member_ids)
+            or len(set(member_ids)) != len(member_ids)
+            or any(member not in entries_by_id for member in member_ids)
+            or clustered_asset_ids.intersection(member_ids)
+        ):
+            raise ValueError("near-duplicate audit cluster membership is invalid")
+        clustered_asset_ids.update(member_ids)
+        member_entries = [entries_by_id[member] for member in member_ids]
+        roles = cluster.get("roles")
+        expected_roles = sorted({str(entry["role"]) for entry in member_entries})
+        expected_cohorts = sorted({str(entry["cohort"]) for entry in member_entries})
+        expected_views = sorted({str(entry["view_kind"]) for entry in member_entries})
+        expected_images = sorted({str(entry["image_sha256"]) for entry in member_entries})
+        if (
+            roles != expected_roles
+            or cluster.get("cohorts") != expected_cohorts
+            or cluster.get("view_kinds") != expected_views
+            or cluster.get("member_image_sha256s") != expected_images
+        ):
+            raise ValueError("near-duplicate audit cluster roles are invalid")
+        expected_cluster_id = _sha256_bytes(
+            _canonical_compact_payload(
+                {
+                    "algorithm_id": NEAR_DUPLICATE_ALGORITHM_ID,
+                    "threshold": NEAR_DUPLICATE_PHASH_DISTANCE,
+                    "member_image_sha256s": expected_images,
+                }
+            )
+        )
+        if cluster.get("cluster_id") != expected_cluster_id:
+            raise ValueError("near-duplicate audit cluster ID is invalid")
+        blocking = cluster.get("blocking")
+        multi_role = cluster.get("multi_role")
+        edge_count = cluster.get("edge_count")
+        if type(blocking) is not bool or type(multi_role) is not bool:
+            raise ValueError("near-duplicate audit cluster flags are invalid")
+        if type(edge_count) is not int or edge_count < 0:
+            raise ValueError("near-duplicate audit cluster edge_count is invalid")
+        if blocking or multi_role or len(set(roles)) > 1:
+            blocking_clusters += 1
+        elif edge_count > 0:
+            same_role_clusters += 1
+    if blocking_clusters or summary["blocking_multi_role_clusters"] != 0:
+        raise ValueError("near-duplicate audit contains a forbidden cross-role cluster")
+    if clustered_asset_ids != set(entries_by_id):
+        raise ValueError("near-duplicate audit clusters do not partition all entries")
+    if summary["same_role_duplicate_clusters_nonblocking"] != same_role_clusters:
+        raise ValueError("near-duplicate audit same-role cluster count mismatch")
 
 
 def _validate_training_config(value: Mapping[str, object]) -> None:
@@ -1712,20 +2533,391 @@ def _verify_dataset_content_inventory(
     return _sha256_bytes(_canonical_json(list(entries)))
 
 
-def build_training_authority(
-    *, source_manifests: Sequence[Path],
-    full_data_validator_reports: Sequence[Path], qx3_diagnostic_ready: Path,
-    qx3_diagnostic_report: Path, trusted_policy: Path, license_allowlist: Path,
-    quality_exclusions: Path, protected_sources: Path, code_inventory: Path,
-    pretrained_backbone: Path, training_config: Path,
-    host_launch_contract: Path, container_image_id: str,
-    output_dir: Path,
+def _publish_preaudit_proposal(
+    *, final: Path, source_manifests: Sequence[Path], manifest_shas: Sequence[str],
+    full_data_validator_reports: Sequence[Path], full_report_shas: Sequence[str],
+    license_allowlist: Path, quality_exclusions: Path, protected_sources: Path,
+    training_config: Path, selection_bindings: Mapping[str, str],
+    train_content: bytes, validation_content: bytes,
+    dataset_snapshot_value: Mapping[str, object], dataset_snapshot_content: bytes,
+    dataset_content_inventory: Sequence[Mapping[str, object]],
+    dataset_content_inventory_sha: str,
+    dataset_source_inputs: Sequence[Mapping[str, object]],
+    dataset_crop_inputs: Sequence[Mapping[str, object]],
+    candidate_counts: Mapping[str, object],
 ) -> dict[str, object]:
-    """Create a sealed candidate-training input directory."""
+    """Publish audit inputs atomically without granting training authority."""
+
+    train_path = (final / "train_manifest.csv").absolute()
+    validation_path = (final / "model_validation_manifest.csv").absolute()
+    proposal_path = (final / "preaudit_proposal.json").absolute()
+    snapshot_report_path = (final / "candidate_dataset_snapshot.json").absolute()
+    snapshot_root = (final / "dataset_snapshot").absolute()
+    stage = Path(tempfile.mkdtemp(prefix=f".{final.name}.", dir=final.parent))
+    marker_rows: tuple[tuple[Path, str], ...]
+    snapshot_publish_receipt: dict[str, object]
+    proposal: dict[str, object]
+    try:
+        crop_inputs_by_sha = {
+            str(record["sha256"]): record for record in dataset_crop_inputs
+        }
+        if len(crop_inputs_by_sha) != len(dataset_crop_inputs):
+            raise ValueError("duplicate dataset crop input SHA")
+        snapshot_stage_root = stage / "dataset_snapshot"
+        snapshot_stage_root.mkdir()
+        objects = dataset_snapshot_value.get("objects")
+        if type(objects) is not list:
+            raise RuntimeError("dataset snapshot report objects schema changed")
+        for index, raw in enumerate(objects):
+            if type(raw) is not dict:
+                raise RuntimeError("dataset snapshot report object schema changed")
+            digest = str(raw["sha256"])
+            record = crop_inputs_by_sha.get(digest)
+            if record is None:
+                raise RuntimeError("dataset snapshot plan lacks its crop input")
+            _copy_dataset_snapshot_object(
+                record, stage / str(raw["path"]),
+                f"preaudit dataset snapshot object {index}",
+            )
+        if os.name != "nt":
+            for directory in sorted(
+                (path for path in snapshot_stage_root.rglob("*") if path.is_dir()),
+                key=lambda value: len(value.parts), reverse=True,
+            ):
+                os.chmod(directory, 0o555, follow_symlinks=False)
+            os.chmod(snapshot_stage_root, 0o555, follow_symlinks=False)
+        snapshot_publish_receipt = _dataset_snapshot_tree_contract(
+            snapshot_stage_root, dataset_snapshot_value, logical_root=snapshot_root
+        )
+        snapshot_aliases = {
+            (final / str(raw["path"])).absolute().as_posix(): stage / str(raw["path"])
+            for raw in objects
+        }
+        if _verify_dataset_content_inventory(
+            dataset_content_inventory,
+            "preaudit dataset content inventory construction",
+            path_aliases=snapshot_aliases,
+        ) != dataset_content_inventory_sha:
+            raise RuntimeError("preaudit dataset content inventory changed")
+
+        artifacts = {
+            "manifests": [
+                {"role": "train", **_artifact(train_path, train_content)},
+                {
+                    "role": "model_validation",
+                    **_artifact(validation_path, validation_content),
+                },
+            ],
+            "dataset_snapshot_report": _artifact(
+                snapshot_report_path, dataset_snapshot_content
+            ),
+        }
+        proposal = {
+            "schema": PREAUDIT_PROPOSAL_SCHEMA,
+            "artifact_role": PREAUDIT_PROPOSAL_ROLE,
+            "status": PREAUDIT_PROPOSAL_STATUS,
+            "candidate_only": True,
+            "proposal_only": True,
+            "near_duplicate_audit_input_ready": True,
+            "near_duplicate_audit_completed": False,
+            "candidate_training_input_authorized": False,
+            "training_authority": False,
+            "lineage_execution_authorized": False,
+            "ready_for_lineage_upgrade": False,
+            "blind_test_authority": False,
+            "candidate_promotion_authorized": False,
+            "production_deployment_authorized": False,
+            "pi_deployment_authorized": False,
+            "spring_contract_modified": False,
+            "local_only": True,
+            "portable": False,
+            "selection_contract": {
+                "operational_cutoff_kst": OPERATIONAL_CUTOFF.isoformat(),
+                "quality_contract": QUALITY_CONTRACT,
+                "quality_reasons": sorted(QUALITY_REASONS),
+                "dent_or_crush_is_condition_target_not_quality_exclusion": True,
+            },
+            "artifacts": artifacts,
+            "dataset_content_inventory": list(dataset_content_inventory),
+            "dataset_snapshot_publish_receipt": snapshot_publish_receipt,
+            "counts": dict(candidate_counts),
+            "bindings": {
+                "source_manifest_sha256": list(manifest_shas),
+                "full_data_validator_report_sha256": list(full_report_shas),
+                "dataset_content_inventory_sha256": dataset_content_inventory_sha,
+                **dict(selection_bindings),
+            },
+        }
+        proposal_content = _canonical_json(proposal)
+        marker_rows = (
+            (proposal_path, _sha256_bytes(proposal_content)),
+            (train_path, _sha256_bytes(train_content)),
+            (validation_path, _sha256_bytes(validation_content)),
+            (snapshot_report_path, _sha256_bytes(dataset_snapshot_content)),
+        )
+        marker_content = "".join(
+            f"{digest}  {path.as_posix()}\n" for path, digest in marker_rows
+        ).encode("utf-8")
+        for name, content in (
+            ("train_manifest.csv", train_content),
+            ("model_validation_manifest.csv", validation_content),
+            ("candidate_dataset_snapshot.json", dataset_snapshot_content),
+            ("preaudit_proposal.json", proposal_content),
+        ):
+            with (stage / name).open("xb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        staged_paths = {
+            proposal_path: stage / "preaudit_proposal.json",
+            train_path: stage / "train_manifest.csv",
+            validation_path: stage / "model_validation_manifest.csv",
+            snapshot_report_path: stage / "candidate_dataset_snapshot.json",
+        }
+        for path, expected in marker_rows:
+            if _sha256_bytes(
+                _stable_bytes(staged_paths[path], "preaudit artifact pre-publish")
+            ) != expected:
+                raise RuntimeError(f"preaudit artifact changed before publish: {path}")
+        for path, expected in zip(source_manifests, manifest_shas, strict=True):
+            if _sha256_bytes(_stable_bytes(path, "source manifest final rehash")) != expected:
+                raise RuntimeError("source manifest changed before preaudit publish")
+        for path, expected in zip(
+            full_data_validator_reports, full_report_shas, strict=True
+        ):
+            if _sha256_bytes(
+                _stable_bytes(path, "validator report final rehash")
+            ) != expected:
+                raise RuntimeError("validator report changed before preaudit publish")
+        for path, binding, description in (
+            (license_allowlist, "license_allowlist_sha256", "license allowlist"),
+            (quality_exclusions, "quality_exclusions_sha256", "quality exclusions"),
+            (protected_sources, "protected_sources_sha256", "protected sources"),
+            (training_config, "training_config_sha256", "training config"),
+        ):
+            if _sha256_bytes(_stable_bytes(path, f"{description} final rehash")) != (
+                selection_bindings[binding]
+            ):
+                raise RuntimeError(f"{description} changed before preaudit publish")
+        for index, record in enumerate(dataset_source_inputs):
+            _verify_dataset_input(record, f"preaudit source payload {index}")
+        for index, record in enumerate(dataset_crop_inputs):
+            _verify_dataset_input(record, f"preaudit crop payload {index}")
+        if _dataset_snapshot_tree_contract(
+            snapshot_stage_root, dataset_snapshot_value, logical_root=snapshot_root
+        ) != snapshot_publish_receipt:
+            raise RuntimeError("preaudit dataset snapshot changed before publish")
+        _publish_directory_no_replace(stage, final)
+    except Exception:
+        for path in sorted(
+            stage.rglob("*"), key=lambda value: len(value.parts), reverse=True
+        ):
+            try:
+                os.chmod(path, 0o700 if path.is_dir() else 0o600)
+            except OSError:
+                pass
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+    final_paths = {
+        proposal_path: final / "preaudit_proposal.json",
+        train_path: final / "train_manifest.csv",
+        validation_path: final / "model_validation_manifest.csv",
+        snapshot_report_path: final / "candidate_dataset_snapshot.json",
+    }
+    for path, expected in marker_rows:
+        if _sha256_bytes(
+            _stable_bytes(final_paths[path], "preaudit artifact post-publish")
+        ) != expected:
+            raise RuntimeError(f"preaudit artifact changed after publish: {path}")
+    if _dataset_snapshot_tree_contract(
+        final / "dataset_snapshot", dataset_snapshot_value, logical_root=snapshot_root
+    ) != snapshot_publish_receipt:
+        raise RuntimeError("preaudit dataset snapshot changed after publish")
+    if _verify_dataset_content_inventory(
+        dataset_content_inventory, "preaudit dataset content inventory post-publish"
+    ) != dataset_content_inventory_sha:
+        raise RuntimeError("preaudit dataset content inventory changed after publish")
+    for index, record in enumerate(dataset_source_inputs):
+        _verify_dataset_input(record, f"preaudit source payload post-publish {index}")
+    for index, record in enumerate(dataset_crop_inputs):
+        _verify_dataset_input(record, f"preaudit crop payload post-publish {index}")
+    with (final / "preaudit_proposal.sha256").open("xb") as handle:
+        handle.write(marker_content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if _stable_bytes(
+        final / "preaudit_proposal.sha256", "preaudit completion seal post-write"
+    ) != marker_content:
+        raise RuntimeError("preaudit completion seal changed after publication")
+    return proposal
+
+
+def _validate_preaudit_proposal(
+    proposal_dir: Path, *, source_manifest_sha256: Sequence[str],
+    full_data_report_sha256: Sequence[str], selection_bindings: Mapping[str, str],
+    train_content: bytes, validation_content: bytes,
+    dataset_snapshot_value: Mapping[str, object], dataset_snapshot_content: bytes,
+    candidate_counts: Mapping[str, object],
+) -> None:
+    """Require a sealed proposal and regenerated byte-identical audit inputs."""
+
+    root = _reject_symlink_components(proposal_dir, "preaudit proposal directory")
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("preaudit proposal directory must be a non-symlink directory")
+    expected_names = {
+        "preaudit_proposal.json", "preaudit_proposal.sha256",
+        "train_manifest.csv", "model_validation_manifest.csv",
+        "candidate_dataset_snapshot.json", "dataset_snapshot",
+    }
+    if {path.name for path in root.iterdir()} != expected_names:
+        raise ValueError("preaudit proposal top-level file set mismatch")
+    proposal, proposal_content = _load_json(
+        root / "preaudit_proposal.json", "preaudit proposal"
+    )
+    expected_fields = {
+        "schema", "artifact_role", "status", "candidate_only", "proposal_only",
+        "near_duplicate_audit_input_ready", "near_duplicate_audit_completed",
+        "candidate_training_input_authorized", "training_authority",
+        "lineage_execution_authorized", "ready_for_lineage_upgrade",
+        "blind_test_authority", "candidate_promotion_authorized",
+        "production_deployment_authorized", "pi_deployment_authorized",
+        "spring_contract_modified", "local_only", "portable",
+        "selection_contract", "artifacts", "dataset_content_inventory",
+        "dataset_snapshot_publish_receipt", "counts", "bindings",
+    }
+    if set(proposal) != expected_fields or proposal_content != _canonical_json(proposal):
+        raise ValueError("preaudit proposal schema or canonical bytes mismatch")
+    if (
+        proposal.get("schema") != PREAUDIT_PROPOSAL_SCHEMA
+        or proposal.get("artifact_role") != PREAUDIT_PROPOSAL_ROLE
+        or proposal.get("status") != PREAUDIT_PROPOSAL_STATUS
+    ):
+        raise ValueError("preaudit proposal identity mismatch")
+    for field in (
+        "candidate_only", "proposal_only", "near_duplicate_audit_input_ready",
+        "local_only",
+    ):
+        _require_bool(proposal.get(field), True, f"preaudit proposal {field}")
+    for field in (
+        "near_duplicate_audit_completed", "candidate_training_input_authorized",
+        "training_authority", "lineage_execution_authorized",
+        "ready_for_lineage_upgrade", "blind_test_authority",
+        "candidate_promotion_authorized", "production_deployment_authorized",
+        "pi_deployment_authorized", "spring_contract_modified", "portable",
+    ):
+        _require_bool(proposal.get(field), False, f"preaudit proposal {field}")
+    if proposal.get("selection_contract") != {
+        "operational_cutoff_kst": OPERATIONAL_CUTOFF.isoformat(),
+        "quality_contract": QUALITY_CONTRACT,
+        "quality_reasons": sorted(QUALITY_REASONS),
+        "dent_or_crush_is_condition_target_not_quality_exclusion": True,
+    }:
+        raise ValueError("preaudit proposal selection contract mismatch")
+    bindings = proposal.get("bindings")
+    if type(bindings) is not dict:
+        raise ValueError("preaudit proposal bindings are invalid")
+    proposal_inventory_sha = _require_sha256(
+        bindings.get("dataset_content_inventory_sha256"),
+        "preaudit proposal dataset content inventory SHA",
+    )
+    expected_bindings = {
+        "source_manifest_sha256": list(source_manifest_sha256),
+        "full_data_validator_report_sha256": list(full_data_report_sha256),
+        "dataset_content_inventory_sha256": proposal_inventory_sha,
+        **dict(selection_bindings),
+    }
+    if bindings != expected_bindings:
+        raise ValueError("preaudit proposal input binding mismatch")
+    if proposal.get("counts") != dict(candidate_counts):
+        raise ValueError("preaudit proposal selection counts mismatch")
+
+    train_path = root / "train_manifest.csv"
+    validation_path = root / "model_validation_manifest.csv"
+    snapshot_report_path = root / "candidate_dataset_snapshot.json"
+    if _stable_bytes(train_path, "preaudit train manifest") != train_content:
+        raise ValueError("preaudit train manifest differs from regenerated bytes")
+    if _stable_bytes(
+        validation_path, "preaudit validation manifest"
+    ) != validation_content:
+        raise ValueError(
+            "preaudit model-validation manifest differs from regenerated bytes"
+        )
+    if _stable_bytes(
+        snapshot_report_path, "preaudit snapshot report"
+    ) != dataset_snapshot_content:
+        raise ValueError(
+            "preaudit dataset snapshot report differs from regenerated bytes"
+        )
+    expected_artifacts = {
+        "manifests": [
+            {"role": "train", **_artifact(train_path.absolute(), train_content)},
+            {
+                "role": "model_validation",
+                **_artifact(validation_path.absolute(), validation_content),
+            },
+        ],
+        "dataset_snapshot_report": _artifact(
+            snapshot_report_path.absolute(), dataset_snapshot_content
+        ),
+    }
+    if proposal.get("artifacts") != expected_artifacts:
+        raise ValueError("preaudit proposal artifact binding mismatch")
+    receipt = _dataset_snapshot_tree_contract(
+        root / "dataset_snapshot", dataset_snapshot_value,
+        logical_root=(root / "dataset_snapshot").absolute(),
+    )
+    if proposal.get("dataset_snapshot_publish_receipt") != receipt:
+        raise ValueError("preaudit proposal snapshot receipt mismatch")
+    inventory = proposal.get("dataset_content_inventory")
+    if type(inventory) is not list:
+        raise ValueError("preaudit proposal dataset content inventory is invalid")
+    inventory_sha = _verify_dataset_content_inventory(
+        inventory, "preaudit proposal dataset content inventory"
+    )
+    if inventory_sha != proposal_inventory_sha:
+        raise ValueError("preaudit proposal dataset content inventory binding mismatch")
+
+    marker_content = _stable_bytes(
+        root / "preaudit_proposal.sha256", "preaudit proposal completion seal"
+    )
+    expected_marker = "".join(
+        f"{_sha256_bytes(content)}  {path.absolute().as_posix()}\n"
+        for path, content in (
+            (root / "preaudit_proposal.json", proposal_content),
+            (train_path, train_content),
+            (validation_path, validation_content),
+            (snapshot_report_path, dataset_snapshot_content),
+        )
+    ).encode("utf-8")
+    if marker_content != expected_marker:
+        raise ValueError("preaudit proposal completion seal mismatch")
+
+
+def _build_candidate_bundle(
+    *, source_manifests: Sequence[Path],
+    full_data_validator_reports: Sequence[Path], license_allowlist: Path,
+    quality_exclusions: Path, protected_sources: Path, training_config: Path,
+    output_dir: Path, proposal_only: bool,
+    qx3_diagnostic_ready: Path | None = None,
+    qx3_diagnostic_report: Path | None = None,
+    trusted_policy: Path | None = None,
+    near_duplicate_audit_report: Path | None = None,
+    protected_reference_inventory: Path | None = None,
+    code_inventory: Path | None = None,
+    pretrained_backbone: Path | None = None,
+    host_launch_contract: Path | None = None,
+    container_image_id: str | None = None,
+    preaudit_proposal_dir: Path | None = None,
+) -> dict[str, object]:
+    """Build either the immutable pre-audit proposal or final authority."""
 
     if not source_manifests or len(source_manifests) != len(full_data_validator_reports):
         raise ValueError("each source manifest requires one full-data validator report")
-    if IMAGE_ID_RE.fullmatch(container_image_id) is None:
+    if not proposal_only and (
+        type(container_image_id) is not str
+        or IMAGE_ID_RE.fullmatch(container_image_id) is None
+    ):
         raise ValueError("container_image_id must be a full sha256 image ID")
     final = _reject_symlink_components(output_dir, "output directory")
     if final.exists() or final.is_symlink():
@@ -1753,54 +2945,151 @@ def build_training_authority(
         _validate_full_data_report(report, manifest_sha, rows)
         full_report_shas.append(_sha256_bytes(content))
 
-    qx3_ready, qx3_ready_content = _load_json(qx3_diagnostic_ready, "qx3 diagnostic ready")
-    qx3_report, qx3_report_content = _load_json(qx3_diagnostic_report, "qx3 diagnostic report")
-    _validate_qx3_ready(qx3_ready)
-    _validate_qx3_report(qx3_report)
-    qx3_bindings = qx3_ready.get("bindings")
-    if type(qx3_bindings) is not dict or qx3_bindings.get(
-        "comparison_sha256"
-    ) != _sha256_bytes(qx3_report_content):
-        raise ValueError("qx3 ready does not bind the diagnostic comparison report")
-
     license_value, license_content = _load_json(license_allowlist, "license allowlist")
     quality_value, quality_content = _load_json(quality_exclusions, "quality exclusions")
     protected_value, protected_content = _load_json(protected_sources, "protected sources")
-    inventory_value, inventory_content = _load_json(code_inventory, "code inventory")
     config_value, config_content = _load_json(training_config, "training config")
-    host_value, host_content = _load_json(host_launch_contract, "host launch contract")
-    policy_value, policy_content = _load_json(trusted_policy, "trusted policy")
-    trust_root_evidence = _audit_trusted_policy_trust_root(
-        trusted_policy, _sha256_bytes(policy_content)
-    )
-    backbone_content = _stable_bytes(pretrained_backbone, "pretrained backbone")
 
     origins = _validate_license_allowlist(license_value)
     excluded_sources = _validate_quality_manifest(quality_value)
     protected = _validate_protected_sources(protected_value)
     _validate_training_config(config_value)
-    _validate_code_inventory(inventory_value)
-    inventory_files = inventory_value.get("files")
-    assert type(inventory_files) is list
-    trainer_inventory_rows = [
-        row
-        for row in inventory_files
-        if type(row) is dict
-        and row.get("path") == "scripts/train_multitask_verifier.py"
-    ]
-    if len(trainer_inventory_rows) != 1:
-        raise ValueError("code inventory must contain exactly one candidate trainer")
-    trainer_sha256 = _require_sha256(
-        trainer_inventory_rows[0].get("sha256"), "code inventory trainer SHA"
-    )
-    raw_inspect_path, raw_inspect_content = _validate_host_contract(
-        host_value, container_image_id
-    )
-    backbone_path = _regular_file(pretrained_backbone, "pretrained backbone")
-    if backbone_path.name != "mobilenet_v3_small-047dcff4.pth":
-        raise ValueError("unexpected pretrained MobileNetV3 checkpoint filename")
-    if backbone_path.parent.name != "checkpoints" or backbone_path.parent.parent.name != "hub":
-        raise ValueError("pretrained backbone must be beneath TORCH_HOME/hub/checkpoints")
+
+    # These inputs grant candidate-training authority and therefore must not be
+    # needed to materialize the earlier, non-authoritative audit proposal.
+    qx3_ready_content = b""
+    qx3_report_content = b""
+    near_duplicate_value: dict[str, object] = {}
+    near_duplicate_content = b""
+    protected_inventory_value: dict[str, object] = {}
+    protected_inventory_content = b""
+    protected_asset_count = 0
+    inventory_value: dict[str, object] = {}
+    inventory_content = b""
+    host_content = b""
+    policy_value: dict[str, object] = {}
+    policy_content = b""
+    trust_root_evidence: dict[str, object] = {}
+    backbone_content = b""
+    trainer_sha256 = ""
+    auditor_sha256 = ""
+    auditor_runtime_code_sha256 = ""
+    auditor_path = Path()
+    raw_inspect_path = Path()
+    raw_inspect_content = b""
+    backbone_path = Path()
+    if not proposal_only:
+        required_final_paths = {
+            "qx3_diagnostic_ready": qx3_diagnostic_ready,
+            "qx3_diagnostic_report": qx3_diagnostic_report,
+            "trusted_policy": trusted_policy,
+            "near_duplicate_audit_report": near_duplicate_audit_report,
+            "protected_reference_inventory": protected_reference_inventory,
+            "code_inventory": code_inventory,
+            "pretrained_backbone": pretrained_backbone,
+            "host_launch_contract": host_launch_contract,
+        }
+        missing = sorted(
+            name for name, path in required_final_paths.items()
+            if not isinstance(path, Path)
+        )
+        if missing:
+            raise ValueError(f"final authority inputs are missing: {missing}")
+        assert qx3_diagnostic_ready is not None
+        assert qx3_diagnostic_report is not None
+        assert trusted_policy is not None
+        assert near_duplicate_audit_report is not None
+        assert protected_reference_inventory is not None
+        assert code_inventory is not None
+        assert pretrained_backbone is not None
+        assert host_launch_contract is not None
+        assert type(container_image_id) is str
+
+        qx3_ready, qx3_ready_content = _load_json(
+            qx3_diagnostic_ready, "qx3 diagnostic ready"
+        )
+        qx3_report, qx3_report_content = _load_json(
+            qx3_diagnostic_report, "qx3 diagnostic report"
+        )
+        _validate_qx3_ready(qx3_ready)
+        _validate_qx3_report(qx3_report)
+        qx3_bindings = qx3_ready.get("bindings")
+        if type(qx3_bindings) is not dict or qx3_bindings.get(
+            "comparison_sha256"
+        ) != _sha256_bytes(qx3_report_content):
+            raise ValueError(
+                "qx3 ready does not bind the diagnostic comparison report"
+            )
+        near_duplicate_value, near_duplicate_content = _load_json(
+            near_duplicate_audit_report, "near-duplicate audit report"
+        )
+        protected_inventory_value, protected_inventory_content = _load_json(
+            protected_reference_inventory, "protected reference inventory"
+        )
+        protected_asset_count = _validate_protected_reference_inventory(
+            protected_inventory_value, protected
+        )
+        inventory_value, inventory_content = _load_json(
+            code_inventory, "code inventory"
+        )
+        host_value, host_content = _load_json(
+            host_launch_contract, "host launch contract"
+        )
+        policy_value, policy_content = _load_json(trusted_policy, "trusted policy")
+        trust_root_evidence = _audit_trusted_policy_trust_root(
+            trusted_policy, _sha256_bytes(policy_content)
+        )
+        backbone_content = _stable_bytes(pretrained_backbone, "pretrained backbone")
+
+        _validate_code_inventory(inventory_value)
+        inventory_files = inventory_value.get("files")
+        assert type(inventory_files) is list
+        trainer_inventory_rows = [
+            row
+            for row in inventory_files
+            if type(row) is dict
+            and row.get("path") == "scripts/train_multitask_verifier.py"
+        ]
+        if len(trainer_inventory_rows) != 1:
+            raise ValueError("code inventory must contain exactly one candidate trainer")
+        trainer_sha256 = _require_sha256(
+            trainer_inventory_rows[0].get("sha256"), "code inventory trainer SHA"
+        )
+        auditor_inventory_rows = [
+            row
+            for row in inventory_files
+            if type(row) is dict and row.get("path") == NEAR_DUPLICATE_AUDITOR_PATH
+        ]
+        if len(auditor_inventory_rows) != 1:
+            raise ValueError(
+                "code inventory must contain exactly one near-duplicate auditor"
+            )
+        auditor_sha256 = _require_sha256(
+            auditor_inventory_rows[0].get("sha256"),
+            "code inventory near-duplicate auditor SHA",
+        )
+        inventory_root_text = inventory_value.get("root")
+        assert type(inventory_root_text) is str
+        auditor_path = _regular_file(
+            Path(inventory_root_text) / NEAR_DUPLICATE_AUDITOR_PATH,
+            "near-duplicate auditor",
+        )
+        auditor_runtime_code_sha256 = _load_auditor_runtime_fingerprint(
+            auditor_path, auditor_sha256
+        )
+        raw_inspect_path, raw_inspect_content = _validate_host_contract(
+            host_value, container_image_id
+        )
+        backbone_path = _regular_file(pretrained_backbone, "pretrained backbone")
+        if backbone_path.name != "mobilenet_v3_small-047dcff4.pth":
+            raise ValueError("unexpected pretrained MobileNetV3 checkpoint filename")
+        if (
+            backbone_path.parent.name != "checkpoints"
+            or backbone_path.parent.parent.name != "hub"
+        ):
+            raise ValueError(
+                "pretrained backbone must be beneath TORCH_HOME/hub/checkpoints"
+            )
 
     all_rows = [row for group in manifest_groups for row in group]
     all_source_shas = {
@@ -1831,19 +3120,29 @@ def build_training_authority(
                     ),
                 }
 
-    policy_bindings = {
-        "qx3_diagnostic_ready_sha256": _sha256_bytes(qx3_ready_content),
-        "qx3_diagnostic_report_sha256": _sha256_bytes(qx3_report_content),
+    policy_bindings: dict[str, str] = {
         "license_allowlist_sha256": _sha256_bytes(license_content),
         "quality_exclusions_sha256": _sha256_bytes(quality_content),
         "protected_sources_sha256": _sha256_bytes(protected_content),
-        "code_inventory_sha256": _sha256_bytes(inventory_content),
         "training_config_sha256": _sha256_bytes(config_content),
-        "host_launch_contract_sha256": _sha256_bytes(host_content),
-        "raw_container_inspect_sha256": _sha256_bytes(raw_inspect_content),
-        "pretrained_backbone_sha256": _sha256_bytes(backbone_content),
-        "container_image_id": container_image_id,
     }
+    if not proposal_only:
+        assert type(container_image_id) is str
+        policy_bindings.update({
+            "qx3_diagnostic_ready_sha256": _sha256_bytes(qx3_ready_content),
+            "qx3_diagnostic_report_sha256": _sha256_bytes(qx3_report_content),
+            "candidate_near_duplicate_audit_sha256": _sha256_bytes(
+                near_duplicate_content
+            ),
+            "protected_reference_inventory_sha256": _sha256_bytes(
+                protected_inventory_content
+            ),
+            "code_inventory_sha256": _sha256_bytes(inventory_content),
+            "host_launch_contract_sha256": _sha256_bytes(host_content),
+            "raw_container_inspect_sha256": _sha256_bytes(raw_inspect_content),
+            "pretrained_backbone_sha256": _sha256_bytes(backbone_content),
+            "container_image_id": container_image_id,
+        })
     identities: dict[str, dict[str, str]] = {
         field: {} for field in (
             "source_sha256", "image_sha256", "object_group", "capture_session"
@@ -2103,17 +3402,6 @@ def build_training_authority(
     dataset_snapshot_value, dataset_snapshot_content = _dataset_snapshot_report(
         dataset_snapshot_plan
     )
-    dataset_consumption_contract = _dataset_consumption_contract(
-        trainer_sha256=trainer_sha256,
-        snapshot_report_sha256=_sha256_bytes(dataset_snapshot_content),
-        snapshot_tree_sha256=str(dataset_snapshot_value["tree_sha256"]),
-        manifest_payload_set_sha256=str(
-            dataset_snapshot_value["payload_set_sha256"]
-        ),
-    )
-    dataset_consumption_contract_sha = _sha256_bytes(
-        _canonical_json(dataset_consumption_contract)
-    )
     dataset_content_inventory_sha = _sha256_bytes(
         _canonical_json(dataset_content_inventory)
     )
@@ -2127,10 +3415,44 @@ def build_training_authority(
         "candidate_dataset_snapshot_sha256": _sha256_bytes(
             dataset_snapshot_content
         ),
-        "candidate_dataset_consumption_contract_sha256": (
-            dataset_consumption_contract_sha
-        ),
     })
+    dataset_consumption_contract: dict[str, object] = {}
+    dataset_consumption_contract_sha = ""
+    if not proposal_only:
+        dataset_consumption_contract = _dataset_consumption_contract(
+            trainer_sha256=trainer_sha256,
+            snapshot_report_sha256=_sha256_bytes(dataset_snapshot_content),
+            snapshot_tree_sha256=str(dataset_snapshot_value["tree_sha256"]),
+            manifest_payload_set_sha256=str(
+                dataset_snapshot_value["payload_set_sha256"]
+            ),
+        )
+        dataset_consumption_contract_sha = _sha256_bytes(
+            _canonical_json(dataset_consumption_contract)
+        )
+        policy_bindings["candidate_dataset_consumption_contract_sha256"] = (
+            dataset_consumption_contract_sha
+        )
+        _validate_near_duplicate_audit(
+            near_duplicate_value,
+            near_duplicate_content,
+            candidate_manifest_sha256={
+                "train": policy_bindings["candidate_train_manifest_sha256"],
+                "model_validation": policy_bindings[
+                    "candidate_model_validation_manifest_sha256"
+                ],
+            },
+            candidate_rows_by_role=selected,
+            candidate_asset_count=2 * sum(len(rows) for rows in selected.values()),
+            protected_sources_value=protected_value,
+            protected_sources_content=protected_content,
+            protected_sources=protected,
+            protected_inventory_value=protected_inventory_value,
+            protected_inventory_content=protected_inventory_content,
+            protected_asset_count=protected_asset_count,
+            auditor_sha256=auditor_sha256,
+            auditor_runtime_code_sha256=auditor_runtime_code_sha256,
+        )
     candidate_counts: dict[str, object] = {
         "selected_by_role": {role: len(selected[role]) for role in ROLE_SPLITS},
         "selected_by_origin": dict(sorted(origin_counts.items())),
@@ -2167,6 +3489,50 @@ def build_training_authority(
             for head, counts in condition_counts.items()
         },
     }
+    proposal_selection_bindings = {
+        field: policy_bindings[field]
+        for field in (
+            "license_allowlist_sha256", "quality_exclusions_sha256",
+            "protected_sources_sha256", "training_config_sha256",
+            "candidate_train_manifest_sha256",
+            "candidate_model_validation_manifest_sha256",
+            "candidate_dataset_snapshot_sha256",
+        )
+    }
+    if proposal_only:
+        return _publish_preaudit_proposal(
+            final=final,
+            source_manifests=source_manifests,
+            manifest_shas=manifest_shas,
+            full_data_validator_reports=full_data_validator_reports,
+            full_report_shas=full_report_shas,
+            license_allowlist=license_allowlist,
+            quality_exclusions=quality_exclusions,
+            protected_sources=protected_sources,
+            training_config=training_config,
+            selection_bindings=proposal_selection_bindings,
+            train_content=train_content,
+            validation_content=validation_content,
+            dataset_snapshot_value=dataset_snapshot_value,
+            dataset_snapshot_content=dataset_snapshot_content,
+            dataset_content_inventory=dataset_content_inventory,
+            dataset_content_inventory_sha=dataset_content_inventory_sha,
+            dataset_source_inputs=dataset_source_inputs,
+            dataset_crop_inputs=dataset_crop_inputs,
+            candidate_counts=candidate_counts,
+        )
+    if preaudit_proposal_dir is not None:
+        _validate_preaudit_proposal(
+            preaudit_proposal_dir,
+            source_manifest_sha256=manifest_shas,
+            full_data_report_sha256=full_report_shas,
+            selection_bindings=proposal_selection_bindings,
+            train_content=train_content,
+            validation_content=validation_content,
+            dataset_snapshot_value=dataset_snapshot_value,
+            dataset_snapshot_content=dataset_snapshot_content,
+            candidate_counts=candidate_counts,
+        )
     # The repository-pinned policy approves the exact deterministic, filtered
     # candidate manifests.  A self-issued authority file cannot substitute
     # different rows or labels while retaining the same trust root.
@@ -2181,6 +3547,8 @@ def build_training_authority(
     authority_path = (final / "training_authority.json").absolute()
     snapshot_report_path = (final / "candidate_dataset_snapshot.json").absolute()
     snapshot_root = (final / "dataset_snapshot").absolute()
+    assert code_inventory is not None
+    assert host_launch_contract is not None
     inventory_path = _regular_file(code_inventory, "code inventory")
     config_path = _regular_file(training_config, "training config")
     host_path = _regular_file(host_launch_contract, "host launch contract")
@@ -2265,6 +3633,7 @@ def build_training_authority(
             "dataset_content_inventory": dataset_content_inventory,
             "dataset_snapshot_publish_receipt": snapshot_publish_receipt,
             "dataset_consumption_contract": dataset_consumption_contract,
+            "near_duplicate_audit": near_duplicate_value,
             "counts": candidate_counts,
             "bindings": {
                 "source_manifest_sha256": manifest_shas,
@@ -2328,6 +3697,17 @@ def build_training_authority(
             (quality_exclusions, policy_bindings["quality_exclusions_sha256"], "quality exclusions"),
             (protected_sources, policy_bindings["protected_sources_sha256"], "protected sources"),
             (
+                near_duplicate_audit_report,
+                policy_bindings["candidate_near_duplicate_audit_sha256"],
+                "near-duplicate audit report",
+            ),
+            (
+                protected_reference_inventory,
+                policy_bindings["protected_reference_inventory_sha256"],
+                "protected reference inventory",
+            ),
+            (auditor_path, auditor_sha256, "near-duplicate auditor"),
+            (
                 raw_inspect_path,
                 policy_bindings["raw_container_inspect_sha256"],
                 "raw docker inspect evidence",
@@ -2335,6 +3715,12 @@ def build_training_authority(
         ):
             if _sha256_bytes(_stable_bytes(path, f"{description} final rehash")) != expected:
                 raise RuntimeError(f"{description} changed before publish")
+        if _load_auditor_runtime_fingerprint(
+            auditor_path, auditor_sha256
+        ) != auditor_runtime_code_sha256:
+            raise RuntimeError(
+                "near-duplicate auditor runtime fingerprint changed before publish"
+            )
         for index, record in enumerate(dataset_source_inputs):
             _verify_dataset_input(record, f"source payload pre-publish {index}")
         for index, record in enumerate(dataset_crop_inputs):
@@ -2393,28 +3779,122 @@ def build_training_authority(
     return authority
 
 
+def build_preaudit_candidate_proposal(
+    *, source_manifests: Sequence[Path],
+    full_data_validator_reports: Sequence[Path], license_allowlist: Path,
+    quality_exclusions: Path, protected_sources: Path, training_config: Path,
+    output_dir: Path,
+) -> dict[str, object]:
+    """Create immutable inputs for the near-duplicate audit, with no authority."""
+
+    return _build_candidate_bundle(
+        source_manifests=source_manifests,
+        full_data_validator_reports=full_data_validator_reports,
+        license_allowlist=license_allowlist,
+        quality_exclusions=quality_exclusions,
+        protected_sources=protected_sources,
+        training_config=training_config,
+        output_dir=output_dir,
+        proposal_only=True,
+    )
+
+
+def build_training_authority(
+    *, source_manifests: Sequence[Path],
+    full_data_validator_reports: Sequence[Path], qx3_diagnostic_ready: Path,
+    qx3_diagnostic_report: Path, trusted_policy: Path, license_allowlist: Path,
+    quality_exclusions: Path, protected_sources: Path,
+    near_duplicate_audit_report: Path, protected_reference_inventory: Path,
+    code_inventory: Path, pretrained_backbone: Path, training_config: Path,
+    host_launch_contract: Path, container_image_id: str, output_dir: Path,
+    preaudit_proposal_dir: Path | None = None,
+) -> dict[str, object]:
+    """Create a sealed candidate-training input directory."""
+
+    return _build_candidate_bundle(
+        source_manifests=source_manifests,
+        full_data_validator_reports=full_data_validator_reports,
+        license_allowlist=license_allowlist,
+        quality_exclusions=quality_exclusions,
+        protected_sources=protected_sources,
+        training_config=training_config,
+        output_dir=output_dir,
+        proposal_only=False,
+        qx3_diagnostic_ready=qx3_diagnostic_ready,
+        qx3_diagnostic_report=qx3_diagnostic_report,
+        trusted_policy=trusted_policy,
+        near_duplicate_audit_report=near_duplicate_audit_report,
+        protected_reference_inventory=protected_reference_inventory,
+        code_inventory=code_inventory,
+        pretrained_backbone=pretrained_backbone,
+        host_launch_contract=host_launch_contract,
+        container_image_id=container_image_id,
+        preaudit_proposal_dir=preaudit_proposal_dir,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode", choices=("final", "preaudit-proposal"), default="final"
+    )
     parser.add_argument("--source-manifest", action="append", type=Path, required=True)
     parser.add_argument(
         "--full-data-validator-report", action="append", type=Path, required=True
     )
     for name in (
-        "qx3_diagnostic_ready", "qx3_diagnostic_report", "trusted_policy",
         "license_allowlist", "quality_exclusions", "protected_sources",
-        "code_inventory", "pretrained_backbone", "training_config",
-        "host_launch_contract", "output_dir",
+        "training_config", "output_dir",
     ):
         parser.add_argument(f"--{name.replace('_', '-')}", type=Path, required=True)
-    parser.add_argument("--container-image-id", required=True)
+    for name in (
+        "qx3_diagnostic_ready", "qx3_diagnostic_report", "trusted_policy",
+        "near_duplicate_audit_report", "protected_reference_inventory",
+        "code_inventory", "pretrained_backbone", "host_launch_contract",
+        "preaudit_proposal_dir",
+    ):
+        parser.add_argument(f"--{name.replace('_', '-')}", type=Path)
+    parser.add_argument("--container-image-id")
     return parser
 
 
 def main() -> int:
-    args = vars(_parser().parse_args())
+    parser = _parser()
+    args = vars(parser.parse_args())
+    mode = args.pop("mode")
     args["source_manifests"] = args.pop("source_manifest")
     args["full_data_validator_reports"] = args.pop("full_data_validator_report")
-    result = build_training_authority(**args)
+    if mode == "preaudit-proposal":
+        forbidden = {
+            name: args.pop(name)
+            for name in (
+                "qx3_diagnostic_ready", "qx3_diagnostic_report", "trusted_policy",
+                "near_duplicate_audit_report", "protected_reference_inventory",
+                "code_inventory", "pretrained_backbone", "host_launch_contract",
+                "container_image_id", "preaudit_proposal_dir",
+            )
+        }
+        supplied = sorted(name for name, value in forbidden.items() if value is not None)
+        if supplied:
+            parser.error(
+                "preaudit-proposal mode rejects authority-only inputs: "
+                + ", ".join(supplied)
+            )
+        result = build_preaudit_candidate_proposal(**args)
+    else:
+        required = (
+            "qx3_diagnostic_ready", "qx3_diagnostic_report", "trusted_policy",
+            "near_duplicate_audit_report", "protected_reference_inventory",
+            "code_inventory", "pretrained_backbone", "host_launch_contract",
+            "container_image_id",
+        )
+        missing = [name for name in required if args.get(name) is None]
+        if missing:
+            parser.error(
+                "final mode requires: "
+                + ", ".join("--" + name.replace("_", "-") for name in missing)
+            )
+        result = build_training_authority(**args)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

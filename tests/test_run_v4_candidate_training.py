@@ -99,7 +99,7 @@ def test_shell_syntax_when_bash_is_available() -> None:
 def test_authority_and_marker_contract_is_fail_closed() -> None:
     text = _text()
     for fragment in (
-        '"schema": "v4_candidate_training_authority.v2"',
+        '"schema": "v4_candidate_training_authority.v3"',
         '"artifact_role": "v4_candidate_training_input_authority_not_blind_or_deployment"',
         '"status": "candidate_training_inputs_ready"',
         '"candidate_only", "candidate_training_input_authorized", "training_authority"',
@@ -114,11 +114,54 @@ def test_authority_and_marker_contract_is_fail_closed() -> None:
         '"candidate_dataset_snapshot_sha256"',
         '"dataset_snapshot_publish_receipt_sha256"',
         '"dataset_consumption_contract_sha256"',
+        '"candidate_near_duplicate_audit_sha256"',
+        '"protected_reference_inventory_sha256"',
+        '"near_duplicate_audit"',
         'FORBIDDEN_DIAGNOSTIC_TOKENS',
     ):
         assert fragment in text
     assert 'require_exact_bool(authority.get(field), True' in text
     assert 'require_exact_bool(authority.get(field), False' in text
+
+
+def test_near_duplicate_audit_is_fail_closed_and_bound_through_ready() -> None:
+    text = _text()
+    for fragment in (
+        '"v4_near_duplicate_leakage_audit.v1"',
+        '"candidate_dataset_separation_evidence_only"',
+        '"id": "oneexpo_phash_rot4_v1"',
+        '"threshold": 4',
+        '"graph_edge_cap": 1000000',
+        '"automatic_delete_or_relabel": False',
+        'near-duplicate audit candidate manifest binding mismatch',
+        'near-duplicate coverage complete',
+        'near-duplicate protected source union count mismatch',
+        'near-duplicate protected crop-view coverage mismatch',
+        'near-duplicate candidate crop-view coverage mismatch',
+        'near-duplicate candidate payload-set binding mismatch',
+        'near-duplicate protected payload-set binding mismatch',
+        'near-duplicate protected canonical union binding mismatch',
+        'near-duplicate candidate crop entries differ from the exact manifest rows',
+        'near-duplicate supplied edge array exceeds its graph edge cap',
+        'near-duplicate audit omitted a forbidden cross-role edge',
+        'near-duplicate audit edge set is incomplete',
+        'near-duplicate audit edge evidence is incomplete',
+        'near-duplicate cluster is multi-role or malformed',
+        'near-duplicate cluster blocking',
+        '"blocking_multi_role_clusters": 0',
+        'near-duplicate auditor differs from the report/code inventory binding',
+        '"runtime_code_sha256"',
+        'runtime_code_fingerprint_sha256',
+        'near-duplicate auditor executed-code fingerprint differs from the report',
+        '"near_duplicate_audit": near_duplicate_audit',
+        '"near_duplicate_audit_sha256": near_duplicate_audit_sha',
+        '"candidate_near_duplicate_audit_sha256": near_duplicate_audit_sha',
+        '"protected_sources_sha256": near_protected_sources["file_sha256"]',
+        '"protected_reference_inventory_sha256": near_protected_inventory["file_sha256"]',
+    ):
+        assert fragment in text
+    assert text.count('near_duplicate_audit_sha =') == 2
+    assert text.count('near_duplicate_audit.get("status") != "passed"') == 2
 
 
 def test_code_image_config_and_pretrained_bytes_are_pinned() -> None:

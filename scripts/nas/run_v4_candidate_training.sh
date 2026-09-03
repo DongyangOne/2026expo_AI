@@ -969,6 +969,7 @@ import re
 import socket
 import stat
 import sys
+import types
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -1046,6 +1047,8 @@ POLICY_BINDING_FIELDS = {
     "candidate_model_validation_manifest_sha256",
     "candidate_dataset_snapshot_sha256",
     "candidate_dataset_consumption_contract_sha256",
+    "candidate_near_duplicate_audit_sha256",
+    "protected_reference_inventory_sha256",
 }
 AUTHORITY_BINDING_FIELDS = {
     "source_manifest_sha256", "full_data_validator_report_sha256",
@@ -1110,6 +1113,17 @@ def stable_bytes(path: Path, description: str) -> bytes:
 
 def sha_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def compact_json_value(value) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")
+
+
+def compact_json(value) -> bytes:
+    return compact_json_value(value) + b"\n"
 
 
 def resolved_file(path: str, description: str) -> Path:
@@ -1190,13 +1204,13 @@ authority_fields = {
     "portable", "operational_cutoff_kst", "material_classes",
     "objectness_classes", "condition_heads", "artifacts", "trust_root",
     "dataset_content_inventory", "dataset_snapshot_publish_receipt",
-    "dataset_consumption_contract",
+    "dataset_consumption_contract", "near_duplicate_audit",
     "counts", "bindings",
 }
 if set(authority) != authority_fields:
     raise ValueError("training authority top-level schema mismatch")
 exact_authority = {
-    "schema": "v4_candidate_training_authority.v2",
+    "schema": "v4_candidate_training_authority.v3",
     "artifact_role": "v4_candidate_training_input_authority_not_blind_or_deployment",
     "status": "candidate_training_inputs_ready",
 }
@@ -1344,6 +1358,493 @@ for value in manifest_values:
     manifest_hashes[role] = actual
 if set(manifest_paths) != expected_roles or len(set(manifest_paths.values())) != 2:
     raise ValueError("authority must bind two distinct train/model_validation manifests")
+
+# Consume the complete, immutable separation report embedded by the authority
+# builder.  pHash is separation evidence only: it cannot delete, relabel,
+# select, promote, or deploy any sample.  Any cross-role cluster fails closed.
+near_duplicate_audit = authority.get("near_duplicate_audit")
+near_duplicate_fields = {
+    "schema", "status", "ok", "artifact_role", "authority", "algorithm",
+    "bindings", "coverage", "summary", "entries", "edges", "clusters",
+}
+if not isinstance(near_duplicate_audit, dict) or set(near_duplicate_audit) != near_duplicate_fields:
+    raise ValueError("near-duplicate audit top-level schema mismatch")
+if near_duplicate_audit.get("schema") != "v4_near_duplicate_leakage_audit.v1":
+    raise ValueError("near-duplicate audit schema mismatch")
+if near_duplicate_audit.get("status") != "passed" or near_duplicate_audit.get("ok") is not True:
+    raise ValueError("near-duplicate audit did not pass")
+if near_duplicate_audit.get("artifact_role") != "candidate_dataset_separation_evidence_only":
+    raise ValueError("near-duplicate audit artifact role mismatch")
+expected_near_duplicate_authority = {
+    "candidate_only": True,
+    "label_authority": False,
+    "blind_authority": False,
+    "promotion_authority": False,
+    "deployment_authority": False,
+    "automatic_delete_or_relabel": False,
+}
+if near_duplicate_audit.get("authority") != expected_near_duplicate_authority:
+    raise ValueError("near-duplicate audit grants forbidden authority")
+
+algorithm = near_duplicate_audit.get("algorithm")
+algorithm_fields = {
+    "id", "threshold", "decode", "views", "resize", "dct", "bit_rule",
+    "byte_cap", "pixel_cap", "graph_edge_cap",
+    "exact_right_angle_rotation_invariant",
+    "crop_invariant", "runtime",
+}
+if not isinstance(algorithm, dict) or set(algorithm) != algorithm_fields:
+    raise ValueError("near-duplicate algorithm schema mismatch")
+expected_algorithm = {
+    "id": "oneexpo_phash_rot4_v1",
+    "threshold": 4,
+    "decode": "verified_bytes_cv2_grayscale_ignore_exif_orientation",
+    "views": ["rot0", "rot90", "rot180", "rot270"],
+    "resize": {"width": 32, "height": 32, "interpolation": "INTER_AREA"},
+    "dct": {"dtype": "float32", "low_frequency_block": [8, 8]},
+    "bit_rule": "row_major_msb_first; median(coefficients[1:]); coefficient>median; dc=0",
+    "byte_cap": 67108864,
+    "pixel_cap": 16000000,
+    "graph_edge_cap": 1000000,
+    "exact_right_angle_rotation_invariant": True,
+    "crop_invariant": False,
+}
+for field, expected in expected_algorithm.items():
+    if algorithm.get(field) != expected:
+        raise ValueError(f"near-duplicate algorithm {field} mismatch")
+runtime = algorithm.get("runtime")
+if not isinstance(runtime, dict) or set(runtime) != {
+    "python", "opencv", "numpy", "pillow", "opencv_build_information_sha256",
+}:
+    raise ValueError("near-duplicate algorithm runtime schema mismatch")
+for field in ("python", "opencv", "numpy", "pillow"):
+    if not isinstance(runtime.get(field), str) or not runtime[field]:
+        raise ValueError(f"near-duplicate runtime {field} is invalid")
+require_sha(
+    runtime.get("opencv_build_information_sha256"),
+    "near-duplicate OpenCV build information SHA",
+)
+
+near_bindings = near_duplicate_audit.get("bindings")
+if not isinstance(near_bindings, dict) or set(near_bindings) != {
+    "candidate_manifest_sha256", "candidate_payload_set_sha256",
+    "protected_payload_set_sha256", "protected_sources",
+    "protected_inventory", "auditor",
+}:
+    raise ValueError("near-duplicate audit bindings schema mismatch")
+if near_bindings.get("candidate_manifest_sha256") != {
+    role: manifest_hashes[role] for role in sorted(expected_roles)
+}:
+    raise ValueError("near-duplicate audit candidate manifest binding mismatch")
+for field in ("candidate_payload_set_sha256", "protected_payload_set_sha256"):
+    require_sha(near_bindings.get(field), f"near-duplicate audit {field}")
+protected_source_binding = near_bindings.get("protected_sources")
+if not isinstance(protected_source_binding, dict) or set(protected_source_binding) != {
+    "file_sha256", "payload_sha256", "canonical_union_sha256",
+}:
+    raise ValueError("near-duplicate protected-sources binding schema mismatch")
+for field, digest in protected_source_binding.items():
+    require_sha(digest, f"near-duplicate protected_sources.{field}")
+protected_inventory_binding = near_bindings.get("protected_inventory")
+if not isinstance(protected_inventory_binding, dict) or set(protected_inventory_binding) != {
+    "file_sha256", "payload_sha256",
+}:
+    raise ValueError("near-duplicate protected-inventory binding schema mismatch")
+for field, digest in protected_inventory_binding.items():
+    require_sha(digest, f"near-duplicate protected_inventory.{field}")
+auditor_binding = near_bindings.get("auditor")
+if not isinstance(auditor_binding, dict) or set(auditor_binding) != {
+    "path", "sha256", "runtime_code_sha256",
+}:
+    raise ValueError("near-duplicate auditor binding schema mismatch")
+if auditor_binding.get("path") != "scripts/audit_v4_near_duplicate_leakage.py":
+    raise ValueError("near-duplicate auditor path mismatch")
+require_sha(auditor_binding.get("sha256"), "near-duplicate auditor SHA")
+require_sha(
+    auditor_binding.get("runtime_code_sha256"),
+    "near-duplicate auditor runtime code SHA",
+)
+
+coverage = near_duplicate_audit.get("coverage")
+if not isinstance(coverage, dict) or set(coverage) != {
+    "candidate_assets", "protected_assets", "protected_source_union",
+    "verified_assets", "complete",
+}:
+    raise ValueError("near-duplicate coverage schema mismatch")
+require_exact_bool(coverage.get("complete"), True, "near-duplicate coverage complete")
+for field in (
+    "candidate_assets", "protected_assets", "protected_source_union", "verified_assets",
+):
+    if type(coverage.get(field)) is not int or coverage[field] <= 0:
+        raise ValueError(f"near-duplicate coverage {field} must be a positive integer")
+if coverage["verified_assets"] != coverage["candidate_assets"] + coverage["protected_assets"]:
+    raise ValueError("near-duplicate verified asset count mismatch")
+if coverage["protected_assets"] != 2 * coverage["protected_source_union"]:
+    raise ValueError("near-duplicate protected union coverage is incomplete")
+
+entries = near_duplicate_audit.get("entries")
+edges = near_duplicate_audit.get("edges")
+clusters = near_duplicate_audit.get("clusters")
+if not isinstance(entries, list) or not isinstance(edges, list) or not isinstance(clusters, list):
+    raise ValueError("near-duplicate entries/edges/clusters must be arrays")
+if len(entries) != coverage["verified_assets"] or not entries:
+    raise ValueError("near-duplicate entry coverage mismatch")
+if len(edges) > algorithm["graph_edge_cap"]:
+    raise ValueError("near-duplicate supplied edge array exceeds its graph edge cap")
+entry_fields = {
+    "asset_id", "role", "cohort", "view_kind", "sample_id", "source_sha256",
+    "image_sha256", "size", "width", "height", "phash_rot4",
+}
+asset_ids = set()
+asset_entries = {}
+phash_signatures = {}
+candidate_entry_count = 0
+protected_entry_count = 0
+protected_source_shas = set()
+protected_source_view_counts = Counter()
+protected_crop_view_counts = Counter()
+candidate_source_view_counts = Counter()
+candidate_crop_view_counts = Counter()
+candidate_audit_manifest_rows = set()
+candidate_payload_shas = set()
+protected_payload_shas = set()
+previous_asset_id = None
+protected_cohorts = {"qx3_diagnostic", "hardware41", "known_audit", "calibration", "blind_test"}
+for index, entry in enumerate(entries):
+    if not isinstance(entry, dict) or set(entry) != entry_fields:
+        raise ValueError(f"near-duplicate entry {index} schema mismatch")
+    asset_id = require_sha(entry.get("asset_id"), f"near-duplicate entry {index} asset_id")
+    if previous_asset_id is not None and asset_id <= previous_asset_id:
+        raise ValueError("near-duplicate entries are not strictly asset-id sorted")
+    previous_asset_id = asset_id
+    if asset_id in asset_ids:
+        raise ValueError("near-duplicate entries contain duplicate asset IDs")
+    asset_ids.add(asset_id)
+    asset_entries[asset_id] = entry
+    role = entry.get("role")
+    cohort = entry.get("cohort")
+    view_kind = entry.get("view_kind")
+    sample_id = entry.get("sample_id")
+    source_sha = require_sha(
+        entry.get("source_sha256"), f"near-duplicate entry {index} source SHA"
+    )
+    image_sha = require_sha(
+        entry.get("image_sha256"), f"near-duplicate entry {index} image SHA"
+    )
+    expected_asset_id = sha_bytes(compact_json_value({
+        "cohort": cohort,
+        "image_sha256": image_sha,
+        "role": role,
+        "sample_id": sample_id,
+        "source_sha256": source_sha,
+        "view_kind": view_kind,
+    }))
+    if asset_id != expected_asset_id:
+        raise ValueError("near-duplicate entry asset ID is not deterministic")
+    if cohort == "candidate":
+        if role not in expected_roles:
+            raise ValueError("near-duplicate candidate entry role mismatch")
+        candidate_entry_count += 1
+        candidate_payload_shas.add(image_sha)
+        if view_kind == "source":
+            if sample_id != f"source:{role}:{source_sha}":
+                raise ValueError("near-duplicate candidate source sample ID mismatch")
+            candidate_source_view_counts[(role, source_sha)] += 1
+        elif view_kind == "crop":
+            candidate_crop_view_counts[(role, source_sha)] += 1
+            candidate_audit_manifest_rows.add(
+                (role, sample_id, source_sha, image_sha)
+            )
+    else:
+        if cohort not in protected_cohorts or role != cohort:
+            raise ValueError("near-duplicate protected entry role/cohort mismatch")
+        protected_entry_count += 1
+        protected_source_shas.add(source_sha)
+        protected_payload_shas.add(image_sha)
+        if view_kind == "source":
+            protected_source_view_counts[source_sha] += 1
+        elif view_kind == "crop":
+            protected_crop_view_counts[source_sha] += 1
+    if view_kind not in {"source", "crop"}:
+        raise ValueError("near-duplicate entry view_kind mismatch")
+    if not isinstance(sample_id, str) or not sample_id:
+        raise ValueError("near-duplicate entry sample_id is invalid")
+    if view_kind == "source" and image_sha != source_sha:
+        raise ValueError("near-duplicate source-view image/source SHA mismatch")
+    for field in ("size", "width", "height"):
+        if type(entry.get(field)) is not int or entry[field] <= 0:
+            raise ValueError(f"near-duplicate entry {index} {field} is invalid")
+    phash = entry.get("phash_rot4")
+    if not isinstance(phash, list) or len(phash) != 4 or any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{16}", value) is None
+        for value in phash
+    ):
+        raise ValueError("near-duplicate entry pHash signature mismatch")
+    phash_signatures[asset_id] = tuple(int(value, 16) for value in phash)
+if candidate_entry_count != coverage["candidate_assets"]:
+    raise ValueError("near-duplicate candidate asset coverage mismatch")
+if protected_entry_count != coverage["protected_assets"]:
+    raise ValueError("near-duplicate protected asset coverage mismatch")
+if len(protected_source_shas) != coverage["protected_source_union"]:
+    raise ValueError("near-duplicate protected source union count mismatch")
+candidate_role_sources = {
+    (entry["role"], entry["source_sha256"])
+    for entry in entries if entry["cohort"] == "candidate"
+}
+if set(candidate_source_view_counts) != candidate_role_sources or any(
+    count != 1 for count in candidate_source_view_counts.values()
+):
+    raise ValueError("near-duplicate candidate source-view coverage mismatch")
+if candidate_crop_view_counts != candidate_source_view_counts:
+    raise ValueError("near-duplicate candidate crop-view coverage mismatch")
+if set(protected_source_view_counts) != protected_source_shas or any(
+    count != 1 for count in protected_source_view_counts.values()
+):
+    raise ValueError("near-duplicate protected source-view coverage mismatch")
+if set(protected_crop_view_counts) != protected_source_shas or any(
+    count != 1 for count in protected_crop_view_counts.values()
+):
+    raise ValueError("near-duplicate protected crop-view coverage mismatch")
+if near_bindings["candidate_payload_set_sha256"] != sha_bytes(
+    compact_json_value(sorted(candidate_payload_shas))
+):
+    raise ValueError("near-duplicate candidate payload-set binding mismatch")
+if near_bindings["protected_payload_set_sha256"] != sha_bytes(
+    compact_json_value(sorted(protected_payload_shas))
+):
+    raise ValueError("near-duplicate protected payload-set binding mismatch")
+if protected_source_binding["canonical_union_sha256"] != sha_bytes(
+    compact_json_value(sorted(protected_source_shas))
+):
+    raise ValueError("near-duplicate protected canonical union binding mismatch")
+
+edge_fields = {
+    "left_asset_id", "right_asset_id", "distance", "evidence", "blocking",
+}
+
+
+def phash_bucket_keys(value, threshold):
+    widths = [64 // (threshold + 1)] * (threshold + 1)
+    for index in range(64 % (threshold + 1)):
+        widths[index] += 1
+    keys = []
+    offset = 0
+    for index, width in enumerate(widths):
+        keys.append((index, (value >> offset) & ((1 << width) - 1)))
+        offset += width
+    return tuple(keys)
+
+
+def phash_distance(left, right):
+    return min((a ^ b).bit_count() for a in left for b in right)
+
+
+# Reconstruct the complete edge set from the reported signatures and exact
+# identities.  Merely checking supplied edges would let an omitted cross-role
+# edge masquerade as two harmless singleton clusters.
+expected_edges = {}
+phash_buckets = {}
+for current_id in sorted(asset_ids):
+    signature = tuple(sorted(set(phash_signatures[current_id])))
+    candidates = set()
+    for value in signature:
+        for key in phash_bucket_keys(value, algorithm["threshold"]):
+            candidates.update(phash_buckets.get(key, ()))
+    for other_id in sorted(candidates):
+        distance = phash_distance(phash_signatures[other_id], signature)
+        if distance <= algorithm["threshold"]:
+            pair = (other_id, current_id)
+            expected_edges.setdefault(pair, {"evidence": set(), "distance": distance})[
+                "evidence"
+            ].add("perceptual_hash")
+            if len(expected_edges) > algorithm["graph_edge_cap"]:
+                raise ValueError("near-duplicate audit exceeds its graph edge cap")
+    for value in signature:
+        for key in phash_bucket_keys(value, algorithm["threshold"]):
+            phash_buckets.setdefault(key, set()).add(current_id)
+
+for identity_field, evidence_name in (
+    ("image_sha256", "exact_image_sha256"),
+    ("source_sha256", "source_sha256"),
+):
+    groups = {}
+    for asset_id, entry in asset_entries.items():
+        groups.setdefault(entry[identity_field], []).append(asset_id)
+    for members in groups.values():
+        members.sort()
+        for position, left in enumerate(members):
+            for right in members[position + 1:]:
+                edge = expected_edges.setdefault(
+                    (left, right), {"evidence": set(), "distance": None}
+                )
+                if len(expected_edges) > algorithm["graph_edge_cap"]:
+                    raise ValueError("near-duplicate audit exceeds its graph edge cap")
+                edge["evidence"].add(evidence_name)
+                if evidence_name == "exact_image_sha256":
+                    edge["distance"] = 0
+
+if len(expected_edges) > algorithm["graph_edge_cap"]:
+    raise ValueError("near-duplicate audit exceeds its graph edge cap")
+for (left, right), expected in expected_edges.items():
+    if asset_entries[left]["role"] != asset_entries[right]["role"]:
+        raise ValueError("near-duplicate audit omitted a forbidden cross-role edge")
+
+edge_pairs = set()
+actual_edges = {}
+for index, edge in enumerate(edges):
+    if not isinstance(edge, dict) or set(edge) != edge_fields:
+        raise ValueError(f"near-duplicate edge {index} schema mismatch")
+    left = require_sha(edge.get("left_asset_id"), f"near-duplicate edge {index} left")
+    right = require_sha(edge.get("right_asset_id"), f"near-duplicate edge {index} right")
+    if left >= right or left not in asset_ids or right not in asset_ids:
+        raise ValueError("near-duplicate edge endpoints are invalid")
+    pair = (left, right)
+    if pair in edge_pairs:
+        raise ValueError("near-duplicate audit contains duplicate edges")
+    edge_pairs.add(pair)
+    left_entry = asset_entries[left]
+    right_entry = asset_entries[right]
+    if left_entry["role"] != right_entry["role"]:
+        raise ValueError("near-duplicate audit contains a forbidden cross-role edge")
+    require_exact_bool(edge.get("blocking"), False, "near-duplicate edge blocking")
+    evidence = edge.get("evidence")
+    if not isinstance(evidence, list) or not evidence or evidence != sorted(set(evidence)) or any(
+        value not in {"perceptual_hash", "exact_image_sha256", "source_sha256"}
+        for value in evidence
+    ):
+        raise ValueError("near-duplicate edge evidence mismatch")
+    distance = edge.get("distance")
+    if "perceptual_hash" in evidence:
+        actual_distance = min(
+            (int(left_hash, 16) ^ int(right_hash, 16)).bit_count()
+            for left_hash in left_entry["phash_rot4"]
+            for right_hash in right_entry["phash_rot4"]
+        )
+        if (
+            type(distance) is not int
+            or distance != actual_distance
+            or not 0 <= distance <= algorithm["threshold"]
+        ):
+            raise ValueError("near-duplicate perceptual distance mismatch")
+    elif distance is not None and not (
+        "exact_image_sha256" in evidence and type(distance) is int and distance == 0
+    ):
+        raise ValueError("near-duplicate non-perceptual distance mismatch")
+    if (
+        "exact_image_sha256" in evidence
+        and left_entry["image_sha256"] != right_entry["image_sha256"]
+    ):
+        raise ValueError("near-duplicate exact-image evidence is false")
+    if (
+        "source_sha256" in evidence
+        and left_entry["source_sha256"] != right_entry["source_sha256"]
+    ):
+        raise ValueError("near-duplicate source evidence is false")
+    actual_edges[pair] = {
+        "evidence": set(evidence),
+        "distance": distance,
+    }
+if set(actual_edges) != set(expected_edges):
+    raise ValueError("near-duplicate audit edge set is incomplete")
+for pair, expected in expected_edges.items():
+    if actual_edges[pair] != expected:
+        raise ValueError("near-duplicate audit edge evidence is incomplete")
+
+cluster_fields = {
+    "cluster_id", "member_asset_ids", "member_image_sha256s", "roles",
+    "cohorts", "view_kinds", "edge_count", "multi_role", "blocking",
+}
+cluster_ids = set()
+cluster_members = set()
+asset_cluster = {}
+cluster_edge_counts = {}
+derived_same_role_duplicate_clusters = 0
+for index, cluster in enumerate(clusters):
+    if not isinstance(cluster, dict) or set(cluster) != cluster_fields:
+        raise ValueError(f"near-duplicate cluster {index} schema mismatch")
+    cluster_id = require_sha(cluster.get("cluster_id"), f"near-duplicate cluster {index} ID")
+    if cluster_id in cluster_ids:
+        raise ValueError("near-duplicate audit contains duplicate cluster IDs")
+    cluster_ids.add(cluster_id)
+    members = cluster.get("member_asset_ids")
+    image_shas = cluster.get("member_image_sha256s")
+    roles = cluster.get("roles")
+    cohorts = cluster.get("cohorts")
+    view_kinds = cluster.get("view_kinds")
+    if not isinstance(members, list) or not members or members != sorted(set(members)):
+        raise ValueError("near-duplicate cluster member schema mismatch")
+    if any(member not in asset_ids or member in cluster_members for member in members):
+        raise ValueError("near-duplicate cluster members overlap or are unknown")
+    cluster_members.update(members)
+    for member in members:
+        asset_cluster[member] = cluster_id
+    if not isinstance(image_shas, list) or not image_shas or image_shas != sorted(set(image_shas)):
+        raise ValueError("near-duplicate cluster image SHA schema mismatch")
+    for image_sha in image_shas:
+        require_sha(image_sha, "near-duplicate cluster image SHA")
+    expected_cluster_id = sha_bytes(compact_json_value({
+        "algorithm_id": algorithm["id"],
+        "threshold": algorithm["threshold"],
+        "member_image_sha256s": image_shas,
+    }))
+    if cluster_id != expected_cluster_id:
+        raise ValueError("near-duplicate cluster ID is not deterministic")
+    if not isinstance(roles, list) or len(roles) != 1 or roles != sorted(set(roles)):
+        raise ValueError("near-duplicate cluster is multi-role or malformed")
+    if not isinstance(cohorts, list) or not cohorts or cohorts != sorted(set(cohorts)):
+        raise ValueError("near-duplicate cluster cohorts are malformed")
+    if not isinstance(view_kinds, list) or not view_kinds or view_kinds != sorted(set(view_kinds)):
+        raise ValueError("near-duplicate cluster views are malformed")
+    member_entries = [asset_entries[member] for member in members]
+    if roles != sorted({entry["role"] for entry in member_entries}):
+        raise ValueError("near-duplicate cluster roles differ from its members")
+    if cohorts != sorted({entry["cohort"] for entry in member_entries}):
+        raise ValueError("near-duplicate cluster cohorts differ from its members")
+    if view_kinds != sorted({entry["view_kind"] for entry in member_entries}):
+        raise ValueError("near-duplicate cluster views differ from its members")
+    if image_shas != sorted({entry["image_sha256"] for entry in member_entries}):
+        raise ValueError("near-duplicate cluster image SHAs differ from its members")
+    edge_count = cluster.get("edge_count")
+    if type(edge_count) is not int or edge_count < 0:
+        raise ValueError("near-duplicate cluster edge count is invalid")
+    if edge_count > 0:
+        derived_same_role_duplicate_clusters += 1
+    cluster_edge_counts[cluster_id] = edge_count
+    require_exact_bool(cluster.get("multi_role"), False, "near-duplicate cluster multi_role")
+    require_exact_bool(cluster.get("blocking"), False, "near-duplicate cluster blocking")
+if cluster_members != asset_ids:
+    raise ValueError("near-duplicate clusters do not partition all verified assets")
+if any(asset_cluster[left] != asset_cluster[right] for left, right in edge_pairs):
+    raise ValueError("near-duplicate edge crosses deterministic clusters")
+derived_edge_counts = Counter(asset_cluster[left] for left, _right in edge_pairs)
+if any(
+    cluster_edge_counts[cluster_id] != derived_edge_counts[cluster_id]
+    for cluster_id in cluster_ids
+):
+    raise ValueError("near-duplicate cluster edge counts mismatch")
+
+summary = near_duplicate_audit.get("summary")
+if not isinstance(summary, dict) or set(summary) != {
+    "edges", "clusters", "blocking_multi_role_clusters",
+    "same_role_duplicate_clusters_nonblocking",
+}:
+    raise ValueError("near-duplicate summary schema mismatch")
+if summary != {
+    "edges": len(edges),
+    "clusters": len(clusters),
+    "blocking_multi_role_clusters": 0,
+    "same_role_duplicate_clusters_nonblocking": derived_same_role_duplicate_clusters,
+}:
+    raise ValueError("near-duplicate summary does not match complete cluster evidence")
+
+near_duplicate_audit_bytes = compact_json(near_duplicate_audit)
+near_duplicate_audit_sha = sha_bytes(near_duplicate_audit_bytes)
+if bindings.get("candidate_near_duplicate_audit_sha256") != near_duplicate_audit_sha:
+    raise ValueError("near-duplicate audit SHA binding mismatch")
+if bindings.get("protected_sources_sha256") != protected_source_binding["file_sha256"]:
+    raise ValueError("near-duplicate protected-sources file binding mismatch")
+if bindings.get("protected_reference_inventory_sha256") != protected_inventory_binding["file_sha256"]:
+    raise ValueError("near-duplicate protected-inventory file binding mismatch")
 
 policy_fields = {
     "schema", "artifact_role", "status", "approved",
@@ -1724,6 +2225,53 @@ for row in files:
         raise ValueError(f"code inventory size mismatch: {relative}")
     if require_sha(row.get("sha256"), "code inventory file sha256") != sha_bytes(content):
         raise ValueError(f"code inventory SHA mismatch: {relative}")
+auditor_path = (code_root / "scripts/audit_v4_near_duplicate_leakage.py").resolve(strict=True)
+try:
+    auditor_path.relative_to(code_root)
+except ValueError as error:
+    raise ValueError("near-duplicate auditor escapes CODE_ROOT") from error
+if auditor_path not in inventory_paths:
+    raise ValueError("near-duplicate auditor is absent from the complete code inventory")
+auditor_content = stable_bytes(auditor_path, "near-duplicate auditor")
+if sha_bytes(auditor_content) != auditor_binding["sha256"]:
+    raise ValueError("near-duplicate auditor differs from the report/code inventory binding")
+auditor_module_name = "_v4_near_duplicate_auditor_" + auditor_binding["sha256"]
+auditor_module = types.ModuleType(auditor_module_name)
+auditor_module.__file__ = str(auditor_path)
+auditor_module.__package__ = ""
+previous_auditor_module = sys.modules.get(auditor_module_name)
+sys.modules[auditor_module_name] = auditor_module
+try:
+    auditor_code = compile(
+        auditor_content,
+        str(auditor_path),
+        "exec",
+        dont_inherit=True,
+    )
+    exec(auditor_code, auditor_module.__dict__)
+    runtime_fingerprint_function = auditor_module.__dict__.get(
+        "runtime_code_fingerprint_sha256"
+    )
+    if not callable(runtime_fingerprint_function):
+        raise ValueError(
+            "near-duplicate auditor runtime fingerprint function is absent"
+        )
+    actual_auditor_runtime_code_sha = runtime_fingerprint_function()
+finally:
+    if previous_auditor_module is None:
+        sys.modules.pop(auditor_module_name, None)
+    else:
+        sys.modules[auditor_module_name] = previous_auditor_module
+require_sha(
+    actual_auditor_runtime_code_sha,
+    "actual near-duplicate auditor runtime code SHA",
+)
+if actual_auditor_runtime_code_sha != auditor_binding["runtime_code_sha256"]:
+    raise ValueError(
+        "near-duplicate auditor executed-code fingerprint differs from the report"
+    )
+if sha_bytes(stable_bytes(auditor_path, "near-duplicate auditor final rehash")) != auditor_binding["sha256"]:
+    raise ValueError("near-duplicate auditor changed during runtime validation")
 actual_code_paths = {
     path.resolve()
     for path in code_root.rglob("*")
@@ -2515,6 +3063,7 @@ for origin, weight in origin_weights.items():
 manifest_rows = {}
 manifest_payload_files = {}
 dataset_content_inventory = []
+manifest_audit_rows = set()
 snapshot_samples_seen = set()
 train_origin_counts = Counter()
 selected_by_role = Counter()
@@ -2670,6 +3219,12 @@ for role, path in manifest_paths.items():
         sample_id = str(row.get("sample_id", ""))
         if not sample_id:
             raise ValueError(f"empty sample_id at {path}:{number}")
+        manifest_audit_rows.add((
+            role,
+            sample_id,
+            str(row["source_sha256"]),
+            str(row["image_sha256"]),
+        ))
         snapshot_entry = snapshot_by_sample.get(sample_id)
         if (
             not isinstance(snapshot_entry, dict)
@@ -2699,6 +3254,10 @@ for role, path in manifest_paths.items():
 
 if snapshot_samples_seen != set(snapshot_by_sample):
     raise ValueError("manifest rows do not consume the exact dataset snapshot object set")
+if manifest_audit_rows != candidate_audit_manifest_rows:
+    raise ValueError(
+        "near-duplicate candidate crop entries differ from the exact manifest rows"
+    )
 
 derived_candidate_counts = {
     "selected_by_role": dict(sorted(selected_by_role.items())),
@@ -2835,6 +3394,8 @@ payload = {
     "candidate_dataset_snapshot_runtime": dataset_snapshot_runtime_contract,
     "dataset_consumption_contract": dataset_consumption_contract,
     "dataset_consumption_contract_sha256": dataset_consumption_contract_sha,
+    "near_duplicate_audit": near_duplicate_audit,
+    "near_duplicate_audit_sha256": near_duplicate_audit_sha,
     "manifests": [
         {
             "role": role,
@@ -4266,6 +4827,31 @@ if (
     != preflight_value.get("trainer_sha256")
 ):
     raise ValueError("candidate dataset consumption bindings differ before ready")
+near_duplicate_audit = preflight_value.get("near_duplicate_audit")
+if not isinstance(near_duplicate_audit, dict):
+    raise ValueError("near-duplicate audit is missing before ready")
+near_duplicate_audit_sha = digest(
+    (json.dumps(
+        near_duplicate_audit, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ) + "\n").encode("utf-8")
+)
+if preflight_value.get("near_duplicate_audit_sha256") != near_duplicate_audit_sha:
+    raise ValueError("near-duplicate audit SHA mismatch before ready")
+if (
+    near_duplicate_audit.get("schema") != "v4_near_duplicate_leakage_audit.v1"
+    or near_duplicate_audit.get("status") != "passed"
+    or near_duplicate_audit.get("ok") is not True
+    or near_duplicate_audit.get("summary", {}).get("blocking_multi_role_clusters") != 0
+):
+    raise ValueError("near-duplicate audit lost its passing contract before ready")
+near_duplicate_bindings = near_duplicate_audit.get("bindings")
+if not isinstance(near_duplicate_bindings, dict):
+    raise ValueError("near-duplicate audit bindings are missing before ready")
+near_protected_sources = near_duplicate_bindings.get("protected_sources")
+near_protected_inventory = near_duplicate_bindings.get("protected_inventory")
+if not isinstance(near_protected_sources, dict) or not isinstance(near_protected_inventory, dict):
+    raise ValueError("near-duplicate protected bindings are missing before ready")
 inventory_value = json.loads(bound_bytes[inventory.resolve()].decode("utf-8"))
 if set(inventory_value) != {
     "schema", "status", "candidate_only", "candidate_promotion_authorized",
@@ -4366,6 +4952,9 @@ payload = {
         "manifest_payload_set_sha256": dataset_consumption_contract[
             "manifest_payload_set_sha256"
         ],
+        "candidate_near_duplicate_audit_sha256": near_duplicate_audit_sha,
+        "protected_sources_sha256": near_protected_sources["file_sha256"],
+        "protected_reference_inventory_sha256": near_protected_inventory["file_sha256"],
     },
 }
 temporary = ready.with_name(f".{ready.name}.{os.getpid()}.tmp")
