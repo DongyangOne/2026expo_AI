@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-AUTHORITY_SCHEMA = "v4_candidate_training_authority.v1"
+AUTHORITY_SCHEMA = "v4_candidate_training_authority.v2"
 AUTHORITY_ROLE = "v4_candidate_training_input_authority_not_blind_or_deployment"
 AUTHORITY_STATUS = "candidate_training_inputs_ready"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -93,6 +93,7 @@ CONFIG_FIELDS = {
     "weight_decay", "scheduler", "sampling_mode",
     "scheduler_t_max", "scheduler_eta_min",
     "sampling_samples_per_epoch", "sampling_expected_fraction_by_origin",
+    "image_consumption_contract_version", "image_max_bytes", "image_max_pixels",
 }
 REQUIRED_CONTAINER_ENV = {
     "RUN_ROOT", "RUN_DIR", "GLOBAL_ROOT", "CODE_ROOT", "AUTHORITY_JSON",
@@ -116,6 +117,7 @@ POLICY_BINDING_FIELDS = {
     "container_image_id", "candidate_train_manifest_sha256",
     "candidate_model_validation_manifest_sha256",
     "candidate_dataset_snapshot_sha256",
+    "candidate_dataset_consumption_contract_sha256",
 }
 TRUST_ROOT_CODE_PATHS = {
     "configs/v4_candidate_training_trusted_policy.json",
@@ -139,11 +141,45 @@ ALLOWED_QNAP_LIBRARY_MOUNTS = {
 }
 QNAP_LIBRARY_INVENTORY_SCHEMA = "v4_qnap_library_inventory.v1"
 QNAP_LIBRARY_SNAPSHOT_MAX_BYTES = 3221225472
-DATASET_SNAPSHOT_SCHEMA = "v4_candidate_dataset_snapshot.v1"
+DATASET_SNAPSHOT_SCHEMA = "v4_candidate_dataset_snapshot.v2"
 DATASET_SNAPSHOT_ROLE = (
     "candidate_training_crop_bytes_not_blind_or_deployment_authority"
 )
 DATASET_SNAPSHOT_MAX_BYTES = 68719476736
+IMAGE_CONSUMPTION_CONTRACT_VERSION = "multitask_verifier.image_consumption.v1"
+IMAGE_CONSUMPTION_MAX_BYTES = 67108864
+IMAGE_CONSUMPTION_MAX_PIXELS = 16777216
+DATASET_CONSUMPTION_CONTRACT_SCHEMA = "v4_candidate_dataset_consumption.v1"
+
+
+def _dataset_consumption_contract(
+    *,
+    trainer_sha256: str,
+    snapshot_report_sha256: str,
+    snapshot_tree_sha256: str,
+    manifest_payload_set_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema": DATASET_CONSUMPTION_CONTRACT_SCHEMA,
+        "version": IMAGE_CONSUMPTION_CONTRACT_VERSION,
+        "evidence_scope": "per_access_fail_closed_no_complete_access_receipt",
+        "authority_platform": "linux_qnap",
+        "read_semantics": "single_descriptor_fstat_sha256_then_bytesio_decode",
+        "trainer_path": "scripts/train_multitask_verifier.py",
+        "trainer_sha256": _require_sha256(trainer_sha256, "consumption trainer SHA"),
+        "dataset_snapshot_report_sha256": _require_sha256(
+            snapshot_report_sha256, "consumption snapshot report SHA"
+        ),
+        "dataset_snapshot_tree_sha256": _require_sha256(
+            snapshot_tree_sha256, "consumption snapshot tree SHA"
+        ),
+        "manifest_payload_set_sha256": _require_sha256(
+            manifest_payload_set_sha256, "consumption manifest payload-set SHA"
+        ),
+        "max_image_bytes": IMAGE_CONSUMPTION_MAX_BYTES,
+        "max_image_pixels": IMAGE_CONSUMPTION_MAX_PIXELS,
+        "complete_access_receipt": False,
+    }
 
 
 def _reject_duplicate_keys(items: list[tuple[str, object]]) -> dict[str, object]:
@@ -374,6 +410,10 @@ def _dataset_snapshot_report(
             raise ValueError(f"dataset snapshot plan row {index} path mismatch")
         if type(size) is not int or size <= 0:
             raise ValueError(f"dataset snapshot plan row {index} size mismatch")
+        if size > IMAGE_CONSUMPTION_MAX_BYTES:
+            raise ValueError(
+                f"dataset snapshot plan row {index} exceeds image_max_bytes"
+            )
         if sample_id in seen_samples:
             raise ValueError("duplicate dataset snapshot sample_id")
         if relative in seen_paths:
@@ -400,6 +440,7 @@ def _dataset_snapshot_report(
         {"path": row["path"], "size": row["size"], "sha256": row["sha256"]}
         for row in sorted(normalized, key=lambda row: str(row["path"]))
     ]
+    payload_set_sha256 = _sha256_bytes(_canonical_compact_json(normalized))
     report: dict[str, object] = {
         "schema": DATASET_SNAPSHOT_SCHEMA,
         "artifact_role": DATASET_SNAPSHOT_ROLE,
@@ -410,9 +451,11 @@ def _dataset_snapshot_report(
         "source_lineage_bytes_snapshotted": False,
         "snapshot_root_relative": "dataset_snapshot",
         "snapshot_max_bytes": DATASET_SNAPSHOT_MAX_BYTES,
+        "object_max_bytes": IMAGE_CONSUMPTION_MAX_BYTES,
         "object_count": len(normalized),
         "total_regular_bytes": total,
         "tree_sha256": _sha256_bytes(_canonical_compact_json(tree_rows)),
+        "payload_set_sha256": payload_set_sha256,
         "objects": normalized,
     }
     return report, _canonical_json(report)
@@ -473,6 +516,11 @@ def _dataset_snapshot_tree_contract(
 ) -> dict[str, object]:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("dataset snapshot root must be a non-symlink directory")
+    if (
+        report.get("schema") != DATASET_SNAPSHOT_SCHEMA
+        or report.get("object_max_bytes") != IMAGE_CONSUMPTION_MAX_BYTES
+    ):
+        raise ValueError("dataset snapshot report consumption contract mismatch")
     objects = report.get("objects")
     if type(objects) is not list:
         raise ValueError("dataset snapshot report objects must be a list")
@@ -529,6 +577,8 @@ def _dataset_snapshot_tree_contract(
         )
         if current["size"] != raw.get("size") or current["mode"] != 0o444:
             raise ValueError("dataset snapshot object size/mode mismatch")
+        if int(current["size"]) > IMAGE_CONSUMPTION_MAX_BYTES:
+            raise ValueError("dataset snapshot object exceeds image_max_bytes")
         relative = path.relative_to(root).as_posix()
         total += int(current["size"])
         rows.append({
@@ -548,6 +598,22 @@ def _dataset_snapshot_tree_contract(
     ]
     if _sha256_bytes(_canonical_compact_json(tree_rows)) != report.get("tree_sha256"):
         raise ValueError("dataset snapshot tree SHA mismatch")
+    payload_rows = [
+        {
+            "sample_id": raw["sample_id"],
+            "role": raw["role"],
+            "path": raw["path"],
+            "size": raw["size"],
+            "sha256": raw["sha256"],
+        }
+        for raw in sorted(
+            expected.values(), key=lambda value: (str(value["role"]), str(value["sample_id"]))
+        )
+    ]
+    if _sha256_bytes(_canonical_compact_json(payload_rows)) != report.get(
+        "payload_set_sha256"
+    ):
+        raise ValueError("dataset snapshot payload-set SHA mismatch")
     return {
         "schema": "v4_candidate_dataset_snapshot_publish_receipt.v1",
         "snapshot_root": logical_root.as_posix(),
@@ -913,7 +979,7 @@ def _validate_protected_sources(value: Mapping[str, object]) -> set[str]:
 
 
 def _validate_training_config(value: Mapping[str, object]) -> None:
-    if set(value) != CONFIG_FIELDS or value.get("schema") != "v4_candidate_training_config.v1":
+    if set(value) != CONFIG_FIELDS or value.get("schema") != "v4_candidate_training_config.v2":
         raise ValueError("training config fields/schema mismatch")
     if value.get("backbone") != "mobilenet_v3_small":
         raise ValueError("training backbone must be mobilenet_v3_small")
@@ -929,6 +995,14 @@ def _validate_training_config(value: Mapping[str, object]) -> None:
         raise ValueError("training workers must be a non-negative integer")
     if type(value.get("seed")) is not int or value["seed"] < 0:
         raise ValueError("training seed must be a non-negative integer")
+    if value.get("image_consumption_contract_version") != (
+        IMAGE_CONSUMPTION_CONTRACT_VERSION
+    ):
+        raise ValueError("training image consumption contract version mismatch")
+    if value.get("image_max_bytes") != IMAGE_CONSUMPTION_MAX_BYTES:
+        raise ValueError("training image_max_bytes mismatch")
+    if value.get("image_max_pixels") != IMAGE_CONSUMPTION_MAX_PIXELS:
+        raise ValueError("training image_max_pixels mismatch")
     for field in (
         "lr", "backbone_lr", "head_lr", "objectness_weight",
         "material_weight", "condition_weight",
@@ -1706,6 +1780,19 @@ def build_training_authority(
     protected = _validate_protected_sources(protected_value)
     _validate_training_config(config_value)
     _validate_code_inventory(inventory_value)
+    inventory_files = inventory_value.get("files")
+    assert type(inventory_files) is list
+    trainer_inventory_rows = [
+        row
+        for row in inventory_files
+        if type(row) is dict
+        and row.get("path") == "scripts/train_multitask_verifier.py"
+    ]
+    if len(trainer_inventory_rows) != 1:
+        raise ValueError("code inventory must contain exactly one candidate trainer")
+    trainer_sha256 = _require_sha256(
+        trainer_inventory_rows[0].get("sha256"), "code inventory trainer SHA"
+    )
     raw_inspect_path, raw_inspect_content = _validate_host_contract(
         host_value, container_image_id
     )
@@ -2016,6 +2103,17 @@ def build_training_authority(
     dataset_snapshot_value, dataset_snapshot_content = _dataset_snapshot_report(
         dataset_snapshot_plan
     )
+    dataset_consumption_contract = _dataset_consumption_contract(
+        trainer_sha256=trainer_sha256,
+        snapshot_report_sha256=_sha256_bytes(dataset_snapshot_content),
+        snapshot_tree_sha256=str(dataset_snapshot_value["tree_sha256"]),
+        manifest_payload_set_sha256=str(
+            dataset_snapshot_value["payload_set_sha256"]
+        ),
+    )
+    dataset_consumption_contract_sha = _sha256_bytes(
+        _canonical_json(dataset_consumption_contract)
+    )
     dataset_content_inventory_sha = _sha256_bytes(
         _canonical_json(dataset_content_inventory)
     )
@@ -2028,6 +2126,9 @@ def build_training_authority(
         ),
         "candidate_dataset_snapshot_sha256": _sha256_bytes(
             dataset_snapshot_content
+        ),
+        "candidate_dataset_consumption_contract_sha256": (
+            dataset_consumption_contract_sha
         ),
     })
     candidate_counts: dict[str, object] = {
@@ -2163,6 +2264,7 @@ def build_training_authority(
             "trust_root": trust_root_evidence,
             "dataset_content_inventory": dataset_content_inventory,
             "dataset_snapshot_publish_receipt": snapshot_publish_receipt,
+            "dataset_consumption_contract": dataset_consumption_contract,
             "counts": candidate_counts,
             "bindings": {
                 "source_manifest_sha256": manifest_shas,
@@ -2171,6 +2273,9 @@ def build_training_authority(
                 "dataset_content_inventory_sha256": dataset_content_inventory_sha,
                 "dataset_snapshot_publish_receipt_sha256": (
                     snapshot_publish_receipt_sha
+                ),
+                "dataset_consumption_contract_sha256": (
+                    dataset_consumption_contract_sha
                 ),
                 **policy_bindings,
             },

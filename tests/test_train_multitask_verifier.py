@@ -1,6 +1,8 @@
 import csv
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -174,6 +176,204 @@ def test_strict_manifest_preserves_lineage_and_rejects_group_leakage(tmp_path):
     _write_manifest(manifest, raw_rows)
     with pytest.raises(ValueError, match=r"object_group.*crosses train/validation"):
         trainer.read_manifests([manifest])
+
+
+def test_dataset_decodes_only_the_single_descriptor_verified_bytes(tmp_path, monkeypatch):
+    manifest, _ = _complete_manifest(tmp_path)
+    row = trainer.read_manifests([manifest])[0]
+    opened_inputs = []
+    original_open = trainer.Image.open
+
+    def tracked_open(source, *args, **kwargs):
+        opened_inputs.append(source)
+        return original_open(source, *args, **kwargs)
+
+    monkeypatch.setattr(trainer.Image, "open", tracked_open)
+    result = trainer.VerifierDataset(
+        [row], transform=lambda _image: torch.zeros(3, 16, 16)
+    )[0]
+
+    assert result["sample_id"] == row.sample_id
+    assert len(opened_inputs) == 1
+    assert isinstance(opened_inputs[0], io.BytesIO)
+
+
+def test_dataset_rejects_mutated_or_identical_content_replaced_image(tmp_path):
+    manifest, _ = _complete_manifest(tmp_path)
+    parsed = trainer.read_manifests([manifest])
+    transform = lambda _image: torch.zeros(3, 16, 16)
+
+    mutated = parsed[0]
+    payload = bytearray(mutated.path.read_bytes())
+    payload[len(payload) // 2] ^= 1
+    mutated.path.write_bytes(payload)
+    with pytest.raises(ValueError, match="identity changed|image_sha256"):
+        trainer.VerifierDataset([mutated], transform=transform)[0]
+
+    replaced = parsed[1]
+    replacement = replaced.path.with_suffix(".replacement")
+    replacement.write_bytes(replaced.path.read_bytes())
+    replacement.replace(replaced.path)
+    with pytest.raises(ValueError, match="identity changed"):
+        trainer.VerifierDataset([replaced], transform=transform)[0]
+
+
+def test_manifest_rejects_hardlinked_or_symlinked_image_payload(tmp_path):
+    manifest, raw_rows = _complete_manifest(tmp_path)
+    first_path = manifest.parent / str(raw_rows[0]["filepath"])
+    hardlink = tmp_path / "hardlink.png"
+    os.link(first_path, hardlink)
+    with pytest.raises(ValueError, match="exactly one hard link"):
+        trainer.read_manifests([manifest])
+
+    hardlink.unlink()
+    target = first_path.with_suffix(".target.png")
+    first_path.replace(target)
+    try:
+        os.symlink(target, first_path)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable on this host")
+    with pytest.raises(ValueError, match="contains a symlink"):
+        trainer.read_manifests([manifest])
+
+
+def test_image_consumption_rejects_byte_and_pixel_caps(tmp_path, monkeypatch):
+    manifest, _ = _complete_manifest(tmp_path)
+    first_size = next((tmp_path / "images").rglob("*.png")).stat().st_size
+    monkeypatch.setattr(trainer, "IMAGE_CONSUMPTION_MAX_BYTES", first_size - 1)
+    with pytest.raises(ValueError, match="payload size"):
+        trainer.read_manifests([manifest])
+
+    monkeypatch.setattr(trainer, "IMAGE_CONSUMPTION_MAX_BYTES", 64 * 1024 * 1024)
+    row = trainer.read_manifests([manifest])[0]
+    monkeypatch.setattr(trainer, "IMAGE_CONSUMPTION_MAX_PIXELS", 255)
+    with pytest.raises(ValueError, match="pixel cap"):
+        trainer.VerifierDataset(
+            [row], transform=lambda _image: torch.zeros(3, 16, 16)
+        )[0]
+
+
+def test_image_consumption_rejects_partial_read_and_path_swap(tmp_path, monkeypatch):
+    image_path = tmp_path / "image.png"
+    _write_image(image_path, 7)
+    expected_sha = hashlib.sha256(image_path.read_bytes()).hexdigest()
+    real_read = os.read
+    calls = 0
+
+    def partial_read(descriptor, count):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return b""
+        return real_read(descriptor, min(count, 8))
+
+    monkeypatch.setattr(trainer, "IMAGE_CONSUMPTION_READ_BYTES", 8)
+    monkeypatch.setattr(trainer.os, "read", partial_read)
+    with pytest.raises(ValueError, match="partial"):
+        trainer._verified_image_stream(
+            image_path,
+            manifest_root=tmp_path,
+            expected_sha256=expected_sha,
+        )
+
+    monkeypatch.setattr(trainer.os, "read", real_read)
+    real_open = os.open
+    parked = tmp_path / "parked.png"
+    replacement = tmp_path / "replacement.png"
+    replacement.write_bytes(image_path.read_bytes())
+
+    def swap_after_open(path, flags):
+        descriptor = real_open(path, flags)
+        image_path.replace(parked)
+        replacement.replace(image_path)
+        return descriptor
+
+    monkeypatch.setattr(trainer.os, "open", swap_after_open)
+    with pytest.raises(ValueError, match="secure open failed|path chain changed"):
+        trainer._verified_image_stream(
+            image_path,
+            manifest_root=tmp_path,
+            expected_sha256=expected_sha,
+        )
+
+
+def test_image_consumption_accepts_normal_short_reads(tmp_path, monkeypatch):
+    image_path = tmp_path / "short-read.bin"
+    payload = b"approved-image-payload" * 4
+    image_path.write_bytes(payload)
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    real_read = os.read
+
+    monkeypatch.setattr(
+        trainer.os,
+        "read",
+        lambda descriptor, count: real_read(descriptor, min(count, 3)),
+    )
+    stream, size, _identity = trainer._verified_image_stream(
+        image_path,
+        manifest_root=tmp_path,
+        expected_sha256=expected_sha,
+    )
+    with stream:
+        assert size == len(payload)
+        assert stream.read() == payload
+
+
+@pytest.mark.skipif(os.name != "posix", reason="QNAP/POSIX race semantics")
+def test_posix_consumption_rejects_poison_then_restore(tmp_path, monkeypatch):
+    image_path = tmp_path / "poison-restore.bin"
+    approved = b"A" * 64
+    poisoned = b"B" * 64
+    image_path.write_bytes(approved)
+    expected_sha = hashlib.sha256(approved).hexdigest()
+    real_read = os.read
+    calls = 0
+
+    def poison_then_restore(descriptor, count):
+        nonlocal calls
+        calls += 1
+        chunk = real_read(descriptor, min(count, 8))
+        if calls == 1:
+            image_path.write_bytes(poisoned)
+        elif calls == 2:
+            image_path.write_bytes(approved)
+        return chunk
+
+    monkeypatch.setattr(trainer, "IMAGE_CONSUMPTION_READ_BYTES", 8)
+    monkeypatch.setattr(trainer.os, "read", poison_then_restore)
+    with pytest.raises(ValueError, match="identity changed|image_sha256"):
+        trainer._verified_image_stream(
+            image_path,
+            manifest_root=tmp_path,
+            expected_sha256=expected_sha,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="QNAP/POSIX special-file semantics")
+def test_posix_consumption_rejects_ancestor_symlink_and_fifo(tmp_path):
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    image_path = actual / "image.bin"
+    image_path.write_bytes(b"approved")
+    linked = tmp_path / "linked"
+    os.symlink(actual, linked, target_is_directory=True)
+    expected_sha = hashlib.sha256(image_path.read_bytes()).hexdigest()
+
+    with pytest.raises(ValueError, match="contains a symlink"):
+        trainer._verified_image_stream(
+            linked / image_path.name,
+            manifest_root=tmp_path,
+            expected_sha256=expected_sha,
+        )
+
+    fifo = tmp_path / "payload.fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="regular file"):
+        trainer._verified_image_stream(
+            fifo,
+            manifest_root=tmp_path,
+            expected_sha256=expected_sha,
+        )
 
 
 @pytest.mark.parametrize(
@@ -416,6 +616,33 @@ def test_weighted_loader_is_seeded_and_validation_loader_is_unweighted():
     )
     assert isinstance(validation_loader.sampler, torch.utils.data.SequentialSampler)
     assert list(validation_loader.sampler) == list(range(len(rows)))
+
+
+def test_multiworker_loader_uses_spawn_and_consumes_verified_rows(tmp_path):
+    manifest, _ = _complete_manifest(tmp_path)
+    rows = [
+        row
+        for row in trainer.read_manifests([manifest])
+        if row.role == trainer.TRAIN_ROLE
+    ][:4]
+    _, transform = trainer._build_transforms(16, smoke=True)
+    loader = trainer._make_loader(
+        rows,
+        transform,
+        batch_size=2,
+        workers=2,
+        shuffle=False,
+        seed=23,
+        pin_memory=False,
+    )
+
+    assert loader.multiprocessing_context.get_start_method() == "spawn"
+    observed = [
+        sample_id
+        for batch in loader
+        for sample_id in batch["sample_id"]
+    ]
+    assert observed == [row.sample_id for row in rows]
 
 
 def test_condition_heads_use_current_minus_one_zero_one_labels(tmp_path):
@@ -675,6 +902,16 @@ def test_dry_run_validates_without_creating_training_artifacts(
     assert payload["mode"] == "dry-run"
     assert payload["manifest"]["rows"] == 20
     assert payload["output_contract"]["output_order"] == ["objectness", "material"]
+    contract = payload["dataset_consumption_contract"]
+    assert contract["schema"] == "v4_candidate_dataset_consumption.v1"
+    assert contract["authority_platform"] == "unbound_local_validation"
+    assert contract["manifest_payload_set_sha256"] == payload["manifest"][
+        "payload_set_sha256"
+    ]
+    assert contract["complete_access_receipt"] is False
+    assert contract["trainer_sha256"] == hashlib.sha256(
+        Path(trainer.__file__).read_bytes()
+    ).hexdigest()
     assert not absent_output.exists()
 
 
@@ -729,5 +966,12 @@ def test_cpu_smoke_writes_loadable_v3_checkpoint_and_metadata(tmp_path, monkeypa
     assert metadata["candidate_only"] is True
     assert metadata["production_runtime_modified"] is False
     assert metadata["output_contract"]["output_order"] == ["objectness", "material"]
+    assert checkpoint["dataset_consumption_contract"] == metadata[
+        "dataset_consumption_contract"
+    ]
+    assert metadata["dataset_consumption_contract"]["manifest_payload_set_sha256"] == (
+        metadata["manifest_summary"]["payload_set_sha256"]
+    )
+    assert metadata["dataset_consumption_contract"]["complete_access_receipt"] is False
     assert metadata["onnx"] is None
     assert not (output_dir / trainer.ONNX_NAME).exists()

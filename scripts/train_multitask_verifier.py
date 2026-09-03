@@ -26,6 +26,8 @@ import json
 import math
 import os
 import random
+import stat
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,6 +75,10 @@ CONDITION_CLASS_NAMES = {
     "foreign_material": ("no_foreign_material", "has_foreign_material"),
 }
 OUTPUT_CONTRACT_VERSION = "multitask_verifier.v3"
+IMAGE_CONSUMPTION_CONTRACT_VERSION = "multitask_verifier.image_consumption.v1"
+IMAGE_CONSUMPTION_MAX_BYTES = 64 * 1024 * 1024
+IMAGE_CONSUMPTION_MAX_PIXELS = 16 * 1024 * 1024
+IMAGE_CONSUMPTION_READ_BYTES = 1024 * 1024
 TRAIN_ROLE = "train"
 VALIDATION_ROLE = "model_validation"
 TRAINING_ROLES = (TRAIN_ROLE, VALIDATION_ROLE)
@@ -114,12 +120,188 @@ METADATA_NAME = "multitask_verifier_metadata.json"
 ONNX_NAME = "multitask_verifier.onnx"
 
 
+def build_image_consumption_contract(
+    *,
+    trainer_sha256: str,
+    dataset_snapshot_report_sha256: str | None,
+    dataset_snapshot_tree_sha256: str | None,
+    manifest_payload_set_sha256: str,
+) -> dict[str, Any]:
+    """Return the exact per-access image-byte contract bound into artifacts."""
+
+    if not _is_sha256(trainer_sha256):
+        raise ValueError("trainer SHA must be lowercase SHA-256")
+    authority_values = (
+        dataset_snapshot_report_sha256,
+        dataset_snapshot_tree_sha256,
+    )
+    if any(value is None for value in authority_values) and not all(
+        value is None for value in authority_values
+    ):
+        raise ValueError("dataset authority SHA values must be supplied together")
+    for name, value in (
+        ("dataset snapshot report", dataset_snapshot_report_sha256),
+        ("dataset snapshot tree", dataset_snapshot_tree_sha256),
+    ):
+        if value is not None and not _is_sha256(value):
+            raise ValueError(f"{name} SHA must be lowercase SHA-256")
+    if not _is_sha256(manifest_payload_set_sha256):
+        raise ValueError("manifest payload-set SHA must be lowercase SHA-256")
+    return {
+        "schema": "v4_candidate_dataset_consumption.v1",
+        "version": IMAGE_CONSUMPTION_CONTRACT_VERSION,
+        "evidence_scope": "per_access_fail_closed_no_complete_access_receipt",
+        "authority_platform": (
+            "linux_qnap"
+            if dataset_snapshot_report_sha256 is not None
+            else "unbound_local_validation"
+        ),
+        "read_semantics": "single_descriptor_fstat_sha256_then_bytesio_decode",
+        "trainer_path": "scripts/train_multitask_verifier.py",
+        "trainer_sha256": trainer_sha256,
+        "dataset_snapshot_report_sha256": dataset_snapshot_report_sha256,
+        "dataset_snapshot_tree_sha256": dataset_snapshot_tree_sha256,
+        "manifest_payload_set_sha256": manifest_payload_set_sha256,
+        "max_image_bytes": IMAGE_CONSUMPTION_MAX_BYTES,
+        "max_image_pixels": IMAGE_CONSUMPTION_MAX_PIXELS,
+        "complete_access_receipt": False,
+    }
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mode),
+        int(value.st_nlink),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns) if os.name != "nt" else 0,
+    )
+
+
+def _lstat_image_chain(root: Path, path: Path) -> list[tuple[Path, tuple[int, ...]]]:
+    lexical_root = Path(os.path.abspath(root))
+    lexical_path = Path(os.path.abspath(path))
+    try:
+        relative = lexical_path.relative_to(lexical_root)
+    except ValueError as exc:
+        raise ValueError(f"image path escapes its manifest directory: {lexical_path}") from exc
+    if not relative.parts:
+        raise ValueError("image path must be a file beneath its manifest directory")
+    result: list[tuple[Path, tuple[int, ...]]] = []
+    current = lexical_root
+    components = (
+        lexical_root,
+        *(
+            lexical_root / Path(*relative.parts[:index])
+            for index in range(1, len(relative.parts) + 1)
+        ),
+    )
+    for index, current in enumerate(components):
+        try:
+            current_stat = os.lstat(current)
+        except OSError as exc:
+            raise ValueError(f"image path component cannot be inspected: {current}") from exc
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ValueError(f"image path contains a symlink: {current}")
+        is_leaf = index == len(components) - 1
+        if is_leaf:
+            if not stat.S_ISREG(current_stat.st_mode):
+                raise ValueError(f"image payload must be a regular file: {current}")
+            if current_stat.st_nlink != 1:
+                raise ValueError(f"image payload must have exactly one hard link: {current}")
+        elif not stat.S_ISDIR(current_stat.st_mode):
+            raise ValueError(f"image path ancestor must be a directory: {current}")
+        result.append((current, _stat_identity(current_stat)))
+    return result
+
+
+def _verified_image_stream(
+    path: Path,
+    *,
+    manifest_root: Path,
+    expected_sha256: str,
+    expected_size: int | None = None,
+    expected_identity: tuple[int, ...] | None = None,
+) -> tuple[io.BytesIO, int, tuple[int, ...]]:
+    """Read, hash, and return exactly the descriptor bytes later given to PIL."""
+
+    if not _is_sha256(expected_sha256):
+        raise ValueError("expected image SHA must be lowercase SHA-256")
+    lexical_path = Path(os.path.abspath(path))
+    before_chain = _lstat_image_chain(manifest_root, lexical_path)
+    leaf_identity = before_chain[-1][1]
+    if expected_identity is not None and leaf_identity != expected_identity:
+        raise ValueError("image payload identity changed after manifest validation")
+    leaf_size = leaf_identity[4]
+    if leaf_size <= 0 or leaf_size > IMAGE_CONSUMPTION_MAX_BYTES:
+        raise ValueError(
+            f"image payload size must be in 1..{IMAGE_CONSUMPTION_MAX_BYTES} bytes"
+        )
+    if expected_size is not None and leaf_size != expected_size:
+        raise ValueError("image payload size changed after manifest validation")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    if os.name == "posix":
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        if no_follow is None:
+            raise RuntimeError("POSIX image consumption requires O_NOFOLLOW")
+        flags |= no_follow | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(lexical_path, flags)
+    except OSError as exc:
+        raise ValueError(f"image payload secure open failed: {lexical_path}") from exc
+
+    stream = io.BytesIO()
+    try:
+        opened_before = os.fstat(descriptor)
+        if _stat_identity(opened_before) != leaf_identity:
+            raise ValueError("image path identity changed during secure open")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            try:
+                chunk = os.read(descriptor, IMAGE_CONSUMPTION_READ_BYTES)
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > IMAGE_CONSUMPTION_MAX_BYTES:
+                raise ValueError("image payload exceeds the per-object byte cap")
+            digest.update(chunk)
+            stream.write(chunk)
+        opened_after = os.fstat(descriptor)
+        if _stat_identity(opened_after) != leaf_identity:
+            raise ValueError("image payload identity changed while being consumed")
+    except Exception:
+        stream.close()
+        raise
+    finally:
+        os.close(descriptor)
+
+    try:
+        after_chain = _lstat_image_chain(manifest_root, lexical_path)
+        if after_chain != before_chain:
+            raise ValueError("image path chain changed while being consumed")
+        if total != leaf_size:
+            raise ValueError("image payload read was partial")
+        if digest.hexdigest() != expected_sha256:
+            raise ValueError("image_sha256 does not match consumed image bytes")
+        stream.seek(0)
+        return stream, total, leaf_identity
+    except Exception:
+        stream.close()
+        raise
 
 
 def _is_sha256(value: str) -> bool:
@@ -181,6 +363,8 @@ class ManifestRow:
     role: str
     fold: str
     image_sha256: str
+    image_size_bytes: int
+    image_identity: tuple[int, ...] = field(repr=False)
     manifest_split: str
     source_id: str
     source_object_count: int
@@ -302,9 +486,7 @@ def _parse_manifest_row(
     image_path = Path(raw_path)
     if not image_path.is_absolute():
         image_path = manifest_path.parent / image_path
-    image_path = image_path.resolve()
-    if not image_path.is_file():
-        raise FileNotFoundError(f"{location}: image does not exist: {image_path}")
+    image_path = Path(os.path.abspath(image_path))
 
     material = _parse_integer_label(raw, "material", location, required=True)
     if material not in range(len(MATERIAL_CLASS_NAMES) + 1):
@@ -372,14 +554,17 @@ def _parse_manifest_row(
         if value not in {-1, 0, 1}:
             raise ValueError(f"{location}: {name}={value} must be -1, 0, or 1")
 
-    actual_image_sha256 = _sha256_file(image_path)
     declared_image_sha256 = _nonempty(raw, "image_sha256", location)
     if not _is_sha256(declared_image_sha256):
         raise ValueError(
             f"{location}: image_sha256 must be 64 lowercase hexadecimal characters"
         )
-    if declared_image_sha256.lower() != actual_image_sha256:
-        raise ValueError(f"{location}: image_sha256 does not match image content")
+    verified_stream, image_size_bytes, image_identity = _verified_image_stream(
+        image_path,
+        manifest_root=manifest_path.parent,
+        expected_sha256=declared_image_sha256,
+    )
+    verified_stream.close()
 
     return ManifestRow(
         path=image_path,
@@ -391,6 +576,8 @@ def _parse_manifest_row(
         role=role,
         fold=fold,
         image_sha256=declared_image_sha256,
+        image_size_bytes=image_size_bytes,
+        image_identity=image_identity,
         manifest_split=split,
         source_id=source_id,
         source_object_count=source_object_count,
@@ -624,8 +811,30 @@ class VerifierDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[index]
-        with Image.open(row.path) as image:
-            tensor = self.transform(image.convert("RGB"))
+        stream, _, _ = _verified_image_stream(
+            row.path,
+            manifest_root=row.manifest_path.parent,
+            expected_sha256=row.image_sha256,
+            expected_size=row.image_size_bytes,
+            expected_identity=row.image_identity,
+        )
+        with stream:
+            with Image.open(stream) as image:
+                width, height = image.size
+                if (
+                    type(width) is not int
+                    or type(height) is not int
+                    or width <= 0
+                    or height <= 0
+                    or width * height > IMAGE_CONSUMPTION_MAX_PIXELS
+                ):
+                    raise ValueError("decoded image exceeds the per-object pixel cap")
+                image.load()
+                rgb = image.convert("RGB")
+                try:
+                    tensor = self.transform(rgb)
+                finally:
+                    rgb.close()
         return {
             "image": tensor,
             "objectness": row.objectness,
@@ -1008,6 +1217,26 @@ def _manifest_summary(
     lineage_bytes = json.dumps(
         ordered_lineage, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+    payload_rows = [
+        {
+            "sample_id": row.sample_id,
+            "role": row.role,
+            "path": row.path.relative_to(row.manifest_path.parent).as_posix(),
+            "size": row.image_size_bytes,
+            "sha256": row.image_sha256.lower(),
+        }
+        for row in sorted(rows, key=lambda item: (item.role, item.sample_id))
+    ]
+    payload_set_bytes = (
+        json.dumps(
+            payload_rows,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
     role_counts = Counter(row.role for row in rows)
     objectness_counts = Counter((row.role, row.objectness) for row in rows)
     material_counts = Counter(
@@ -1018,6 +1247,7 @@ def _manifest_summary(
         "required_lineage_fields": list(LINEAGE_FIELDS),
         "rows": len(rows),
         "lineage_sha256": hashlib.sha256(lineage_bytes).hexdigest(),
+        "payload_set_sha256": hashlib.sha256(payload_set_bytes).hexdigest(),
         "input_manifests": [
             {
                 "path": str(Path(path).resolve()),
@@ -1103,6 +1333,13 @@ def _make_loader(
             replacement=True,
             generator=generator,
         )
+    loader_options: dict[str, Any] = {}
+    if workers:
+        # The authoritative NAS path eagerly initializes CUDA before manifest
+        # hashing.  Linux's default ``fork`` would clone that live CUDA state
+        # into workers and can deadlock or fail before the first epoch.  Spawn
+        # gives every image-consumption worker a clean interpreter instead.
+        loader_options["multiprocessing_context"] = "spawn"
     return DataLoader(
         VerifierDataset(rows, transform),
         batch_size=batch_size,
@@ -1112,6 +1349,7 @@ def _make_loader(
         pin_memory=pin_memory,
         worker_init_fn=_seed_worker if workers else None,
         generator=generator,
+        **loader_options,
     )
 
 
@@ -1252,6 +1490,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--dataset-snapshot-report-sha256")
+    parser.add_argument("--dataset-snapshot-tree-sha256")
+    parser.add_argument("--manifest-payload-set-sha256")
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--no-export-onnx", action="store_true")
     parser.add_argument(
@@ -1291,6 +1532,32 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error(f"--{name.replace('_', '-')} must be finite and non-negative")
     if args.objectness_weight == 0 or args.material_weight == 0:
         parser.error("objectness and material task weights must both be positive")
+    authority_values = (
+        args.dataset_snapshot_report_sha256,
+        args.dataset_snapshot_tree_sha256,
+    )
+    if any(value is None for value in authority_values) and not all(
+        value is None for value in authority_values
+    ):
+        parser.error("dataset authority SHA arguments must be supplied together")
+    if any(value is not None for value in authority_values) and (
+        args.manifest_payload_set_sha256 is None
+    ):
+        parser.error(
+            "--manifest-payload-set-sha256 is required with dataset authority SHAs"
+        )
+    if all(value is not None for value in authority_values) and not sys.platform.startswith(
+        "linux"
+    ):
+        parser.error("authority-bound image consumption requires Linux/QNAP")
+    for value in authority_values:
+        if value is not None and not _is_sha256(value):
+            parser.error("dataset authority SHA arguments must be lowercase SHA-256")
+    if (
+        args.manifest_payload_set_sha256 is not None
+        and not _is_sha256(args.manifest_payload_set_sha256)
+    ):
+        parser.error("manifest payload-set SHA must be lowercase SHA-256")
 
 
 def _weight_metadata(
@@ -1378,6 +1645,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows, origin_weights
         )
         manifest_summary = _manifest_summary(rows, args.manifest)
+        if (
+            args.manifest_payload_set_sha256 is not None
+            and args.manifest_payload_set_sha256
+            != manifest_summary["payload_set_sha256"]
+        ):
+            raise ValueError("manifest payload-set SHA differs from consumed manifests")
+        dataset_consumption_contract = build_image_consumption_contract(
+            trainer_sha256=_sha256_file(Path(__file__).resolve()),
+            dataset_snapshot_report_sha256=args.dataset_snapshot_report_sha256,
+            dataset_snapshot_tree_sha256=args.dataset_snapshot_tree_sha256,
+            manifest_payload_set_sha256=manifest_summary["payload_set_sha256"],
+        )
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
 
@@ -1395,6 +1674,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "sampling": sampling_plan,
         "output_contract": output_contract,
+        "dataset_consumption_contract": dataset_consumption_contract,
     }
     if args.dry_run:
         print(json.dumps(preflight, ensure_ascii=False, indent=2, sort_keys=True))
@@ -1575,6 +1855,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "excluded_roles": [CALIBRATION_ROLE, BLIND_TEST_ROLE],
                     },
                     "manifest_summary": manifest_summary,
+                    "dataset_consumption_contract": dataset_consumption_contract,
                     "training_config": training_config,
                     "selection_contract": {
                         "metric": "mean balanced accuracy",
@@ -1625,6 +1906,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "preprocessing": checkpoint["preprocessing"],
         "manifest_contract": checkpoint["manifest_contract"],
         "manifest_summary": checkpoint["manifest_summary"],
+        "dataset_consumption_contract": checkpoint["dataset_consumption_contract"],
         "training_config": checkpoint["training_config"],
         "selection_contract": checkpoint["selection_contract"],
         "best_epoch": best_epoch,

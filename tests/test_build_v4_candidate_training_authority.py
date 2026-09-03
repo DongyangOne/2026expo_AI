@@ -157,9 +157,13 @@ def _snapshot_report_bytes_for_policy(entries: list[dict[str, object]]) -> bytes
             "source_lineage_bytes_snapshotted": False,
             "snapshot_root_relative": "dataset_snapshot",
             "snapshot_max_bytes": authority_builder.DATASET_SNAPSHOT_MAX_BYTES,
+            "object_max_bytes": authority_builder.IMAGE_CONSUMPTION_MAX_BYTES,
             "object_count": len(normalized),
             "total_regular_bytes": sum(int(row["size"]) for row in normalized),
             "tree_sha256": _sha(authority_builder._canonical_compact_json(tree_rows)),
+            "payload_set_sha256": _sha(
+                authority_builder._canonical_compact_json(normalized)
+            ),
             "objects": normalized,
         }
         return authority_builder._canonical_json(report)
@@ -305,6 +309,16 @@ def _refresh(fixture: dict[str, object]) -> None:
         origin: mass / total_mass for origin, mass in weighted_mass.items()
     }
     _dump(config_path, config_value)
+    snapshot_report_bytes = _snapshot_report_bytes_for_policy(snapshot_plan)
+    snapshot_report_value = json.loads(snapshot_report_bytes)
+    trainer_path = fixture["trainer"]
+    assert isinstance(trainer_path, Path)
+    consumption_contract = authority_builder._dataset_consumption_contract(
+        trainer_sha256=_sha(trainer_path.read_bytes()),
+        snapshot_report_sha256=_sha(snapshot_report_bytes),
+        snapshot_tree_sha256=snapshot_report_value["tree_sha256"],
+        manifest_payload_set_sha256=snapshot_report_value["payload_set_sha256"],
+    )
     candidate_manifest_bindings = {
         "candidate_train_manifest_sha256": _sha(
             authority_builder._render_manifest(selected["train"])
@@ -312,8 +326,9 @@ def _refresh(fixture: dict[str, object]) -> None:
         "candidate_model_validation_manifest_sha256": _sha(
             authority_builder._render_manifest(selected["model_validation"])
         ),
-        "candidate_dataset_snapshot_sha256": _sha(
-            _snapshot_report_bytes_for_policy(snapshot_plan)
+        "candidate_dataset_snapshot_sha256": _sha(snapshot_report_bytes),
+        "candidate_dataset_consumption_contract_sha256": _sha(
+            authority_builder._canonical_json(consumption_contract)
         ),
     }
     license_path = fixture["license_path"]
@@ -495,6 +510,20 @@ output_contract = {
     'decision_order': ['objectness','material','conditions'],
     'warning': 'This v3 contract is not the legacy four-output production contract.',
 }
+dataset_consumption_contract = {
+    'schema': 'v4_candidate_dataset_consumption.v1',
+    'version': 'multitask_verifier.image_consumption.v1',
+    'evidence_scope': 'per_access_fail_closed_no_complete_access_receipt',
+    'authority_platform': 'linux_qnap',
+    'read_semantics': 'single_descriptor_fstat_sha256_then_bytesio_decode',
+    'trainer_path': 'scripts/train_multitask_verifier.py',
+    'trainer_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    'dataset_snapshot_report_sha256': one('--dataset-snapshot-report-sha256'),
+    'dataset_snapshot_tree_sha256': one('--dataset-snapshot-tree-sha256'),
+    'manifest_payload_set_sha256': one('--manifest-payload-set-sha256'),
+    'max_image_bytes': 67108864, 'max_image_pixels': 16777216,
+    'complete_access_receipt': False,
+}
 if '--dry-run' in sys.argv:
     print(json.dumps({
         'ok': True, 'mode': 'dry-run', 'seed': int(one('--seed')),
@@ -504,6 +533,7 @@ if '--dry-run' in sys.argv:
             'beta': float(one('--class-weight-beta')), 'values': {},
         },
         'sampling': sampling, 'output_contract': output_contract,
+        'dataset_consumption_contract': dataset_consumption_contract,
     }))
     raise SystemExit(0)
 import onnx
@@ -519,7 +549,8 @@ manifest_summary = {
     ],
     'strict': True,
     'required_lineage_fields': ['sample_id','source_sha256','object_group','capture_session','role','fold'],
-    'rows': 0, 'lineage_sha256': '0' * 64, 'role_counts': {},
+    'rows': 0, 'lineage_sha256': '0' * 64,
+    'payload_set_sha256': one('--manifest-payload-set-sha256'), 'role_counts': {},
     'excluded_from_training_role_counts': {'calibration': 0, 'blind_test': 0},
     'folds_by_role': {}, 'unique': {}, 'objectness_counts': {},
     'positive_material_counts': {},
@@ -586,6 +617,7 @@ metadata = {
         },
     },
     'manifest_contract': manifest_contract, 'manifest_summary': manifest_summary,
+    'dataset_consumption_contract': dataset_consumption_contract,
     'training_config': config, 'selection_contract': selection_contract,
     'best_epoch': 1, 'best_selection_score': 0.5, 'best_metrics': best_metrics,
 }
@@ -626,6 +658,7 @@ torch.save(
         'preprocessing': metadata['preprocessing'],
         'manifest_contract': manifest_contract,
         'manifest_summary': manifest_summary,
+        'dataset_consumption_contract': dataset_consumption_contract,
         'training_config': config,
         'selection_contract': selection_contract,
         'epoch': 1, 'selection_score': 0.5, 'metrics': best_metrics,
@@ -832,7 +865,7 @@ torch.onnx.export(
     config = _dump(
         global_root / "training_config.json",
         {
-            "schema": "v4_candidate_training_config.v1",
+            "schema": "v4_candidate_training_config.v2",
             "backbone": "mobilenet_v3_small",
             "pretrained": True,
             "input_size": 320,
@@ -860,6 +893,11 @@ torch.onnx.export(
             "sampling_mode": "shuffle_without_replacement",
             "sampling_samples_per_epoch": 10,
             "sampling_expected_fraction_by_origin": {"aihub": 1.0},
+            "image_consumption_contract_version": (
+                authority_builder.IMAGE_CONSUMPTION_CONTRACT_VERSION
+            ),
+            "image_max_bytes": authority_builder.IMAGE_CONSUMPTION_MAX_BYTES,
+            "image_max_pixels": authority_builder.IMAGE_CONSUMPTION_MAX_PIXELS,
             "seed": 20260902,
         },
     )
@@ -1160,6 +1198,27 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
     assert snapshot_report["schema"] == authority_builder.DATASET_SNAPSHOT_SCHEMA
     assert snapshot_report["object_count"] == len(content_inventory)
     assert snapshot_report["payload_kind"] == "training_crop_only"
+    assert snapshot_report["object_max_bytes"] == (
+        authority_builder.IMAGE_CONSUMPTION_MAX_BYTES
+    )
+    contract = authority["dataset_consumption_contract"]
+    assert contract == authority_builder._dataset_consumption_contract(
+        trainer_sha256=next(
+            item["sha256"]
+            for item in json.loads(
+                fixture["inventory"].read_text(encoding="utf-8")  # type: ignore[union-attr]
+            )["files"]
+            if item["path"] == "scripts/train_multitask_verifier.py"
+        ),
+        snapshot_report_sha256=_sha(
+            (output / "candidate_dataset_snapshot.json").read_bytes()
+        ),
+        snapshot_tree_sha256=snapshot_report["tree_sha256"],
+        manifest_payload_set_sha256=snapshot_report["payload_set_sha256"],
+    )
+    assert authority["bindings"]["candidate_dataset_consumption_contract_sha256"] == (  # type: ignore[index]
+        _sha(authority_builder._canonical_json(contract))
+    )
     assert authority["bindings"]["candidate_dataset_snapshot_sha256"] == _sha(  # type: ignore[index]
         (output / "candidate_dataset_snapshot.json").read_bytes()
     )
@@ -1167,6 +1226,22 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
     assert authority["bindings"]["dataset_snapshot_publish_receipt_sha256"] == _sha(  # type: ignore[index]
         authority_builder._canonical_json(receipt)
     )
+
+
+def test_dataset_snapshot_rejects_an_object_above_the_consumption_cap() -> None:
+    digest = _fake_sha("oversized-object")
+    with pytest.raises(ValueError, match="exceeds image_max_bytes"):
+        authority_builder._dataset_snapshot_report(
+            [
+                {
+                    "sample_id": "oversized",
+                    "role": "train",
+                    "path": authority_builder._snapshot_relative_path(digest),
+                    "size": authority_builder.IMAGE_CONSUMPTION_MAX_BYTES + 1,
+                    "sha256": digest,
+                }
+            ]
+        )
 
 
 @pytest.mark.parametrize(
@@ -1738,7 +1813,12 @@ def _reseal_authority_marker(output: Path) -> None:
 
 @pytest.mark.parametrize(
     "mutation",
-    ("extra_authority_field", "forged_train_manifest", "forged_snapshot_report"),
+    (
+        "extra_authority_field",
+        "forged_train_manifest",
+        "forged_snapshot_report",
+        "forged_consumption_contract",
+    ),
 )
 def test_launcher_rejects_consistently_rehashed_authority_forgery(
     tmp_path: Path, mutation: str
@@ -1763,7 +1843,7 @@ def test_launcher_rejects_consistently_rehashed_authority_forgery(
         )
         manifest["sha256"] = digest
         authority["bindings"]["candidate_train_manifest_sha256"] = digest
-    else:
+    elif mutation == "forged_snapshot_report":
         report_path = output / "candidate_dataset_snapshot.json"
         report = json.loads(report_path.read_text(encoding="utf-8"))
         report["snapshot_max_bytes"] += 1
@@ -1771,6 +1851,13 @@ def test_launcher_rejects_consistently_rehashed_authority_forgery(
         digest = _sha(report_path.read_bytes())
         authority["artifacts"]["dataset_snapshot_report"]["sha256"] = digest
         authority["bindings"]["candidate_dataset_snapshot_sha256"] = digest
+    else:
+        authority["dataset_consumption_contract"]["max_image_pixels"] += 1
+        authority["bindings"]["dataset_consumption_contract_sha256"] = _sha(
+            authority_builder._canonical_json(
+                authority["dataset_consumption_contract"]
+            )
+        )
     authority_path.write_bytes(authority_builder._canonical_json(authority))
     _reseal_authority_marker(output)
     wrapper, env, run_dir = _prepare_test_launcher(fixture)
@@ -1808,6 +1895,12 @@ def test_producer_output_runs_through_launcher_candidate_only(tmp_path: Path) ->
     ]
     assert preflight["cuda_runtime_contract"]["required"] is False
     ready = json.loads((control / "candidate_training_ready.json").read_text())
+    assert ready["dataset_consumption_contract"] == preflight[
+        "dataset_consumption_contract"
+    ]
+    assert ready["bindings"]["dataset_consumption_contract_sha256"] == _sha(
+        authority_builder._canonical_json(preflight["dataset_consumption_contract"])
+    )
     assert ready["candidate_only"] is True
     assert ready["requires_independent_blind_hardware_gate"] is True
     assert ready["production_deployment_authorized"] is False

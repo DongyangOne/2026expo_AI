@@ -1045,11 +1045,13 @@ POLICY_BINDING_FIELDS = {
     "container_image_id", "candidate_train_manifest_sha256",
     "candidate_model_validation_manifest_sha256",
     "candidate_dataset_snapshot_sha256",
+    "candidate_dataset_consumption_contract_sha256",
 }
 AUTHORITY_BINDING_FIELDS = {
     "source_manifest_sha256", "full_data_validator_report_sha256",
     "trusted_policy_sha256", "dataset_content_inventory_sha256",
     "dataset_snapshot_publish_receipt_sha256",
+    "dataset_consumption_contract_sha256",
     *POLICY_BINDING_FIELDS,
 }
 
@@ -1188,12 +1190,13 @@ authority_fields = {
     "portable", "operational_cutoff_kst", "material_classes",
     "objectness_classes", "condition_heads", "artifacts", "trust_root",
     "dataset_content_inventory", "dataset_snapshot_publish_receipt",
+    "dataset_consumption_contract",
     "counts", "bindings",
 }
 if set(authority) != authority_fields:
     raise ValueError("training authority top-level schema mismatch")
 exact_authority = {
-    "schema": "v4_candidate_training_authority.v1",
+    "schema": "v4_candidate_training_authority.v2",
     "artifact_role": "v4_candidate_training_input_authority_not_blind_or_deployment",
     "status": "candidate_training_inputs_ready",
 }
@@ -1462,12 +1465,12 @@ snapshot_report_fields = {
     "schema", "artifact_role", "status", "candidate_only",
     "production_deployment_authorized", "payload_kind",
     "source_lineage_bytes_snapshotted", "snapshot_root_relative",
-    "snapshot_max_bytes", "object_count", "total_regular_bytes",
-    "tree_sha256", "objects",
+    "snapshot_max_bytes", "object_max_bytes", "object_count",
+    "total_regular_bytes", "tree_sha256", "payload_set_sha256", "objects",
 }
 if not isinstance(dataset_snapshot_report, dict) or set(dataset_snapshot_report) != snapshot_report_fields:
     raise ValueError("candidate dataset snapshot report schema mismatch")
-if dataset_snapshot_report.get("schema") != "v4_candidate_dataset_snapshot.v1":
+if dataset_snapshot_report.get("schema") != "v4_candidate_dataset_snapshot.v2":
     raise ValueError("candidate dataset snapshot report version mismatch")
 if dataset_snapshot_report.get("artifact_role") != (
     "candidate_training_crop_bytes_not_blind_or_deployment_authority"
@@ -1493,6 +1496,8 @@ if dataset_snapshot_report.get("snapshot_root_relative") != "dataset_snapshot":
     raise ValueError("candidate dataset snapshot root contract mismatch")
 if dataset_snapshot_report.get("snapshot_max_bytes") != 68719476736:
     raise ValueError("candidate dataset snapshot byte cap mismatch")
+if dataset_snapshot_report.get("object_max_bytes") != 67108864:
+    raise ValueError("candidate dataset snapshot object byte cap mismatch")
 snapshot_objects = dataset_snapshot_report.get("objects")
 if not isinstance(snapshot_objects, list) or not snapshot_objects:
     raise ValueError("candidate dataset snapshot objects must be nonempty")
@@ -1523,7 +1528,12 @@ for index, row in enumerate(snapshot_objects):
         or relative != f"dataset_snapshot/objects/{digest[:2]}/{digest}"
     ):
         raise ValueError("candidate dataset snapshot object path mismatch")
-    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or size > dataset_snapshot_report["object_max_bytes"]
+    ):
         raise ValueError("candidate dataset snapshot object size mismatch")
     if sample_id in snapshot_by_sample or relative in snapshot_paths or digest in snapshot_shas:
         raise ValueError("candidate dataset snapshot contains duplicate sample/path/SHA")
@@ -1549,6 +1559,43 @@ snapshot_tree_sha = sha_bytes(
 )
 if dataset_snapshot_report.get("tree_sha256") != snapshot_tree_sha:
     raise ValueError("candidate dataset snapshot tree SHA mismatch")
+snapshot_payload_set_sha = sha_bytes(
+    (json.dumps(
+        snapshot_objects, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ) + "\n").encode("utf-8")
+)
+if dataset_snapshot_report.get("payload_set_sha256") != snapshot_payload_set_sha:
+    raise ValueError("candidate dataset snapshot payload-set SHA mismatch")
+
+dataset_consumption_contract = authority.get("dataset_consumption_contract")
+expected_dataset_consumption_contract = {
+    "schema": "v4_candidate_dataset_consumption.v1",
+    "version": "multitask_verifier.image_consumption.v1",
+    "evidence_scope": "per_access_fail_closed_no_complete_access_receipt",
+    "authority_platform": "linux_qnap",
+    "read_semantics": "single_descriptor_fstat_sha256_then_bytesio_decode",
+    "trainer_path": "scripts/train_multitask_verifier.py",
+    "trainer_sha256": sha_bytes(input_bytes[trainer_path]),
+    "dataset_snapshot_report_sha256": snapshot_report_sha,
+    "dataset_snapshot_tree_sha256": snapshot_tree_sha,
+    "manifest_payload_set_sha256": snapshot_payload_set_sha,
+    "max_image_bytes": 67108864,
+    "max_image_pixels": 16777216,
+    "complete_access_receipt": False,
+}
+if dataset_consumption_contract != expected_dataset_consumption_contract:
+    raise ValueError("candidate dataset consumption contract mismatch")
+dataset_consumption_contract_sha = sha_bytes(
+    canonical_json(dataset_consumption_contract)
+)
+if (
+    bindings.get("dataset_consumption_contract_sha256")
+    != dataset_consumption_contract_sha
+    or bindings.get("candidate_dataset_consumption_contract_sha256")
+    != dataset_consumption_contract_sha
+):
+    raise ValueError("candidate dataset consumption contract SHA binding mismatch")
 
 snapshot_root = snapshot_report_path.parent / "dataset_snapshot"
 reject_symlink_components(snapshot_root, "candidate dataset snapshot root")
@@ -2052,10 +2099,12 @@ required_config_fields = {
     "scheduler_t_max", "scheduler_eta_min",
     "sampling_mode", "sampling_samples_per_epoch",
     "sampling_expected_fraction_by_origin",
+    "image_consumption_contract_version", "image_max_bytes",
+    "image_max_pixels",
 }
 if not isinstance(config, dict) or set(config) != required_config_fields:
     raise ValueError("training config fields differ from the frozen contract")
-if config.get("schema") != "v4_candidate_training_config.v1":
+if config.get("schema") != "v4_candidate_training_config.v2":
     raise ValueError("unsupported training config schema")
 if config.get("backbone") != "mobilenet_v3_small":
     raise ValueError("candidate training backbone must be mobilenet_v3_small")
@@ -2071,6 +2120,14 @@ if type(config.get("workers")) is not int or config["workers"] < 0:
     raise ValueError("training config workers must be a non-negative integer")
 if type(config.get("seed")) is not int or config["seed"] < 0:
     raise ValueError("training config seed must be a non-negative integer")
+if config.get("image_consumption_contract_version") != (
+    "multitask_verifier.image_consumption.v1"
+):
+    raise ValueError("training image consumption contract version mismatch")
+if config.get("image_max_bytes") != 67108864:
+    raise ValueError("training image_max_bytes mismatch")
+if config.get("image_max_pixels") != 16777216:
+    raise ValueError("training image_max_pixels mismatch")
 for field in (
     "lr", "backbone_lr", "head_lr", "objectness_weight", "material_weight",
     "condition_weight",
@@ -2776,6 +2833,8 @@ payload = {
     "dataset_content_inventory_sha256": dataset_inventory_sha,
     "candidate_dataset_snapshot": dataset_snapshot_report,
     "candidate_dataset_snapshot_runtime": dataset_snapshot_runtime_contract,
+    "dataset_consumption_contract": dataset_consumption_contract,
+    "dataset_consumption_contract_sha256": dataset_consumption_contract_sha,
     "manifests": [
         {
             "role": role,
@@ -2797,6 +2856,7 @@ payload = {
     "pretrained_backbone_path": backbone_path.as_posix(),
     "torch_home": torch_home.as_posix(),
     "trainer_path": trainer_path.as_posix(),
+    "trainer_sha256": sha_bytes(input_bytes[trainer_path]),
     "wrapper_path": wrapper_path.as_posix(),
     "bound_inputs": snapshot_rows,
     "manifest_payload_files": [
@@ -2852,6 +2912,25 @@ inventory_path = Path(sys.argv[2])
 if preflight_path.is_symlink() or not preflight_path.is_file():
     raise ValueError("preflight must remain a regular non-symlink file")
 preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+consumption = preflight.get("dataset_consumption_contract")
+if not isinstance(consumption, dict):
+    raise ValueError("dataset consumption contract is missing")
+consumption_sha = hashlib.sha256(
+    (json.dumps(
+        consumption, ensure_ascii=False, indent=2, sort_keys=True,
+        allow_nan=False,
+    ) + "\n").encode("utf-8")
+).hexdigest()
+if preflight.get("dataset_consumption_contract_sha256") != consumption_sha:
+    raise ValueError("dataset consumption contract SHA changed")
+if (
+    preflight.get("trainer_sha256") != consumption.get("trainer_sha256")
+    or consumption.get("version") != "multitask_verifier.image_consumption.v1"
+    or consumption.get("max_image_bytes") != 67108864
+    or consumption.get("max_image_pixels") != 16777216
+    or consumption.get("complete_access_receipt") is not False
+):
+    raise ValueError("dataset consumption contract semantics changed")
 
 def reject_symlink_components(path: Path, description: str) -> None:
     absolute = Path(os.path.abspath(path))
@@ -2952,6 +3031,7 @@ for path in sorted(actual_snapshot_files, key=lambda value: value.as_posix()):
         current.st_nlink != 1
         or stat.S_IMODE(current.st_mode) != 0o444
         or current.st_size != expected["size"]
+        or current.st_size > snapshot_report["object_max_bytes"]
         or digest != expected["sha256"]
     ):
         raise ValueError("dataset snapshot object changed")
@@ -3047,6 +3127,12 @@ args = [
     "--condition-weight", str(config["condition_weight"]),
     "--seed", str(config["seed"]),
     "--device", "cuda",
+    "--dataset-snapshot-report-sha256",
+    preflight["dataset_consumption_contract"]["dataset_snapshot_report_sha256"],
+    "--dataset-snapshot-tree-sha256",
+    preflight["dataset_consumption_contract"]["dataset_snapshot_tree_sha256"],
+    "--manifest-payload-set-sha256",
+    preflight["dataset_consumption_contract"]["manifest_payload_set_sha256"],
 ]
 for head in config["condition_heads"]:
     args.extend(("--condition-head", head))
@@ -3065,6 +3151,7 @@ if mode == "dry-run":
     if set(value) != {
         "ok", "mode", "seed", "manifest", "condition_heads",
         "class_weights", "sampling", "output_contract",
+        "dataset_consumption_contract",
     }:
         raise ValueError("trainer dry-run response schema mismatch")
     if value.get("ok") is not True or value.get("mode") != "dry-run":
@@ -3075,6 +3162,10 @@ if mode == "dry-run":
         raise ValueError("trainer dry-run condition-head mismatch")
     if value.get("sampling") != preflight["sampling"]:
         raise ValueError("trainer dry-run sampling plan mismatch")
+    if value.get("dataset_consumption_contract") != preflight.get(
+        "dataset_consumption_contract"
+    ):
+        raise ValueError("trainer dry-run consumption contract mismatch")
     if value.get("output_contract", {}).get("version") != "multitask_verifier.v3":
         raise ValueError("trainer dry-run output contract mismatch")
     if value.get("output_contract", {}).get("output_order") != [
@@ -3239,6 +3330,12 @@ args = [
     "--material-weight", str(config["material_weight"]),
     "--condition-weight", str(config["condition_weight"]),
     "--seed", str(config["seed"]), "--device", "cuda",
+    "--dataset-snapshot-report-sha256",
+    preflight["dataset_consumption_contract"]["dataset_snapshot_report_sha256"],
+    "--dataset-snapshot-tree-sha256",
+    preflight["dataset_consumption_contract"]["dataset_snapshot_tree_sha256"],
+    "--manifest-payload-set-sha256",
+    preflight["dataset_consumption_contract"]["manifest_payload_set_sha256"],
 ]
 for head in config["condition_heads"]:
     args.extend(("--condition-head", head))
@@ -3618,7 +3715,8 @@ expected_metadata_fields = {
     "classes", "material_classes", "objectness_classes",
     "condition_classes", "output_contract", "preprocessing",
     "manifest_contract", "manifest_summary", "training_config",
-    "selection_contract", "best_epoch", "best_selection_score", "best_metrics",
+    "dataset_consumption_contract", "selection_contract", "best_epoch",
+    "best_selection_score", "best_metrics",
 }
 if not isinstance(metadata, dict) or set(metadata) != expected_metadata_fields:
     raise ValueError("candidate metadata root schema mismatch")
@@ -3729,9 +3827,14 @@ expected_manifest_contract = {
 }
 if metadata.get("manifest_contract") != expected_manifest_contract:
     raise ValueError("candidate manifest contract mismatch")
+if metadata.get("dataset_consumption_contract") != preflight.get(
+    "dataset_consumption_contract"
+):
+    raise ValueError("candidate metadata consumption contract mismatch")
 summary = metadata.get("manifest_summary", {})
 if not isinstance(summary, dict) or set(summary) != {
     "strict", "required_lineage_fields", "rows", "lineage_sha256",
+    "payload_set_sha256",
     "input_manifests", "role_counts", "excluded_from_training_role_counts",
     "folds_by_role", "unique", "objectness_counts", "positive_material_counts",
 }:
@@ -3740,6 +3843,10 @@ if summary.get("strict") is not True:
     raise ValueError("candidate manifest summary is not strict")
 if summary.get("required_lineage_fields") != expected_manifest_contract["lineage_fields"]:
     raise ValueError("candidate manifest summary lineage fields mismatch")
+if summary.get("payload_set_sha256") != preflight[
+    "dataset_consumption_contract"
+]["manifest_payload_set_sha256"]:
+    raise ValueError("candidate manifest payload-set SHA mismatch")
 declared_inputs = summary.get("input_manifests")
 expected_inputs = [
     {"path": row["path"], "sha256": row["sha256"]}
@@ -3823,7 +3930,8 @@ expected_checkpoint_fields = {
     "format_version", "architecture", "state_dict", "model_config", "backbone",
     "input_size", "classes", "material_classes", "objectness_classes",
     "condition_classes", "output_contract", "preprocessing", "manifest_contract",
-    "manifest_summary", "training_config", "selection_contract", "epoch",
+    "manifest_summary", "dataset_consumption_contract", "training_config",
+    "selection_contract", "epoch",
     "selection_score", "metrics",
 }
 if set(checkpoint) != expected_checkpoint_fields:
@@ -3837,7 +3945,7 @@ if checkpoint.get("output_contract") != output:
 for field in (
     "classes", "material_classes", "objectness_classes", "condition_classes",
     "preprocessing", "manifest_contract", "manifest_summary", "training_config",
-    "selection_contract",
+    "dataset_consumption_contract", "selection_contract",
 ):
     if checkpoint.get(field) != metadata.get(field):
         raise ValueError(f"candidate checkpoint and metadata differ: {field}")
@@ -4136,6 +4244,28 @@ preflight_value = json.loads(bound_bytes[preflight.resolve()].decode("utf-8"))
 dataset_snapshot_runtime = preflight_value.get("candidate_dataset_snapshot_runtime")
 if not isinstance(dataset_snapshot_runtime, dict):
     raise ValueError("candidate dataset snapshot runtime contract is missing before ready")
+dataset_consumption_contract = preflight_value.get("dataset_consumption_contract")
+if not isinstance(dataset_consumption_contract, dict):
+    raise ValueError("candidate dataset consumption contract is missing before ready")
+dataset_consumption_contract_sha = digest(
+    (json.dumps(
+        dataset_consumption_contract, ensure_ascii=False, indent=2,
+        sort_keys=True, allow_nan=False,
+    ) + "\n").encode("utf-8")
+)
+if preflight_value.get(
+    "dataset_consumption_contract_sha256"
+) != dataset_consumption_contract_sha:
+    raise ValueError("candidate dataset consumption contract SHA mismatch before ready")
+if (
+    dataset_consumption_contract.get("dataset_snapshot_report_sha256")
+    != dataset_snapshot_runtime.get("report_sha256")
+    or dataset_consumption_contract.get("dataset_snapshot_tree_sha256")
+    != dataset_snapshot_runtime.get("tree_sha256")
+    or dataset_consumption_contract.get("trainer_sha256")
+    != preflight_value.get("trainer_sha256")
+):
+    raise ValueError("candidate dataset consumption bindings differ before ready")
 inventory_value = json.loads(bound_bytes[inventory.resolve()].decode("utf-8"))
 if set(inventory_value) != {
     "schema", "status", "candidate_only", "candidate_promotion_authorized",
@@ -4213,6 +4343,7 @@ payload = {
     "spring_contract_modified": False,
     "requires_offline_judge": True,
     "requires_independent_blind_hardware_gate": True,
+    "dataset_consumption_contract": dataset_consumption_contract,
     "container_image_id": image_id,
     "bindings": {
         "preflight_sha256": digest(bound_bytes[preflight.resolve()]),
@@ -4229,6 +4360,11 @@ payload = {
         ],
         "candidate_dataset_snapshot_tree_sha256": dataset_snapshot_runtime[
             "tree_sha256"
+        ],
+        "dataset_consumption_contract_sha256": dataset_consumption_contract_sha,
+        "trainer_sha256": dataset_consumption_contract["trainer_sha256"],
+        "manifest_payload_set_sha256": dataset_consumption_contract[
+            "manifest_payload_set_sha256"
         ],
     },
 }
