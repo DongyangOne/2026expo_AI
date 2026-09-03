@@ -1,11 +1,10 @@
 """Assemble teacher-verified operational capture-quality exclusions.
 
-Only exact post-cutoff v3 teacher decisions that mark a capture unusable for
-one of the four subjective capture-quality reasons are eligible.  The emitted
-quality manifest remains SHA/reason-only and grants no training, calibration,
-blind-test, or deployment authority.  Objective failures removed before the
-teacher queue are intentionally out of scope because the current queue summary
-does not retain per-source evidence for them.
+Only exact post-cutoff v3 teacher decisions and independently rechecked
+objective capture failures are eligible.  The emitted quality manifest remains
+SHA/reason-only and grants no training, calibration, blind-test, or deployment
+authority.  Objective evidence is accepted only from the immutable prepare
+bundle whose metadata, source bytes, policy, counts, and digests all revalidate.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 try:
+    import scripts.prepare_operational_capture_queue as capture_queue
     from scripts.build_operational_teacher_manifest import (
         ARTIFACT_NAMES,
         EMPTY_SCENE_INVENTORY_FIELDS,
@@ -54,6 +54,7 @@ try:
         build_quality_exclusion_manifest,
     )
 except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
+    import prepare_operational_capture_queue as capture_queue  # type: ignore[no-redef]
     from build_operational_teacher_manifest import (  # type: ignore[no-redef]
         ARTIFACT_NAMES,
         EMPTY_SCENE_INVENTORY_FIELDS,
@@ -191,6 +192,73 @@ QUALITY_REJECTION_FIELDS = {
     "teacher_training_usable",
     "teacher_quality_reason",
 }
+OBJECTIVE_EVIDENCE_FIELDS = {
+    "schema_version",
+    "source_sha256",
+    "capture_timestamp_utc",
+    "metadata_ref",
+    "metadata_sha256",
+    "image_ref",
+    "raw_reasons",
+    "quality_reason",
+}
+OBJECTIVE_CAPTURE_INDEX_FIELDS = {
+    "schema_version",
+    "metadata_ref",
+    "metadata_sha256",
+}
+OBJECTIVE_RECEIPT_FIELDS = {
+    "schema_version",
+    "evidence_schema",
+    "artifact_role",
+    "status",
+    "local_only",
+    "operational_capture_cutoff_kst",
+    "start_kst",
+    "quality_policy",
+    "counts",
+    "input_digests",
+    "output_digests",
+    "privacy",
+    "authority",
+}
+OBJECTIVE_RECEIPT_COUNT_FIELDS = {
+    "capture_metadata_index_rows",
+    "objective_quality_rejections",
+    "objective_known_audit_suppressed",
+    "objective_quality_reason_counts",
+}
+OBJECTIVE_INPUT_DIGEST_FIELDS = {
+    "known_audit_sha256",
+    "shadow_log_present",
+    "shadow_log_sha256",
+    "objective_source_bindings_sha256",
+}
+OBJECTIVE_SUMMARY_FIELDS = {
+    "operational_capture_cutoff_kst",
+    "start_kst",
+    "capture_rows_after_cutoff",
+    "capture_rows_rejected",
+    "capture_rejection_counts",
+    "capture_metadata_index_rows",
+    "unique_images",
+    "decisions",
+    "teacher_queue",
+    "objective_quality_rejections",
+    "objective_quality_reason_counts",
+    "objective_known_audit_suppressed",
+    "objective_evidence_schema",
+    "client_ids_exported",
+    "quality_policy",
+}
+OBJECTIVE_PRIVACY = {
+    "objective_evidence_structured_client_id_fields_exported": False,
+    "objective_evidence_structured_device_id_fields_exported": False,
+    "objective_evidence_prediction_outputs_exported": False,
+    "objective_evidence_absolute_paths_exported": False,
+    "objective_evidence_untrusted_relative_local_refs_present": True,
+    "objective_evidence_relative_refs_may_contain_identifiers": True,
+}
 
 
 def _sha256_bytes(content: bytes) -> str:
@@ -275,6 +343,25 @@ def _require_finite_number(value: object, *, description: str) -> float:
     if not math.isfinite(normalized):
         raise ValueError(f"{description} must be a finite number")
     return normalized
+
+
+def _exact_typed_value(actual: object, expected: object) -> bool:
+    """Compare JSON-compatible values without bool/int coercion."""
+
+    if type(actual) is not type(expected):
+        return False
+    if type(expected) is dict:
+        assert isinstance(actual, dict) and isinstance(expected, dict)
+        return set(actual) == set(expected) and all(
+            _exact_typed_value(actual[key], expected[key]) for key in expected
+        )
+    if type(expected) is list:
+        assert isinstance(actual, list) and isinstance(expected, list)
+        return len(actual) == len(expected) and all(
+            _exact_typed_value(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected, strict=True)
+        )
+    return actual == expected
 
 
 def _timestamp(value: object, *, description: str) -> datetime:
@@ -825,10 +912,510 @@ def _quality_rows(
         source_bindings.append((source, source_content, sha, canonical_reason))
         selected_shas.add(sha)
 
-    if not selected:
-        raise ValueError("no eligible post-cutoff teacher quality exclusions")
     selected.sort(key=lambda row: row["path"])
     return selected, source_bindings
+
+
+def _objective_quality_rows(
+    *,
+    prepare_output_dir: Path,
+    input_contents: Mapping[str, bytes],
+    known_shas: set[str],
+    image_root: Path,
+) -> tuple[
+    list[dict[str, str]],
+    list[tuple[Path, bytes, str, str]],
+    dict[str, Path],
+    dict[str, bytes],
+    dict[Path, bytes | None],
+    tuple[Path, ...],
+]:
+    prepare_output_dir = _stable_directory(
+        prepare_output_dir, description="objective prepare output directory"
+    )
+    expected_names = set(capture_queue.OUTPUT_FILES.values())
+    if {path.name for path in prepare_output_dir.iterdir()} != expected_names:
+        raise ValueError("objective prepare output directory file set is not exact")
+
+    resolved_outputs: dict[str, Path] = {}
+    output_contents: dict[str, bytes] = {}
+    for name, filename in capture_queue.OUTPUT_FILES.items():
+        resolved, content = _stable_regular_file(
+            prepare_output_dir / filename,
+            description=f"objective prepare output {name}",
+        )
+        resolved_outputs[name] = resolved
+        output_contents[name] = content
+
+    if output_contents["teacher_queue"] != input_contents["teacher_queue"]:
+        raise ValueError("objective prepare teacher queue binding mismatch")
+    if output_contents["capture_inventory"] != input_contents["capture_inventory"]:
+        raise ValueError("objective prepare capture inventory binding mismatch")
+
+    receipt = _load_json_bytes(
+        output_contents["objective_receipt"],
+        description="objective quality evidence receipt",
+    )
+    if type(receipt) is not dict or set(receipt) != OBJECTIVE_RECEIPT_FIELDS:
+        raise ValueError("objective quality evidence receipt schema is not exact")
+    if (
+        type(receipt.get("schema_version")) is not int
+        or receipt.get("schema_version") != 1
+        or receipt.get("evidence_schema") != capture_queue.OBJECTIVE_EVIDENCE_SCHEMA
+        or receipt.get("artifact_role") != capture_queue.OBJECTIVE_EVIDENCE_ROLE
+        or receipt.get("status") != "objective_quality_evidence_prepared"
+        or receipt.get("local_only") is not True
+    ):
+        raise ValueError("objective quality evidence receipt identity mismatch")
+    if receipt.get("operational_capture_cutoff_kst") != (
+        OPERATIONAL_CAPTURE_CUTOFF_KST.isoformat()
+    ):
+        raise ValueError("objective quality evidence cutoff mismatch")
+    start_timestamp = _timestamp(
+        receipt.get("start_kst"), description="objective evidence start_kst"
+    )
+    if (
+        start_timestamp != OPERATIONAL_CAPTURE_CUTOFF_UTC
+        or receipt.get("start_kst") != OPERATIONAL_CAPTURE_CUTOFF_KST.isoformat()
+    ):
+        raise ValueError(
+            "objective quality evidence must cover the exact operational cutoff"
+        )
+    if not _exact_typed_value(
+        receipt.get("quality_policy"), capture_queue._quality_policy()
+    ):
+        raise ValueError("objective quality evidence policy mismatch")
+    if not _exact_typed_value(receipt.get("privacy"), OBJECTIVE_PRIVACY):
+        raise ValueError("objective quality evidence privacy declaration mismatch")
+    if not _exact_typed_value(
+        receipt.get("authority"), {field: False for field in AUTHORITY_FIELDS}
+    ):
+        raise ValueError("objective quality evidence authority mismatch")
+
+    output_digests = receipt.get("output_digests")
+    expected_output_digest_fields = {
+        f"{name}_sha256"
+        for name in capture_queue.OUTPUT_FILES
+        if name != "objective_receipt"
+    }
+    if type(output_digests) is not dict or set(output_digests) != (
+        expected_output_digest_fields
+    ):
+        raise ValueError("objective quality evidence output digests are not exact")
+    for name, content in output_contents.items():
+        if name == "objective_receipt":
+            continue
+        declared = _require_sha(
+            output_digests.get(f"{name}_sha256"),
+            description=f"objective output digest {name}",
+        )
+        if declared != _sha256_bytes(content):
+            raise ValueError(f"objective output digest mismatch: {name}")
+
+    input_digests = receipt.get("input_digests")
+    if type(input_digests) is not dict or set(input_digests) != (
+        OBJECTIVE_INPUT_DIGEST_FIELDS
+    ):
+        raise ValueError("objective quality evidence input digests are not exact")
+    if _require_sha(
+        input_digests.get("known_audit_sha256"),
+        description="objective known audit digest",
+    ) != _sha256_bytes(input_contents["known_audit"]):
+        raise ValueError("objective quality evidence known audit binding mismatch")
+    shadow_present = input_digests.get("shadow_log_present")
+    shadow_digest = input_digests.get("shadow_log_sha256")
+    if type(shadow_present) is not bool or (
+        (
+            shadow_present
+            and (
+                type(shadow_digest) is not str
+                or not SHA256_RE.fullmatch(shadow_digest)
+            )
+        )
+        or (not shadow_present and shadow_digest is not None)
+    ):
+        raise ValueError("objective quality evidence shadow log binding is invalid")
+
+    summary = _load_json_bytes(
+        output_contents["summary"], description="objective queue summary"
+    )
+    if type(summary) is not dict or set(summary) != OBJECTIVE_SUMMARY_FIELDS:
+        raise ValueError("objective queue summary schema is not exact")
+    if (
+        summary.get("operational_capture_cutoff_kst")
+        != receipt.get("operational_capture_cutoff_kst")
+        or summary.get("start_kst") != receipt.get("start_kst")
+        or summary.get("objective_evidence_schema")
+        != capture_queue.OBJECTIVE_EVIDENCE_SCHEMA
+        or summary.get("client_ids_exported") is not False
+        or not _exact_typed_value(
+            summary.get("quality_policy"), capture_queue._quality_policy()
+        )
+    ):
+        raise ValueError("objective queue summary identity mismatch")
+
+    evidence_rows = _load_jsonl_bytes(
+        output_contents["objective_rejections"],
+        description="objective quality rejections",
+    )
+    capture_index_rows = _load_jsonl_bytes(
+        output_contents["capture_index"],
+        description="objective capture metadata index",
+    )
+    indexed_metadata: dict[str, tuple[Path, bytes]] = {}
+    recorded_index: list[dict[str, object]] = []
+    for row in capture_index_rows:
+        line = row.get("_input_line")
+        if set(row) - {"_input_line"} != OBJECTIVE_CAPTURE_INDEX_FIELDS:
+            raise ValueError(f"capture metadata index line {line} schema is not exact")
+        if type(row.get("schema_version")) is not int or row.get("schema_version") != 1:
+            raise ValueError(f"capture metadata index line {line} schema mismatch")
+        metadata_ref = row.get("metadata_ref")
+        if type(metadata_ref) is not str or metadata_ref in indexed_metadata:
+            raise ValueError("capture metadata index references are invalid or duplicate")
+        metadata_path = _resolve_source(
+            image_root, metadata_ref, row_number=int(line)
+        )
+        metadata_content = _stable_bytes(
+            metadata_path, description=f"capture metadata index line {line}"
+        )
+        metadata_sha = _require_sha(
+            row.get("metadata_sha256"),
+            description=f"capture metadata index line {line} SHA",
+        )
+        if _sha256_bytes(metadata_content) != metadata_sha:
+            raise ValueError("capture metadata index SHA mismatch")
+        indexed_metadata[metadata_ref] = (metadata_path, metadata_content)
+        recorded_index.append(
+            {
+                "schema_version": 1,
+                "metadata_ref": metadata_ref,
+                "metadata_sha256": metadata_sha,
+            }
+        )
+    if [row["metadata_ref"] for row in recorded_index] != sorted(
+        row["metadata_ref"] for row in recorded_index
+    ):
+        raise ValueError("capture metadata index references are not sorted")
+
+    live_index: list[dict[str, object]] = []
+    for metadata_path in sorted(image_root.rglob("*.json")):
+        resolved_metadata, metadata_content = _stable_regular_file(
+            metadata_path, description="live capture metadata"
+        )
+        metadata_ref = capture_queue._capture_relative_ref(
+            image_root, resolved_metadata
+        )
+        live_index.append(
+            {
+                "schema_version": 1,
+                "metadata_ref": metadata_ref,
+                "metadata_sha256": _sha256_bytes(metadata_content),
+            }
+        )
+    live_index.sort(key=lambda row: row["metadata_ref"])
+    if recorded_index != live_index:
+        raise ValueError("capture metadata index does not match the exact live snapshot")
+
+    snapshot_bindings: dict[Path, bytes | None] = {
+        path: content for path, content in indexed_metadata.values()
+    }
+    expected_objective_by_sha: dict[str, dict[str, object]] = {}
+    expected_latest_queue_source: dict[
+        str, tuple[datetime, str, str]
+    ] = {}
+    expected_rows_after_cutoff = 0
+    expected_rejected_rows = 0
+    expected_rejection_counts: Counter[str] = Counter()
+    for index_row in recorded_index:
+        metadata_ref = str(index_row["metadata_ref"])
+        _, metadata_content = indexed_metadata[metadata_ref]
+        try:
+            metadata = _load_json_bytes(
+                metadata_content,
+                description=f"indexed capture metadata {metadata_ref}",
+            )
+            if type(metadata) is not dict:
+                raise ValueError("capture metadata must be an object")
+            captured_at = capture_queue._datetime(metadata["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            expected_rejected_rows += 1
+            expected_rejection_counts[
+                "capture_timestamp_missing_invalid_or_naive"
+            ] += 1
+            continue
+        captured_at_utc = captured_at.astimezone(timezone.utc)
+        if captured_at_utc < start_timestamp:
+            continue
+        expected_rows_after_cutoff += 1
+        try:
+            image_metadata = metadata["image"]
+            sha = capture_queue._valid_sha256(image_metadata["sha256"])
+            source, image_ref = capture_queue._resolve_capture_image(
+                image_root, image_metadata["path"]
+            )
+        except (KeyError, TypeError, ValueError):
+            expected_rejected_rows += 1
+            expected_rejection_counts[
+                "image_path_invalid_or_outside_capture_root"
+            ] += 1
+            continue
+        raw_reasons, resolved_source, source_content = capture_queue._image_quality_assessment(
+            source, image_metadata["sha256"]
+        )
+        if resolved_source is not None and source_content is not None:
+            snapshot_bindings[resolved_source] = source_content
+        elif source.is_symlink() or source.is_file():
+            raise ValueError("indexed capture source could not be read stably")
+        else:
+            snapshot_bindings[source] = None
+        quality_reason = capture_queue._objective_quality_reason(raw_reasons)
+        if raw_reasons:
+            expected_rejected_rows += 1
+            expected_rejection_counts.update(raw_reasons)
+        if quality_reason is None:
+            if not raw_reasons:
+                assert sha is not None
+                previous = expected_latest_queue_source.get(sha)
+                if previous is None or captured_at_utc > previous[0]:
+                    expected_latest_queue_source[sha] = (
+                        captured_at_utc,
+                        str(metadata["timestamp"]),
+                        image_ref,
+                    )
+            continue
+        assert sha is not None
+        if sha in expected_objective_by_sha:
+            raise ValueError(
+                "indexed captures contain duplicate objective-quality source SHA"
+            )
+        expected_objective_by_sha[sha] = {
+            "schema_version": 1,
+            "source_sha256": sha,
+            "capture_timestamp_utc": captured_at_utc.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "metadata_ref": metadata_ref,
+            "metadata_sha256": index_row["metadata_sha256"],
+            "image_ref": image_ref,
+            "raw_reasons": raw_reasons,
+            "quality_reason": quality_reason,
+        }
+    expected_known_suppressed = len(set(expected_objective_by_sha).intersection(known_shas))
+    for sha in set(expected_objective_by_sha).intersection(known_shas):
+        del expected_objective_by_sha[sha]
+    expected_objective_rows = [
+        expected_objective_by_sha[sha] for sha in sorted(expected_objective_by_sha)
+    ]
+    plain_evidence_rows = [
+        {key: value for key, value in row.items() if key != "_input_line"}
+        for row in evidence_rows
+    ]
+    if plain_evidence_rows != expected_objective_rows:
+        raise ValueError(
+            "objective evidence does not exactly cover the indexed capture snapshot"
+        )
+    expected_teacher_queue = [
+        {
+            "sha256": sha,
+            "timestamp": timestamp,
+            "image_ref": image_ref,
+            "decision": "teacher_required",
+        }
+        for sha, (_, timestamp, image_ref) in sorted(
+            expected_latest_queue_source.items(), key=lambda item: item[1][0]
+        )
+        if sha not in known_shas
+    ]
+    known_audit_value = _load_json_bytes(
+        input_contents["known_audit"], description="objective known audit"
+    )
+    assert type(known_audit_value) is dict
+    expected_decisions: Counter[str] = Counter()
+    for sha in expected_latest_queue_source:
+        if sha not in known_shas:
+            expected_decisions["teacher_required"] += 1
+        elif known_audit_value[sha].get("split") == "train":
+            expected_decisions["known_train"] += 1
+        else:
+            expected_decisions["protected_validation"] += 1
+    prepared_queue_rows = _load_jsonl_bytes(
+        output_contents["teacher_queue"], description="objective teacher queue"
+    )
+    plain_prepared_queue_rows = [
+        {key: value for key, value in row.items() if key != "_input_line"}
+        for row in prepared_queue_rows
+    ]
+    if plain_prepared_queue_rows != expected_teacher_queue:
+        raise ValueError(
+            "teacher queue does not exactly match the indexed capture snapshot"
+        )
+    expected_summary_diagnostics = {
+        "capture_rows_after_cutoff": expected_rows_after_cutoff,
+        "capture_rows_rejected": expected_rejected_rows,
+        "capture_rejection_counts": dict(sorted(expected_rejection_counts.items())),
+        "unique_images": len(expected_latest_queue_source),
+        "decisions": dict(expected_decisions),
+    }
+    for field, expected_value in expected_summary_diagnostics.items():
+        if not _exact_typed_value(summary.get(field), expected_value):
+            raise ValueError(
+                f"objective queue summary diagnostic mismatch: {field}"
+            )
+
+    selected: list[dict[str, str]] = []
+    source_bindings: list[tuple[Path, bytes, str, str]] = []
+    seen_shas: set[str] = set()
+    seen_metadata: set[Path] = set()
+    observed_shas: list[str] = []
+    reason_counts: Counter[str] = Counter()
+    source_binding_value: list[dict[str, object]] = []
+    for row in evidence_rows:
+        line = row.get("_input_line")
+        if set(row) - {"_input_line"} != OBJECTIVE_EVIDENCE_FIELDS:
+            raise ValueError(f"objective evidence line {line} schema is not exact")
+        if type(row.get("schema_version")) is not int or row.get("schema_version") != 1:
+            raise ValueError(f"objective evidence line {line} schema mismatch")
+        sha = _require_sha(
+            row.get("source_sha256"),
+            description=f"objective evidence line {line} source SHA",
+        )
+        if sha in seen_shas:
+            raise ValueError("objective evidence contains duplicate source SHA")
+        if sha in known_shas:
+            raise ValueError("objective evidence source is already in known audit")
+        captured_at = _timestamp(
+            row.get("capture_timestamp_utc"),
+            description=f"objective evidence line {line} timestamp",
+        )
+        canonical_timestamp = captured_at.isoformat().replace("+00:00", "Z")
+        if row.get("capture_timestamp_utc") != canonical_timestamp:
+            raise ValueError("objective evidence timestamp is not canonical UTC")
+        if captured_at < OPERATIONAL_CAPTURE_CUTOFF_UTC or captured_at < start_timestamp:
+            raise ValueError("objective evidence source is before its declared start")
+
+        metadata_ref = row.get("metadata_ref")
+        image_ref = row.get("image_ref")
+        if type(metadata_ref) is not str or type(image_ref) is not str:
+            raise ValueError("objective evidence local references are invalid")
+        metadata_path = _resolve_source(
+            image_root, metadata_ref, row_number=int(line)
+        )
+        if metadata_path in seen_metadata:
+            raise ValueError("objective evidence contains duplicate metadata reference")
+        metadata_content = _stable_bytes(
+            metadata_path, description=f"objective evidence metadata {line}"
+        )
+        metadata_sha = _require_sha(
+            row.get("metadata_sha256"),
+            description=f"objective evidence line {line} metadata SHA",
+        )
+        if _sha256_bytes(metadata_content) != metadata_sha:
+            raise ValueError("objective evidence metadata SHA mismatch")
+        metadata = _load_json_bytes(
+            metadata_content, description=f"objective evidence metadata {line}"
+        )
+        if type(metadata) is not dict or type(metadata.get("image")) is not dict:
+            raise ValueError("objective evidence metadata schema is invalid")
+        metadata_timestamp = _timestamp(
+            metadata.get("timestamp"),
+            description=f"objective evidence metadata {line} timestamp",
+        )
+        if metadata_timestamp != captured_at:
+            raise ValueError("objective evidence metadata timestamp mismatch")
+        image_metadata = metadata["image"]
+        if (
+            image_metadata.get("path") != image_ref
+            or image_metadata.get("sha256") != sha
+        ):
+            raise ValueError("objective evidence metadata/source binding mismatch")
+
+        source = _resolve_source(image_root, image_ref, row_number=int(line))
+        recomputed_reasons, resolved_source, source_content = (
+            capture_queue._image_quality_assessment(source, sha)
+        )
+        if resolved_source != source or source_content is None:
+            raise ValueError("objective evidence source is not stable and readable")
+        if _sha256_bytes(source_content) != sha:
+            raise ValueError("objective evidence source SHA mismatch")
+        raw_reasons = row.get("raw_reasons")
+        if (
+            type(raw_reasons) is not list
+            or any(type(reason) is not str for reason in raw_reasons)
+            or raw_reasons != sorted(set(raw_reasons))
+            or raw_reasons != recomputed_reasons
+        ):
+            raise ValueError("objective evidence raw reasons do not revalidate")
+        quality_reason = capture_queue._objective_quality_reason(raw_reasons)
+        if quality_reason is None or row.get("quality_reason") != quality_reason:
+            raise ValueError("objective evidence selected reason does not revalidate")
+        canonical_reason = QUALITY_EXCLUSION_REASON_ALIASES.get(
+            quality_reason, quality_reason
+        )
+        if canonical_reason not in QUALITY_EXCLUSION_REASONS:
+            raise RuntimeError("objective quality reason does not map to the contract")
+
+        selected.append({"path": image_ref, "reason": quality_reason})
+        source_bindings.append((source, source_content, sha, canonical_reason))
+        source_binding_value.append(
+            {
+                "source_sha256": sha,
+                "metadata_sha256": metadata_sha,
+                "quality_reason": quality_reason,
+            }
+        )
+        reason_counts[quality_reason] += 1
+        observed_shas.append(sha)
+        seen_shas.add(sha)
+        seen_metadata.add(metadata_path)
+        snapshot_bindings[metadata_path] = metadata_content
+
+    if observed_shas != sorted(observed_shas):
+        raise ValueError("objective evidence source SHAs are not sorted")
+    declared_bindings_digest = _require_sha(
+        input_digests.get("objective_source_bindings_sha256"),
+        description="objective source bindings digest",
+    )
+    if declared_bindings_digest != _sha256_bytes(
+        _json_bytes(source_binding_value, pretty=False)
+    ):
+        raise ValueError("objective source bindings digest mismatch")
+
+    counts = receipt.get("counts")
+    if type(counts) is not dict or set(counts) != OBJECTIVE_RECEIPT_COUNT_FIELDS:
+        raise ValueError("objective quality evidence counts schema is not exact")
+    for field in OBJECTIVE_RECEIPT_COUNT_FIELDS - {
+        "objective_quality_reason_counts"
+    }:
+        _require_count(counts.get(field), description=f"objective counts.{field}")
+    expected_reason_counts = dict(sorted(reason_counts.items()))
+    if (
+        counts.get("objective_quality_rejections") != len(evidence_rows)
+        or not _exact_typed_value(
+            counts.get("objective_quality_reason_counts"), expected_reason_counts
+        )
+        or counts.get("capture_metadata_index_rows") != len(capture_index_rows)
+        or counts.get("objective_known_audit_suppressed")
+        != expected_known_suppressed
+    ):
+        raise ValueError("objective quality evidence counts mismatch")
+    for field in OBJECTIVE_RECEIPT_COUNT_FIELDS:
+        if not _exact_typed_value(summary.get(field), counts.get(field)):
+            raise ValueError(f"objective summary/receipt count mismatch: {field}")
+    if not _exact_typed_value(
+        summary.get("teacher_queue"), len(prepared_queue_rows)
+    ):
+        raise ValueError("objective teacher queue count mismatch")
+
+    selected.sort(key=lambda value: value["path"])
+    return (
+        selected,
+        source_bindings,
+        resolved_outputs,
+        output_contents,
+        snapshot_bindings,
+        tuple(sorted(path for path, _ in indexed_metadata.values())),
+    )
 
 
 def _source_csv_bytes(rows: Sequence[Mapping[str, str]]) -> bytes:
@@ -905,6 +1492,7 @@ def assemble_operational_quality_exclusions(
     provider_b_spec: Path,
     image_root: Path,
     output_dir: Path,
+    objective_prepare_output_dir: Path | None = None,
 ) -> dict[str, object]:
     input_paths = {
         "teacher_queue": teacher_queue,
@@ -950,6 +1538,20 @@ def assemble_operational_quality_exclusions(
     normalized_output = output_parent / normalized_output.name
     if normalized_output.is_relative_to(teacher_output_dir):
         raise ValueError("output directory must not be inside teacher output authority")
+    if (
+        objective_prepare_output_dir is not None
+        and normalized_output.is_relative_to(image_root)
+    ):
+        raise ValueError("output directory must not be inside image root")
+    if objective_prepare_output_dir is not None:
+        objective_prepare_root = _stable_directory(
+            objective_prepare_output_dir,
+            description="objective prepare output directory",
+        )
+        if normalized_output.is_relative_to(objective_prepare_root):
+            raise ValueError(
+                "output directory must not be inside objective prepare evidence"
+            )
 
     queue_rows = _load_jsonl_bytes(
         input_contents["teacher_queue"], description="teacher queue"
@@ -981,7 +1583,7 @@ def assemble_operational_quality_exclusions(
         teacher_output_contents=teacher_output_contents,
         rejection_report=rejection_value,
     )
-    quality_rows, source_bindings = _quality_rows(
+    subjective_quality_rows, subjective_source_bindings = _quality_rows(
         rejections=rejections,
         queue_rows=queue_rows,
         label_rows=label_rows,
@@ -990,6 +1592,56 @@ def assemble_operational_quality_exclusions(
         minimum_confidence=minimum_confidence,
         image_root=image_root,
     )
+    objective_quality_rows: list[dict[str, str]] = []
+    objective_source_bindings: list[tuple[Path, bytes, str, str]] = []
+    resolved_objective_outputs: dict[str, Path] = {}
+    objective_output_contents: dict[str, bytes] = {}
+    objective_snapshot_bindings: dict[Path, bytes | None] = {}
+    objective_metadata_paths: tuple[Path, ...] = ()
+    if objective_prepare_output_dir is not None:
+        (
+            objective_quality_rows,
+            objective_source_bindings,
+            resolved_objective_outputs,
+            objective_output_contents,
+            objective_snapshot_bindings,
+            objective_metadata_paths,
+        ) = _objective_quality_rows(
+            prepare_output_dir=objective_prepare_output_dir,
+            input_contents=input_contents,
+            known_shas=known_shas,
+            image_root=image_root,
+        )
+
+    subjective_shas = {sha for _, _, sha, _ in subjective_source_bindings}
+    objective_shas = {sha for _, _, sha, _ in objective_source_bindings}
+    if subjective_shas.intersection(objective_shas):
+        raise ValueError("subjective and objective quality evidence overlap by SHA")
+    queued_or_inventoried_shas = {
+        _require_sha(
+            row.get("sha256"), description="teacher queue/objective partition SHA"
+        )
+        for row in queue_rows
+    }.union(
+        {
+            _require_sha(
+                row.get("sha256"),
+                description="capture inventory/objective partition SHA",
+            )
+            for row in inventory_rows
+        }
+    )
+    if objective_shas.intersection(queued_or_inventoried_shas):
+        raise ValueError(
+            "objective quality evidence overlaps the teacher queue or inventory"
+        )
+    quality_rows = [*subjective_quality_rows, *objective_quality_rows]
+    source_bindings = [*subjective_source_bindings, *objective_source_bindings]
+    if not quality_rows:
+        raise ValueError("no eligible post-cutoff quality exclusions")
+    if len({row["path"] for row in quality_rows}) != len(quality_rows):
+        raise ValueError("quality evidence overlaps by source path")
+    quality_rows.sort(key=lambda row: row["path"])
     _validate_teacher_acceptance_outputs(
         teacher_output_contents=teacher_output_contents,
         rejection_report=rejection_value,
@@ -1006,6 +1658,9 @@ def assemble_operational_quality_exclusions(
         "quality_producer": repo_root / "scripts" / "build_v4_quality_exclusion_manifest.py",
         "teacher_builder": repo_root / "scripts" / "build_operational_teacher_manifest.py",
         "teacher_contract": repo_root / "scripts" / "operational_teacher_contract.py",
+        "objective_queue_preparer": (
+            repo_root / "scripts" / "prepare_operational_capture_queue.py"
+        ),
     }
     resolved_code: dict[str, Path] = {}
     code_contents: dict[str, bytes] = {}
@@ -1051,6 +1706,11 @@ def assemble_operational_quality_exclusions(
             "assembly_schema": ASSEMBLY_SCHEMA,
             "artifact_role": ASSEMBLY_ROLE,
             "status": ASSEMBLY_STATUS,
+            "assembly_mode": (
+                "objective_and_subjective_quality"
+                if objective_prepare_output_dir is not None
+                else "legacy_subjective_only"
+            ),
             "quality_exclusion_contract": QUALITY_EXCLUSION_CONTRACT,
             "operational_capture_cutoff_kst": (
                 OPERATIONAL_CAPTURE_CUTOFF_KST.isoformat()
@@ -1069,14 +1729,29 @@ def assemble_operational_quality_exclusions(
                     f"teacher_output_{name}": _sha256_bytes(content)
                     for name, content in sorted(teacher_output_contents.items())
                 },
+                **{
+                    f"objective_prepare_{name}": _sha256_bytes(content)
+                    for name, content in sorted(objective_output_contents.items())
+                },
             },
             "observed_code_sha256": {
                 name: _sha256_bytes(content)
                 for name, content in sorted(code_contents.items())
             },
             "scope": {
-                "teacher_subjective_quality_only": True,
-                "objective_queue_rejections_recoverable": False,
+                "teacher_subjective_quality_included": bool(
+                    subjective_source_bindings
+                ),
+                "objective_queue_quality_included": bool(
+                    objective_source_bindings
+                ),
+                "objective_prepare_bundle_validated": (
+                    objective_prepare_output_dir is not None
+                ),
+                "subjective_quality_source_count": len(
+                    subjective_source_bindings
+                ),
+                "objective_quality_source_count": len(objective_source_bindings),
                 "paths_or_private_ids_exported": False,
                 "trusted_policy_pinned": False,
                 "executed_code_cryptographically_attested": False,
@@ -1109,6 +1784,42 @@ def assemble_operational_quality_exclusions(
                 )
         if {path.name for path in teacher_output_dir.iterdir()} != expected_teacher_names:
             raise RuntimeError("teacher output directory changed before assembly publish")
+        for name, path in resolved_objective_outputs.items():
+            if _stable_bytes(
+                path, description=f"final objective output rehash {name}"
+            ) != objective_output_contents[name]:
+                raise RuntimeError(
+                    f"objective prepare output changed before publish: {name}"
+                )
+        for path, expected_content in objective_snapshot_bindings.items():
+            if expected_content is None:
+                if path.is_symlink() or path.is_file():
+                    raise RuntimeError(
+                        "objective capture source state changed before publish"
+                    )
+            elif _stable_bytes(
+                path, description="final objective snapshot rehash"
+            ) != expected_content:
+                raise RuntimeError(
+                    "objective evidence metadata or source changed before publish"
+                )
+        if objective_prepare_output_dir is not None and tuple(
+            sorted(image_root.rglob("*.json"))
+        ) != objective_metadata_paths:
+            raise RuntimeError(
+                "objective capture metadata set changed before publish"
+            )
+        if objective_prepare_output_dir is not None:
+            objective_directory = _stable_directory(
+                objective_prepare_output_dir,
+                description="objective prepare output directory final recheck",
+            )
+            if {path.name for path in objective_directory.iterdir()} != set(
+                capture_queue.OUTPUT_FILES.values()
+            ):
+                raise RuntimeError(
+                    "objective prepare output directory changed before publish"
+                )
         for name, path in resolved_code.items():
             if _stable_bytes(path, description=f"final code rehash {name}") != code_contents[
                 name
@@ -1159,6 +1870,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.add_argument(f"--provider-{prefix}-spec", required=True, type=Path)
     parser.add_argument("--image-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--objective-prepare-output-dir", required=True, type=Path
+    )
     args = parser.parse_args(argv)
     result = assemble_operational_quality_exclusions(
         teacher_output_dir=args.teacher_output_dir,
@@ -1174,6 +1888,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         provider_b_spec=args.provider_b_spec,
         image_root=args.image_root,
         output_dir=args.output_dir,
+        objective_prepare_output_dir=args.objective_prepare_output_dir,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
     return 0

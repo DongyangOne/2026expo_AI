@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import pytest
 
+import scripts.prepare_operational_capture_queue as capture_queue
 from scripts.prepare_operational_capture_queue import prepare_queue
 
 
@@ -145,7 +146,7 @@ def test_cutoff_naive_timestamp_and_objective_bad_captures_are_excluded(tmp_path
         captures, "missing", "2026-08-01T00:00:02+09:00", "missing-client", value=103
     )
     (captures / "2026-08-01" / "missing.jpg").unlink()
-    _capture(
+    hash_mismatch_sha = _capture(
         captures,
         "hash-mismatch",
         "2026-08-01T00:00:03+09:00",
@@ -153,25 +154,56 @@ def test_cutoff_naive_timestamp_and_objective_bad_captures_are_excluded(tmp_path
         value=104,
         declared_sha256="0" * 64,
     )
-    _capture(
+    invalid_sha = _capture(
+        captures,
+        "invalid-sha",
+        "2026-08-01T00:00:03.500000+09:00",
+        "invalid-client",
+        value=105,
+        declared_sha256="G" * 64,
+    )
+    unreadable_sha = _capture(
         captures,
         "unreadable",
         "2026-08-01T00:00:04+09:00",
         "unreadable-client",
         readable=False,
     )
-    _capture(
+    unreadable_mismatch_sha = _capture(
+        captures,
+        "unreadable-mismatch",
+        "2026-08-01T00:00:04.500000+09:00",
+        "unreadable-mismatch-client",
+        readable=False,
+        declared_sha256="0" * 64,
+    )
+    unreadable_mismatch_path = (
+        captures / "2026-08-01" / "unreadable-mismatch.jpg"
+    )
+    unreadable_mismatch_path.write_bytes(b"different-not-an-image")
+    unreadable_mismatch_sha = hashlib.sha256(
+        unreadable_mismatch_path.read_bytes()
+    ).hexdigest()
+    tiny_sha = _capture(
         captures,
         "tiny",
         "2026-08-01T00:00:05+09:00",
         "tiny-client",
         size=(60, 80),
     )
-    _capture(
+    black_sha = _capture(
         captures, "black", "2026-08-01T00:00:06+09:00", "black-client", value=0
     )
-    _capture(
+    white_sha = _capture(
         captures, "white", "2026-08-01T00:00:07+09:00", "white-client", value=255
+    )
+    tiny_black_sha = _capture(
+        captures,
+        "tiny-black",
+        "2026-08-01T00:00:08+09:00",
+        "tiny-black-client",
+        value=0,
+        size=(60, 80),
     )
     shadow = tmp_path / "shadow.jsonl"
     shadow.write_text("", encoding="utf-8")
@@ -196,12 +228,137 @@ def test_cutoff_naive_timestamp_and_objective_bad_captures_are_excluded(tmp_path
     assert summary["capture_rejection_counts"] == {
         "capture_timestamp_missing_invalid_or_naive": 1,
         "image_extreme_overexposure": 1,
-        "image_extreme_underexposure": 1,
+        "image_extreme_underexposure": 2,
+        "invalid_image_sha256": 1,
         "image_missing": 1,
-        "image_resolution_below_minimum": 1,
-        "image_sha256_mismatch": 1,
-        "image_unreadable": 1,
+        "image_resolution_below_minimum": 2,
+        "image_sha256_mismatch": 2,
+        "image_unreadable": 2,
     }
+    objective_rows = [
+        json.loads(line)
+        for line in (output / capture_queue.OBJECTIVE_REJECTIONS_FILE)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [row["source_sha256"] for row in objective_rows] == sorted(
+        row["source_sha256"] for row in objective_rows
+    )
+    assert all(
+        set(row)
+        == {
+            "schema_version",
+            "source_sha256",
+            "capture_timestamp_utc",
+            "metadata_ref",
+            "metadata_sha256",
+            "image_ref",
+            "raw_reasons",
+            "quality_reason",
+        }
+        for row in objective_rows
+    )
+    by_sha = {row["source_sha256"]: row for row in objective_rows}
+    assert {
+        sha: by_sha[sha]["quality_reason"]
+        for sha in (
+            unreadable_sha,
+            tiny_sha,
+            black_sha,
+            white_sha,
+            tiny_black_sha,
+        )
+    } == {
+        unreadable_sha: "objective_unreadable",
+        tiny_sha: "resolution_too_low",
+        black_sha: "extreme_exposure",
+        white_sha: "extreme_exposure",
+        # Resolution has higher fixed priority than exposure when both fire.
+        tiny_black_sha: "resolution_too_low",
+    }
+    assert by_sha[unreadable_sha]["raw_reasons"] == ["image_unreadable"]
+    assert by_sha[tiny_sha]["raw_reasons"] == [
+        "image_resolution_below_minimum"
+    ]
+    assert by_sha[black_sha]["raw_reasons"] == [
+        "image_extreme_underexposure"
+    ]
+    assert by_sha[white_sha]["raw_reasons"] == [
+        "image_extreme_overexposure"
+    ]
+    assert by_sha[tiny_black_sha]["raw_reasons"] == [
+        "image_extreme_underexposure",
+        "image_resolution_below_minimum",
+    ]
+    # Integrity failures are counted but are never promoted to trusted quality
+    # exclusions, even when an objective detector also fires.
+    assert {
+        missing_sha,
+        hash_mismatch_sha,
+        invalid_sha,
+        unreadable_mismatch_sha,
+    }.isdisjoint(by_sha)
+    assert summary["objective_quality_rejections"] == 5
+    assert summary["objective_quality_reason_counts"] == {
+        "extreme_exposure": 2,
+        "objective_unreadable": 1,
+        "resolution_too_low": 2,
+    }
+    receipt = json.loads(
+        (output / capture_queue.OBJECTIVE_RECEIPT_FILE).read_text(encoding="utf-8")
+    )
+    assert {path.name for path in output.iterdir()} == set(
+        capture_queue.OUTPUT_FILES.values()
+    )
+    capture_index = [
+        json.loads(line)
+        for line in (output / capture_queue.OBJECTIVE_CAPTURE_INDEX_FILE)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(capture_index) == 12
+    assert [row["metadata_ref"] for row in capture_index] == sorted(
+        row["metadata_ref"] for row in capture_index
+    )
+    assert all(
+        set(row) == {"schema_version", "metadata_ref", "metadata_sha256"}
+        and row["schema_version"] == 1
+        and not Path(row["metadata_ref"]).is_absolute()
+        for row in capture_index
+    )
+    assert summary["capture_metadata_index_rows"] == len(capture_index)
+    assert receipt["counts"]["capture_metadata_index_rows"] == len(capture_index)
+    assert receipt["counts"]["objective_quality_rejections"] == 5
+    assert receipt["counts"]["objective_quality_reason_counts"] == summary[
+        "objective_quality_reason_counts"
+    ]
+    assert receipt["quality_policy"]["objective_reason_priority"] == [
+        {"raw_reason": raw, "quality_reason": reason}
+        for raw, reason in capture_queue.OBJECTIVE_REASON_PRIORITY
+    ]
+    assert receipt["privacy"] == {
+        "objective_evidence_structured_client_id_fields_exported": False,
+        "objective_evidence_structured_device_id_fields_exported": False,
+        "objective_evidence_prediction_outputs_exported": False,
+        "objective_evidence_absolute_paths_exported": False,
+        "objective_evidence_untrusted_relative_local_refs_present": True,
+        "objective_evidence_relative_refs_may_contain_identifiers": True,
+    }
+    evidence_text = (output / capture_queue.OBJECTIVE_REJECTIONS_FILE).read_text(
+        encoding="utf-8"
+    )
+    for private_value in (
+        "good-client",
+        "unreadable-client",
+        "tiny-client",
+        "black-client",
+        "white-client",
+        "tiny-black-client",
+    ):
+        assert private_value not in evidence_text
+    assert str(captures.resolve()) not in evidence_text
     # A uniformly mid-tone image is intentionally retained: there is no
     # camera-specific blur threshold and deployed predictions are not a gate.
     assert summary["teacher_queue"] == 1
@@ -273,3 +430,122 @@ def test_queue_rejects_symlink_that_resolves_outside_capture_root(tmp_path):
     assert summary["capture_rejection_counts"] == {
         "image_path_invalid_or_outside_capture_root": 1
     }
+
+
+def test_prepare_rejects_duplicate_objective_source_sha(tmp_path):
+    captures = tmp_path / "captures"
+    first_sha = _capture(
+        captures,
+        "tiny-a",
+        "2026-08-01T00:00:00+09:00",
+        "private-a",
+        size=(60, 80),
+    )
+    second_sha = _capture(
+        captures,
+        "tiny-b",
+        "2026-08-01T00:00:01+09:00",
+        "private-b",
+        size=(60, 80),
+    )
+    assert first_sha == second_sha
+    shadow = tmp_path / "shadow.jsonl"
+    shadow.write_text("", encoding="utf-8")
+    known = tmp_path / "known.json"
+    known.write_text("{}", encoding="utf-8")
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="duplicate objective-quality source SHA"):
+        prepare_queue(
+            captures_dir=captures,
+            shadow_log=shadow,
+            known_audit=known,
+            output_dir=output,
+            start_kst=capture_queue.OPERATIONAL_CAPTURE_CUTOFF_KST,
+        )
+    assert not output.exists()
+
+
+def test_prepare_rehashes_capture_source_before_publish(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    captures = tmp_path / "captures"
+    _capture(
+        captures,
+        "good",
+        "2026-08-01T00:00:00+09:00",
+        "private",
+    )
+    source = (captures / "2026-08-01" / "good.jpg").resolve()
+    shadow = tmp_path / "shadow.jsonl"
+    shadow.write_text("", encoding="utf-8")
+    known = tmp_path / "known.json"
+    known.write_text("{}", encoding="utf-8")
+    output = tmp_path / "output"
+    real_stable = capture_queue._stable_regular_bytes
+    source_reads = 0
+
+    def mutate_on_final_source_rehash(path: Path, *, description: str):
+        nonlocal source_reads
+        if path.resolve() == source:
+            source_reads += 1
+            if source_reads == 2:
+                source.write_bytes(b"changed-before-publication")
+        return real_stable(path, description=description)
+
+    monkeypatch.setattr(
+        capture_queue, "_stable_regular_bytes", mutate_on_final_source_rehash
+    )
+
+    with pytest.raises(RuntimeError, match="capture image changed before queue publication"):
+        prepare_queue(
+            captures_dir=captures,
+            shadow_log=shadow,
+            known_audit=known,
+            output_dir=output,
+            start_kst=capture_queue.OPERATIONAL_CAPTURE_CUTOFF_KST,
+        )
+    assert source_reads == 2
+    assert not output.exists()
+    assert not list(tmp_path.glob(".output.*"))
+
+
+def test_prepare_never_replaces_racing_destination(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    captures = tmp_path / "captures"
+    _capture(
+        captures,
+        "good",
+        "2026-08-01T00:00:00+09:00",
+        "private",
+    )
+    shadow = tmp_path / "shadow.jsonl"
+    shadow.write_text("", encoding="utf-8")
+    known = tmp_path / "known.json"
+    known.write_text("{}", encoding="utf-8")
+    output = tmp_path / "output"
+    real_publish = capture_queue._publish_directory_no_replace
+
+    def collide(staging: Path, destination: Path) -> None:
+        assert destination == output
+        destination.mkdir()
+        (destination / "sentinel.txt").write_text(
+            "do-not-replace", encoding="utf-8"
+        )
+        real_publish(staging, destination)
+
+    monkeypatch.setattr(capture_queue, "_publish_directory_no_replace", collide)
+
+    with pytest.raises(FileExistsError, match="overwrite immutable output"):
+        prepare_queue(
+            captures_dir=captures,
+            shadow_log=shadow,
+            known_audit=known,
+            output_dir=output,
+            start_kst=capture_queue.OPERATIONAL_CAPTURE_CUTOFF_KST,
+        )
+    assert {
+        path.name: path.read_text(encoding="utf-8") for path in output.iterdir()
+    } == {"sentinel.txt": "do-not-replace"}
+    assert not list(tmp_path.glob(".output.*"))

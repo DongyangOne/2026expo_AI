@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 import scripts.assemble_operational_quality_exclusions as quality_assembler
+import scripts.prepare_operational_capture_queue as capture_queue
 from scripts.build_operational_teacher_manifest import (
     ARTIFACT_NAMES,
     TEACHER_LABEL_SCHEMA_VERSION,
@@ -1141,6 +1142,146 @@ def _quality_assembly_fixture(
     return args, image_paths
 
 
+def _write_operational_capture_metadata(
+    captures: Path,
+    image_path: Path,
+    sha: str,
+    timestamp: str,
+    *,
+    client_id: str,
+) -> Path:
+    metadata_path = captures / f"{image_path.stem}.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "timestamp": timestamp,
+                "image": {"path": image_path.name, "sha256": sha},
+                "request": {"client_id": client_id, "device_id": "private-device"},
+                "result": {
+                    "status": "ALLOWED",
+                    "classification": {
+                        "class_name": "plastic",
+                        "confidence": 0.99,
+                    },
+                    "bbox": [1, 2, 3, 4],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return metadata_path
+
+
+def _objective_quality_assembly_fixture(
+    tmp_path: Path,
+) -> tuple[dict, Path, Path]:
+    """Build the real prepare -> teacher -> assembler input chain."""
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    captures = tmp_path / "captures"
+    captures.mkdir()
+    objective_path, objective_sha = _image(
+        captures, "objective-tiny", 100, size=(60, 80)
+    )
+    subjective_path, subjective_sha = _image(
+        captures, "subjective-boundary", 120
+    )
+    usable_path, usable_sha = _image(captures, "usable-control", 170)
+    _write_operational_capture_metadata(
+        captures,
+        objective_path,
+        objective_sha,
+        "2026-08-01T00:00:00+09:00",
+        client_id="private-objective-client",
+    )
+    _write_operational_capture_metadata(
+        captures,
+        subjective_path,
+        subjective_sha,
+        "2026-08-01T00:01:00+09:00",
+        client_id="private-subjective-client",
+    )
+    _write_operational_capture_metadata(
+        captures,
+        usable_path,
+        usable_sha,
+        "2026-08-01T00:02:00+09:00",
+        client_id="private-usable-client",
+    )
+    shadow = tmp_path / "shadow.jsonl"
+    shadow.write_text("", encoding="utf-8")
+    known = tmp_path / "known_audit.json"
+    known.write_text("{}", encoding="utf-8")
+    prepare_output = tmp_path / "prepare-output"
+    capture_queue.prepare_queue(
+        captures_dir=captures,
+        shadow_log=shadow,
+        known_audit=known,
+        output_dir=prepare_output,
+        start_kst=capture_queue.OPERATIONAL_CAPTURE_CUTOFF_KST,
+    )
+    queue_path = prepare_output / "teacher_queue.jsonl"
+    queue_rows = [
+        json.loads(line)
+        for line in queue_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["sha256"] for row in queue_rows} == {
+        subjective_sha,
+        usable_sha,
+    }
+    labels = []
+    for row in queue_rows:
+        path = captures / row["image_ref"]
+        if row["sha256"] == subjective_sha:
+            labels.append(
+                _teacher_row(
+                    path,
+                    row["sha256"],
+                    training_usable=False,
+                    quality_reason="boundary_unreadable",
+                )
+            )
+        else:
+            labels.append(_teacher_row(path, row["sha256"]))
+    _, labels_path = _build_inputs(tmp_path, queue_rows, labels)
+    evidence = _evidence_args(tmp_path)
+    teacher_output = tmp_path / "teacher-output"
+    _real_build_operational_teacher_manifest(
+        teacher_queue=queue_path,
+        teacher_labels=labels_path,
+        image_root=captures,
+        known_audit=known,
+        provider_a_manifest=evidence["provider_a_manifest"],
+        provider_a_name="detector_a",
+        provider_a_model=evidence["provider_a_model"],
+        provider_a_spec=evidence["provider_a_spec"],
+        provider_b_manifest=evidence["provider_b_manifest"],
+        provider_b_name="segmenter_b",
+        provider_b_model=evidence["provider_b_model"],
+        provider_b_spec=evidence["provider_b_spec"],
+        output_dir=teacher_output,
+        capture_inventory=prepare_output / "capture_inventory.json",
+    )
+    args = {
+        "teacher_output_dir": teacher_output,
+        "teacher_queue": queue_path,
+        "teacher_labels": labels_path,
+        "capture_inventory": prepare_output / "capture_inventory.json",
+        "known_audit": known,
+        "provider_a_manifest": evidence["provider_a_manifest"],
+        "provider_a_model": evidence["provider_a_model"],
+        "provider_a_spec": evidence["provider_a_spec"],
+        "provider_b_manifest": evidence["provider_b_manifest"],
+        "provider_b_model": evidence["provider_b_model"],
+        "provider_b_spec": evidence["provider_b_spec"],
+        "image_root": captures,
+        "output_dir": tmp_path / "quality-assembly",
+        "objective_prepare_output_dir": prepare_output,
+    }
+    return args, objective_path, subjective_path
+
+
 def _rewrite_bound_lineage_input(args: dict, name: str, path: Path) -> None:
     lineage_path = args["teacher_output_dir"] / ARTIFACT_NAMES["lineage"]
     lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
@@ -1192,11 +1333,15 @@ def test_operational_quality_assembler_emits_only_sha_and_canonical_reason(
         (output / ASSEMBLY_FILES["receipt"]).read_text(encoding="utf-8")
     )
     assert persisted_receipt == receipt
+    assert receipt["assembly_mode"] == "legacy_subjective_only"
     assert receipt["selected_source_count"] == 4
     assert set(receipt["authority"].values()) == {False}
     assert receipt["scope"] == {
-        "teacher_subjective_quality_only": True,
-        "objective_queue_rejections_recoverable": False,
+        "teacher_subjective_quality_included": True,
+        "objective_queue_quality_included": False,
+        "objective_prepare_bundle_validated": False,
+        "subjective_quality_source_count": 4,
+        "objective_quality_source_count": 0,
         "paths_or_private_ids_exported": False,
         "trusted_policy_pinned": False,
         "executed_code_cryptographically_attested": False,
@@ -1282,6 +1427,541 @@ def test_operational_quality_assembly_is_consumed_by_full_candidate_authority(
         "operational/before_2026_08_01_kst": 1,
         "quality/excessive_background_or_multi_object": 1,
     }
+
+
+def test_prepare_objective_quality_flows_through_assembler_and_candidate_authority(
+    tmp_path: Path,
+) -> None:
+    args, objective_path, subjective_path = _objective_quality_assembly_fixture(
+        tmp_path / "assembly"
+    )
+
+    receipt = assemble_operational_quality_exclusions(**args)
+
+    manifest_path = args["output_dir"] / ASSEMBLY_FILES["manifest"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    objective_sha = hashlib.sha256(objective_path.read_bytes()).hexdigest()
+    subjective_sha = hashlib.sha256(subjective_path.read_bytes()).hexdigest()
+    assert _validate_quality_manifest(manifest) == {
+        objective_sha: "too_low_resolution",
+        subjective_sha: "unreadable_boundary",
+    }
+    assert receipt["assembly_mode"] == "objective_and_subjective_quality"
+    assert receipt["scope"] == {
+        "teacher_subjective_quality_included": True,
+        "objective_queue_quality_included": True,
+        "objective_prepare_bundle_validated": True,
+        "subjective_quality_source_count": 1,
+        "objective_quality_source_count": 1,
+        "paths_or_private_ids_exported": False,
+        "trusted_policy_pinned": False,
+        "executed_code_cryptographically_attested": False,
+    }
+    published_text = "".join(
+        path.read_text(encoding="utf-8") for path in args["output_dir"].iterdir()
+    )
+    for forbidden in (
+        objective_path.name,
+        subjective_path.name,
+        "private-objective-client",
+        "private-subjective-client",
+        "capture_timestamp_utc",
+        "metadata_ref",
+        "image_ref",
+    ):
+        assert forbidden not in published_text
+
+    candidate = _candidate_authority_test_helpers()
+    fixture = candidate._fixture(tmp_path / "candidate")
+    bad_row = fixture["bad_row"]
+    bad_source = Path(bad_row["source_filepath"])
+    bad_source.write_bytes(objective_path.read_bytes())
+    bad_row["source_sha256"] = objective_sha
+    bad_row["origin"] = "ops"
+    bad_row["captured_at"] = "2026-08-01T00:00:00+09:00"
+    bad_row["auditor_sha256"] = candidate._fake_sha("ops-auditor-objective")
+    bad_row["teacher_output_sha256"] = candidate._fake_sha(
+        "ops-teacher-objective"
+    )
+    bad_row["localizer_output_sha256"] = candidate._fake_sha(
+        "ops-localizer-objective"
+    )
+    subjective_source = (
+        fixture["global_root"] / "data" / "source-subjective-quality.jpg"
+    )
+    subjective_crop = (
+        fixture["global_root"] / "data" / "crop-subjective-quality.jpg"
+    )
+    subjective_source.write_bytes(subjective_path.read_bytes())
+    subjective_crop.write_bytes(b"subjective-quality-crop")
+    subjective_row = dict(bad_row)
+    subjective_row.update(
+        {
+            "filepath": str(subjective_crop.resolve()),
+            "source_id": "source-id-subjective-quality",
+            "sample_id": "sample-subjective-quality",
+            "source_sha256": subjective_sha,
+            "image_sha256": hashlib.sha256(
+                subjective_crop.read_bytes()
+            ).hexdigest(),
+            "object_group": "group-subjective-quality",
+            "capture_session": "session-subjective-quality",
+            "source_filepath": str(subjective_source.resolve()),
+            "auditor_sha256": candidate._fake_sha("ops-auditor-subjective"),
+            "teacher_output_sha256": candidate._fake_sha(
+                "ops-teacher-subjective"
+            ),
+            "localizer_output_sha256": candidate._fake_sha(
+                "ops-localizer-subjective"
+            ),
+        }
+    )
+    fixture["rows"].append(subjective_row)
+    fixture["quality"] = manifest_path
+    candidate._refresh(fixture)
+
+    authority = candidate._run(fixture)
+
+    assert authority["counts"]["excluded"] == {
+        "operational/before_2026_08_01_kst": 1,
+        "quality/too_low_resolution": 1,
+        "quality/unreadable_boundary": 1,
+    }
+    train_rows = list(
+        csv.DictReader(
+            (
+                fixture["global_root"] / "authority" / "train_manifest.csv"
+            ).open(encoding="utf-8")
+        )
+    )
+    selected_train_shas = {row["source_sha256"] for row in train_rows}
+    assert {objective_sha, subjective_sha}.isdisjoint(selected_train_shas)
+
+
+def test_objective_quality_assembler_rejects_resealed_fuzzy_reason(
+    tmp_path: Path,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    prepare_output = args["objective_prepare_output_dir"]
+    evidence_path = prepare_output / capture_queue.OBJECTIVE_REJECTIONS_FILE
+    rows = [
+        json.loads(line)
+        for line in evidence_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    rows[0]["quality_reason"] = "resolution_low"
+    _jsonl(evidence_path, rows)
+    receipt_path = prepare_output / capture_queue.OBJECTIVE_RECEIPT_FILE
+    objective_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    objective_receipt["output_digests"]["objective_rejections_sha256"] = (
+        hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    )
+    receipt_path.write_text(
+        json.dumps(objective_receipt, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="does not exactly cover|selected reason does not revalidate"
+    ):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_rejects_resealed_later_start_kst(
+    tmp_path: Path,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    prepare_output = args["objective_prepare_output_dir"]
+    later_start = "2026-08-02T00:00:00+09:00"
+    summary_path = prepare_output / "queue_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["start_kst"] = later_start
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    receipt_path = prepare_output / capture_queue.OBJECTIVE_RECEIPT_FILE
+    objective_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    objective_receipt["start_kst"] = later_start
+    objective_receipt["output_digests"]["summary_sha256"] = hashlib.sha256(
+        summary_path.read_bytes()
+    ).hexdigest()
+    receipt_path.write_text(
+        json.dumps(objective_receipt, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="objective quality evidence must cover the exact operational cutoff",
+    ):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+@pytest.mark.parametrize(
+    ("field_path", "forged_value", "expected_error"),
+    (
+        (("schema_version",), True, "receipt identity mismatch"),
+        (
+            ("quality_policy", "minimum_width"),
+            True,
+            "evidence policy mismatch",
+        ),
+        (
+            ("privacy", "objective_evidence_absolute_paths_exported"),
+            0,
+            "privacy declaration mismatch",
+        ),
+        (
+            ("authority", "ground_truth"),
+            0,
+            "evidence authority mismatch",
+        ),
+    ),
+)
+def test_objective_quality_assembler_rejects_bool_int_schema_masquerade(
+    tmp_path: Path,
+    field_path: tuple[str, ...],
+    forged_value: object,
+    expected_error: str,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    receipt_path = (
+        args["objective_prepare_output_dir"]
+        / capture_queue.OBJECTIVE_RECEIPT_FILE
+    )
+    objective_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    target = objective_receipt
+    for field in field_path[:-1]:
+        target = target[field]
+    assert target[field_path[-1]] != forged_value or type(
+        target[field_path[-1]]
+    ) is not type(forged_value)
+    target[field_path[-1]] = forged_value
+    receipt_path.write_text(
+        json.dumps(objective_receipt, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=expected_error):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "forged_value"),
+    (
+        ("capture_rows_after_cutoff", 999),
+        ("capture_rows_rejected", 999),
+        ("capture_rejection_counts", {"forged_reason": 999}),
+        ("unique_images", 999),
+        ("decisions", {"teacher_required": 999}),
+    ),
+)
+def test_objective_quality_assembler_rejects_resealed_summary_diagnostics(
+    tmp_path: Path,
+    field: str,
+    forged_value: object,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    prepare_output = args["objective_prepare_output_dir"]
+    summary_path = prepare_output / "queue_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary[field] != forged_value
+    summary[field] = forged_value
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    receipt_path = prepare_output / capture_queue.OBJECTIVE_RECEIPT_FILE
+    objective_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    objective_receipt["output_digests"]["summary_sha256"] = hashlib.sha256(
+        summary_path.read_bytes()
+    ).hexdigest()
+    receipt_path.write_text(
+        json.dumps(objective_receipt, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"objective queue summary diagnostic mismatch: {field}",
+    ):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_reconstructs_subjective_queue_from_index(
+    tmp_path: Path,
+) -> None:
+    args, _, subjective_path = _objective_quality_assembly_fixture(tmp_path)
+    prepare_output = args["objective_prepare_output_dir"]
+    metadata_path = args["image_root"] / f"{subjective_path.stem}.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["timestamp"] = "2026-07-31T23:59:59+09:00"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    capture_index_path = (
+        prepare_output / capture_queue.OBJECTIVE_CAPTURE_INDEX_FILE
+    )
+    capture_index = [
+        json.loads(line)
+        for line in capture_index_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    metadata_ref = metadata_path.relative_to(args["image_root"]).as_posix()
+    indexed_row = next(
+        row for row in capture_index if row["metadata_ref"] == metadata_ref
+    )
+    indexed_row["metadata_sha256"] = hashlib.sha256(
+        metadata_path.read_bytes()
+    ).hexdigest()
+    _jsonl(capture_index_path, capture_index)
+
+    receipt_path = prepare_output / capture_queue.OBJECTIVE_RECEIPT_FILE
+    objective_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    objective_receipt["output_digests"]["capture_index_sha256"] = hashlib.sha256(
+        capture_index_path.read_bytes()
+    ).hexdigest()
+    receipt_path.write_text(
+        json.dumps(objective_receipt, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="teacher queue does not exactly match the indexed capture snapshot",
+    ):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_rejects_resealed_duplicate_sha(
+    tmp_path: Path,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    prepare_output = args["objective_prepare_output_dir"]
+    evidence_path = prepare_output / capture_queue.OBJECTIVE_REJECTIONS_FILE
+    row = json.loads(evidence_path.read_text(encoding="utf-8").strip())
+    _jsonl(evidence_path, [row, dict(row)])
+    receipt_path = prepare_output / capture_queue.OBJECTIVE_RECEIPT_FILE
+    objective_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    objective_receipt["output_digests"]["objective_rejections_sha256"] = (
+        hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    )
+    receipt_path.write_text(
+        json.dumps(objective_receipt, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not exactly cover|duplicate source SHA"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_rejects_fully_resealed_omission(
+    tmp_path: Path,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    prepare_output = args["objective_prepare_output_dir"]
+    evidence_path = prepare_output / capture_queue.OBJECTIVE_REJECTIONS_FILE
+    assert evidence_path.read_text(encoding="utf-8").strip()
+    evidence_path.write_bytes(b"")
+
+    summary_path = prepare_output / "queue_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["capture_rows_rejected"] = 0
+    summary["capture_rejection_counts"] = {}
+    summary["objective_quality_rejections"] = 0
+    summary["objective_quality_reason_counts"] = {}
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    receipt_path = prepare_output / capture_queue.OBJECTIVE_RECEIPT_FILE
+    objective_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    objective_receipt["counts"]["objective_quality_rejections"] = 0
+    objective_receipt["counts"]["objective_quality_reason_counts"] = {}
+    objective_receipt["input_digests"]["objective_source_bindings_sha256"] = (
+        hashlib.sha256(capture_queue._json_bytes([], pretty=False)).hexdigest()
+    )
+    for name, filename in capture_queue.OUTPUT_FILES.items():
+        if name == "objective_receipt":
+            continue
+        objective_receipt["output_digests"][f"{name}_sha256"] = hashlib.sha256(
+            (prepare_output / filename).read_bytes()
+        ).hexdigest()
+    receipt_path.write_text(
+        json.dumps(objective_receipt, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not exactly cover"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_and_subjective_same_sha_collision_is_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, image_paths = _quality_assembly_fixture(
+        tmp_path, ("boundary_unreadable",)
+    )
+    source = image_paths[0].resolve()
+    content = source.read_bytes()
+    sha = hashlib.sha256(content).hexdigest()
+
+    monkeypatch.setattr(
+        quality_assembler,
+        "_objective_quality_rows",
+        lambda **_kwargs: (
+            [{"path": source.name, "reason": "resolution_too_low"}],
+            [(source, content, sha, "too_low_resolution")],
+            {},
+            {},
+            {},
+            (),
+        ),
+    )
+    objective_placeholder = tmp_path.parent / f"{tmp_path.name}-objective-placeholder"
+    objective_placeholder.mkdir()
+    args["objective_prepare_output_dir"] = objective_placeholder
+    args["output_dir"] = tmp_path.parent / f"{tmp_path.name}-quality-output"
+
+    with pytest.raises(ValueError, match="overlap by SHA"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_rehashes_capture_metadata_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    prepare_output = args["objective_prepare_output_dir"]
+    evidence_row = json.loads(
+        (prepare_output / capture_queue.OBJECTIVE_REJECTIONS_FILE)
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    metadata_path = args["image_root"] / evidence_row["metadata_ref"]
+    original_metadata = metadata_path.read_bytes()
+    real_builder = quality_assembler.build_quality_exclusion_manifest
+
+    def mutate_metadata_after_manifest(**kwargs):
+        result = real_builder(**kwargs)
+        metadata_path.write_bytes(original_metadata + b" ")
+        return result
+
+    monkeypatch.setattr(
+        quality_assembler,
+        "build_quality_exclusion_manifest",
+        mutate_metadata_after_manifest,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="objective evidence metadata or source changed before publish"
+    ):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_rechecks_exact_metadata_set_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    injected_metadata = args["image_root"] / "late-capture.json"
+    real_builder = quality_assembler.build_quality_exclusion_manifest
+
+    def add_metadata_after_manifest(**kwargs):
+        result = real_builder(**kwargs)
+        injected_metadata.write_text("{}", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        quality_assembler,
+        "build_quality_exclusion_manifest",
+        add_metadata_after_manifest,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="objective capture metadata set changed before publish"
+    ):
+        assemble_operational_quality_exclusions(**args)
+    assert injected_metadata.is_file()
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_rejects_output_inside_image_root(
+    tmp_path: Path,
+) -> None:
+    args, _, _ = _objective_quality_assembly_fixture(tmp_path)
+    args["output_dir"] = args["image_root"] / "quality-assembly"
+
+    with pytest.raises(ValueError, match="output directory must not be inside image root"):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
+
+
+def test_objective_quality_assembler_rejects_queue_inventory_sha_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args, subjective_paths = _quality_assembly_fixture(
+        tmp_path / "assembly", ("boundary_unreadable",)
+    )
+    queue_rows = [
+        json.loads(line)
+        for line in args["teacher_queue"].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    inventory_rows = json.loads(
+        args["capture_inventory"].read_text(encoding="utf-8")
+    )
+    subjective_sha = hashlib.sha256(subjective_paths[0].read_bytes()).hexdigest()
+    overlap_row = next(row for row in queue_rows if row["sha256"] != subjective_sha)
+    overlap_sha = overlap_row["sha256"]
+    assert overlap_sha in {row["sha256"] for row in inventory_rows}
+    overlap_source = (args["image_root"] / overlap_row["image_ref"]).resolve()
+    overlap_content = overlap_source.read_bytes()
+    assert hashlib.sha256(overlap_content).hexdigest() == overlap_sha
+
+    monkeypatch.setattr(
+        quality_assembler,
+        "_objective_quality_rows",
+        lambda **_kwargs: (
+            [{"path": overlap_source.name, "reason": "resolution_too_low"}],
+            [(overlap_source, overlap_content, overlap_sha, "too_low_resolution")],
+            {},
+            {},
+            {},
+            (),
+        ),
+    )
+    objective_placeholder = tmp_path / "objective-placeholder"
+    objective_placeholder.mkdir()
+    args["objective_prepare_output_dir"] = objective_placeholder
+    args["output_dir"] = tmp_path / "quality-output"
+
+    with pytest.raises(
+        ValueError,
+        match="objective quality evidence overlaps the teacher queue or inventory",
+    ):
+        assemble_operational_quality_exclusions(**args)
+    assert not args["output_dir"].exists()
 
 
 def test_operational_quality_assembler_rejects_extra_decision_reason(
