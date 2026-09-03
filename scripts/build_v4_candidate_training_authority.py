@@ -24,6 +24,7 @@ import sys
 import tempfile
 import types
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -60,6 +61,78 @@ QUALITY_REASONS = {
     "unreadable_boundary",
     "too_low_resolution",
     "extreme_exposure",
+}
+QUALITY_ASSEMBLY_SCHEMA = "operational_quality_exclusion_assembly.v1"
+QUALITY_ASSEMBLY_ROLE = (
+    "operational_quality_exclusion_assembly_selection_only_"
+    "not_ground_truth_or_authority"
+)
+QUALITY_ASSEMBLY_STATUS = "operational_quality_exclusions_assembled"
+QUALITY_ASSEMBLY_MODE = "objective_and_subjective_quality"
+QUALITY_ASSEMBLY_TEACHER_SCHEMA = "operational_teacher_label.v3"
+QUALITY_ASSEMBLY_FILES = {
+    "manifest": "operational_quality_exclusions.json",
+    "receipt": "operational_quality_exclusion_assembly.json",
+    "marker": "assembly.sha256",
+}
+QUALITY_ASSEMBLY_INPUT_SHA_FIELDS = {
+    "teacher_queue",
+    "teacher_labels",
+    "capture_inventory",
+    "known_audit",
+    "provider_a_manifest",
+    "provider_a_model",
+    "provider_a_spec",
+    "provider_b_manifest",
+    "provider_b_model",
+    "provider_b_spec",
+    "teacher_output_csv",
+    "teacher_output_jsonl",
+    "teacher_output_empty_scene_csv",
+    "teacher_output_empty_scene_jsonl",
+    "teacher_output_rejections",
+    "teacher_output_lineage",
+    "objective_prepare_capture_index",
+    "objective_prepare_capture_inventory",
+    "objective_prepare_teacher_queue",
+    "objective_prepare_objective_rejections",
+    "objective_prepare_summary",
+    "objective_prepare_objective_receipt",
+}
+QUALITY_ASSEMBLY_CODE_SHA_FIELDS = {
+    "assembler",
+    "quality_producer",
+    "teacher_builder",
+    "teacher_contract",
+    "objective_queue_preparer",
+}
+QUALITY_ASSEMBLY_SCOPE_FIELDS = {
+    "teacher_subjective_quality_included",
+    "objective_queue_quality_included",
+    "objective_prepare_bundle_validated",
+    "subjective_quality_source_count",
+    "objective_quality_source_count",
+    "paths_or_private_ids_exported",
+    "trusted_policy_pinned",
+    "executed_code_cryptographically_attested",
+}
+QUALITY_ASSEMBLY_RECEIPT_FIELDS = {
+    "schema_version",
+    "assembly_schema",
+    "artifact_role",
+    "status",
+    "assembly_mode",
+    "quality_exclusion_contract",
+    "operational_capture_cutoff_kst",
+    "teacher_label_schema_version",
+    "selected_source_count",
+    "reason_counts",
+    "quality_manifest_sha256",
+    "quality_source_list_sha256",
+    "input_sha256",
+    "observed_code_sha256",
+    "scope",
+    "authority",
 }
 KST = ZoneInfo("Asia/Seoul")
 OPERATIONAL_CUTOFF = datetime(2026, 8, 1, 0, 0, 0, tzinfo=KST)
@@ -118,6 +191,7 @@ CLEAN_CONTAINER_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 POLICY_BINDING_FIELDS = {
     "qx3_diagnostic_ready_sha256", "qx3_diagnostic_report_sha256",
     "license_allowlist_sha256", "quality_exclusions_sha256",
+    "quality_exclusion_assembly_receipt_sha256",
     "protected_sources_sha256", "code_inventory_sha256",
     "training_config_sha256", "host_launch_contract_sha256",
     "raw_container_inspect_sha256", "pretrained_backbone_sha256",
@@ -242,6 +316,24 @@ def _require_sha256(value: object, field: str) -> str:
 def _require_bool(value: object, expected: bool, field: str) -> None:
     if type(value) is not bool or value is not expected:
         raise ValueError(f"{field} must be {expected!r}")
+
+
+def _exact_json_equal(left: object, right: object) -> bool:
+    """Compare JSON values without Python's bool/int equality aliasing."""
+
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        assert type(right) is dict
+        if set(left) != set(right):
+            return False
+        return all(_exact_json_equal(left[key], right[key]) for key in left)
+    if type(left) is list:
+        assert type(right) is list
+        return len(left) == len(right) and all(
+            _exact_json_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _reject_symlink_components(path: Path, description: str) -> Path:
@@ -793,12 +885,242 @@ def _validate_quality_manifest(value: Mapping[str, object]) -> dict[str, str]:
     ) != 100:
         raise ValueError("quality max_excluded_sources must be exactly 100")
     reason_counts = dict(sorted(Counter(row["reason"] for row in normalized).items()))
-    if value.get("reason_counts") != reason_counts:
+    if not _exact_json_equal(value.get("reason_counts"), reason_counts):
         raise ValueError("quality reason_counts mismatch")
     expected_sha = _sha256_bytes(_canonical_quality_entries(normalized))
     if value.get("source_list_sha256") != expected_sha:
         raise ValueError("quality source_list_sha256 mismatch")
     return parsed
+
+
+@dataclass(frozen=True)
+class _QualityAssemblyBundle:
+    root: Path
+    manifest_path: Path
+    receipt_path: Path
+    marker_path: Path
+    manifest_content: bytes
+    receipt_content: bytes
+    marker_content: bytes
+    observed_code_sha256: dict[str, str]
+
+
+def _quality_assembly_code_paths() -> dict[str, Path]:
+    root = Path(__file__).resolve().parents[1]
+    return {
+        "assembler": root / "scripts" / "assemble_operational_quality_exclusions.py",
+        "quality_producer": root / "scripts" / "build_v4_quality_exclusion_manifest.py",
+        "teacher_builder": root / "scripts" / "build_operational_teacher_manifest.py",
+        "teacher_contract": root / "scripts" / "operational_teacher_contract.py",
+        "objective_queue_preparer": root
+        / "scripts"
+        / "prepare_operational_capture_queue.py",
+    }
+
+
+def _quality_assembly_code_hashes() -> dict[str, str]:
+    return {
+        name: _sha256_bytes(
+            _stable_bytes(path, f"quality assembly observed code {name}")
+        )
+        for name, path in sorted(_quality_assembly_code_paths().items())
+    }
+
+
+def _quality_assembly_marker_bytes(
+    *, manifest_content: bytes, receipt_content: bytes
+) -> bytes:
+    contents = {
+        QUALITY_ASSEMBLY_FILES["manifest"]: manifest_content,
+        QUALITY_ASSEMBLY_FILES["receipt"]: receipt_content,
+    }
+    return "".join(
+        f"{_sha256_bytes(content)}  {name}\n"
+        for name, content in sorted(contents.items())
+    ).encode("ascii")
+
+
+def _validate_operational_quality_assembly(
+    *,
+    receipt_path: Path,
+    quality_path: Path,
+    quality_value: Mapping[str, object],
+    quality_content: bytes,
+    output_dir: Path,
+) -> _QualityAssemblyBundle:
+    """Validate the immutable full objective+subjective quality bundle."""
+
+    resolved_receipt = _regular_file(
+        receipt_path, "quality exclusion assembly receipt"
+    )
+    root = _reject_symlink_components(
+        resolved_receipt.parent, "quality exclusion assembly directory"
+    )
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("quality exclusion assembly parent must be a directory")
+    expected_names = set(QUALITY_ASSEMBLY_FILES.values())
+    if {entry.name for entry in root.iterdir()} != expected_names:
+        raise ValueError("quality exclusion assembly directory file set mismatch")
+    expected_receipt = root / QUALITY_ASSEMBLY_FILES["receipt"]
+    expected_manifest = root / QUALITY_ASSEMBLY_FILES["manifest"]
+    expected_marker = root / QUALITY_ASSEMBLY_FILES["marker"]
+    resolved_manifest = _regular_file(
+        quality_path, "quality exclusion assembly manifest"
+    )
+    if resolved_receipt != expected_receipt:
+        raise ValueError("quality exclusion assembly receipt basename mismatch")
+    if resolved_manifest != expected_manifest:
+        raise ValueError(
+            "quality exclusions must be the manifest beside the assembly receipt"
+        )
+    marker_path = _regular_file(expected_marker, "quality exclusion assembly marker")
+    normalized_output = Path(os.path.abspath(output_dir))
+    if normalized_output.is_relative_to(root):
+        raise ValueError("output directory must not be inside quality assembly evidence")
+
+    receipt, receipt_content = _load_json(
+        resolved_receipt, "quality exclusion assembly receipt"
+    )
+    marker_content = _stable_bytes(marker_path, "quality exclusion assembly marker")
+    if quality_content != _canonical_json(quality_value):
+        raise ValueError("quality exclusion assembly manifest is not canonical JSON")
+    if receipt_content != _canonical_json(receipt):
+        raise ValueError("quality exclusion assembly receipt is not canonical JSON")
+    if set(receipt) != QUALITY_ASSEMBLY_RECEIPT_FIELDS:
+        raise ValueError("quality exclusion assembly receipt schema mismatch")
+    if type(receipt.get("schema_version")) is not int or receipt.get(
+        "schema_version"
+    ) != 1:
+        raise ValueError("quality exclusion assembly schema_version mismatch")
+    exact_fields = {
+        "assembly_schema": QUALITY_ASSEMBLY_SCHEMA,
+        "artifact_role": QUALITY_ASSEMBLY_ROLE,
+        "status": QUALITY_ASSEMBLY_STATUS,
+        "assembly_mode": QUALITY_ASSEMBLY_MODE,
+        "quality_exclusion_contract": QUALITY_CONTRACT,
+        "operational_capture_cutoff_kst": OPERATIONAL_CUTOFF.isoformat(),
+        "teacher_label_schema_version": QUALITY_ASSEMBLY_TEACHER_SCHEMA,
+    }
+    for field, expected in exact_fields.items():
+        if receipt.get(field) != expected:
+            raise ValueError(f"quality exclusion assembly {field} mismatch")
+
+    selected_count = receipt.get("selected_source_count")
+    if type(selected_count) is not int or selected_count <= 0:
+        raise ValueError("quality exclusion assembly selected_source_count mismatch")
+    if selected_count != quality_value.get("excluded_source_count"):
+        raise ValueError("quality exclusion assembly selected count mismatch")
+    if not _exact_json_equal(
+        receipt.get("reason_counts"), quality_value.get("reason_counts")
+    ):
+        raise ValueError("quality exclusion assembly reason counts mismatch")
+    if receipt.get("quality_manifest_sha256") != _sha256_bytes(quality_content):
+        raise ValueError("quality exclusion assembly manifest SHA mismatch")
+    if receipt.get("quality_source_list_sha256") != quality_value.get(
+        "source_list_sha256"
+    ):
+        raise ValueError("quality exclusion assembly source-list SHA mismatch")
+
+    scope = receipt.get("scope")
+    if type(scope) is not dict or set(scope) != QUALITY_ASSEMBLY_SCOPE_FIELDS:
+        raise ValueError("quality exclusion assembly scope schema mismatch")
+    for field in (
+        "teacher_subjective_quality_included",
+        "objective_queue_quality_included",
+    ):
+        if type(scope.get(field)) is not bool:
+            raise ValueError(f"quality exclusion assembly scope.{field} must be boolean")
+    _require_bool(
+        scope.get("objective_prepare_bundle_validated"),
+        True,
+        "quality exclusion assembly scope.objective_prepare_bundle_validated",
+    )
+    for field in (
+        "paths_or_private_ids_exported",
+        "trusted_policy_pinned",
+        "executed_code_cryptographically_attested",
+    ):
+        _require_bool(
+            scope.get(field), False, f"quality exclusion assembly scope.{field}"
+        )
+    subjective_count = scope.get("subjective_quality_source_count")
+    objective_count = scope.get("objective_quality_source_count")
+    if (
+        type(subjective_count) is not int
+        or subjective_count < 0
+        or type(objective_count) is not int
+        or objective_count < 0
+        or subjective_count + objective_count != selected_count
+    ):
+        raise ValueError("quality exclusion assembly scope counts mismatch")
+    if scope.get("teacher_subjective_quality_included") is not (
+        subjective_count > 0
+    ) or scope.get("objective_queue_quality_included") is not (objective_count > 0):
+        raise ValueError("quality exclusion assembly scope inclusion flags mismatch")
+
+    authority = receipt.get("authority")
+    if type(authority) is not dict or set(authority) != set(FALSE_AUTHORITY_FIELDS):
+        raise ValueError("quality exclusion assembly authority schema mismatch")
+    for field in FALSE_AUTHORITY_FIELDS:
+        _require_bool(
+            authority.get(field), False, f"quality exclusion assembly authority.{field}"
+        )
+
+    input_sha256 = receipt.get("input_sha256")
+    if type(input_sha256) is not dict or set(input_sha256) != (
+        QUALITY_ASSEMBLY_INPUT_SHA_FIELDS
+    ):
+        raise ValueError("quality exclusion assembly input SHA schema mismatch")
+    for field, digest in input_sha256.items():
+        _require_sha256(digest, f"quality exclusion assembly input_sha256.{field}")
+
+    observed_code = receipt.get("observed_code_sha256")
+    if type(observed_code) is not dict or set(observed_code) != (
+        QUALITY_ASSEMBLY_CODE_SHA_FIELDS
+    ):
+        raise ValueError("quality exclusion assembly observed-code schema mismatch")
+    normalized_observed = {
+        str(field): _require_sha256(
+            digest, f"quality exclusion assembly observed_code_sha256.{field}"
+        )
+        for field, digest in observed_code.items()
+    }
+    if normalized_observed != _quality_assembly_code_hashes():
+        raise ValueError("quality exclusion assembly observed code is stale")
+
+    expected_marker_content = _quality_assembly_marker_bytes(
+        manifest_content=quality_content, receipt_content=receipt_content
+    )
+    if marker_content != expected_marker_content:
+        raise ValueError("quality exclusion assembly marker mismatch")
+    return _QualityAssemblyBundle(
+        root=root,
+        manifest_path=resolved_manifest,
+        receipt_path=resolved_receipt,
+        marker_path=marker_path,
+        manifest_content=quality_content,
+        receipt_content=receipt_content,
+        marker_content=marker_content,
+        observed_code_sha256=normalized_observed,
+    )
+
+
+def _rehash_operational_quality_assembly(bundle: _QualityAssemblyBundle) -> None:
+    if {entry.name for entry in bundle.root.iterdir()} != set(
+        QUALITY_ASSEMBLY_FILES.values()
+    ):
+        raise RuntimeError("quality exclusion assembly directory changed")
+    for path, expected, description in (
+        (bundle.manifest_path, bundle.manifest_content, "manifest"),
+        (bundle.receipt_path, bundle.receipt_content, "receipt"),
+        (bundle.marker_path, bundle.marker_content, "marker"),
+    ):
+        if _stable_bytes(path, f"quality exclusion assembly {description} final rehash") != (
+            expected
+        ):
+            raise RuntimeError(f"quality exclusion assembly {description} changed")
+    if _quality_assembly_code_hashes() != bundle.observed_code_sha256:
+        raise RuntimeError("quality exclusion assembly observed code changed")
 
 
 def _validate_full_data_report(
@@ -2537,7 +2859,8 @@ def _publish_preaudit_proposal(
     *, final: Path, source_manifests: Sequence[Path], manifest_shas: Sequence[str],
     full_data_validator_reports: Sequence[Path], full_report_shas: Sequence[str],
     license_allowlist: Path, quality_exclusions: Path, protected_sources: Path,
-    training_config: Path, selection_bindings: Mapping[str, str],
+    training_config: Path, quality_assembly_bundle: _QualityAssemblyBundle,
+    selection_bindings: Mapping[str, str],
     train_content: bytes, validation_content: bytes,
     dataset_snapshot_value: Mapping[str, object], dataset_snapshot_content: bytes,
     dataset_content_inventory: Sequence[Mapping[str, object]],
@@ -2699,6 +3022,7 @@ def _publish_preaudit_proposal(
                 selection_bindings[binding]
             ):
                 raise RuntimeError(f"{description} changed before preaudit publish")
+        _rehash_operational_quality_assembly(quality_assembly_bundle)
         for index, record in enumerate(dataset_source_inputs):
             _verify_dataset_input(record, f"preaudit source payload {index}")
         for index, record in enumerate(dataset_crop_inputs):
@@ -2742,6 +3066,7 @@ def _publish_preaudit_proposal(
         _verify_dataset_input(record, f"preaudit source payload post-publish {index}")
     for index, record in enumerate(dataset_crop_inputs):
         _verify_dataset_input(record, f"preaudit crop payload post-publish {index}")
+    _rehash_operational_quality_assembly(quality_assembly_bundle)
     with (final / "preaudit_proposal.sha256").open("xb") as handle:
         handle.write(marker_content)
         handle.flush()
@@ -2897,7 +3222,8 @@ def _validate_preaudit_proposal(
 def _build_candidate_bundle(
     *, source_manifests: Sequence[Path],
     full_data_validator_reports: Sequence[Path], license_allowlist: Path,
-    quality_exclusions: Path, protected_sources: Path, training_config: Path,
+    quality_exclusions: Path, quality_exclusion_assembly_receipt: Path,
+    protected_sources: Path, training_config: Path,
     output_dir: Path, proposal_only: bool,
     qx3_diagnostic_ready: Path | None = None,
     qx3_diagnostic_report: Path | None = None,
@@ -2952,6 +3278,13 @@ def _build_candidate_bundle(
 
     origins = _validate_license_allowlist(license_value)
     excluded_sources = _validate_quality_manifest(quality_value)
+    quality_assembly_bundle = _validate_operational_quality_assembly(
+        receipt_path=quality_exclusion_assembly_receipt,
+        quality_path=quality_exclusions,
+        quality_value=quality_value,
+        quality_content=quality_content,
+        output_dir=final,
+    )
     protected = _validate_protected_sources(protected_value)
     _validate_training_config(config_value)
 
@@ -3123,6 +3456,9 @@ def _build_candidate_bundle(
     policy_bindings: dict[str, str] = {
         "license_allowlist_sha256": _sha256_bytes(license_content),
         "quality_exclusions_sha256": _sha256_bytes(quality_content),
+        "quality_exclusion_assembly_receipt_sha256": _sha256_bytes(
+            quality_assembly_bundle.receipt_content
+        ),
         "protected_sources_sha256": _sha256_bytes(protected_content),
         "training_config_sha256": _sha256_bytes(config_content),
     }
@@ -3493,6 +3829,7 @@ def _build_candidate_bundle(
         field: policy_bindings[field]
         for field in (
             "license_allowlist_sha256", "quality_exclusions_sha256",
+            "quality_exclusion_assembly_receipt_sha256",
             "protected_sources_sha256", "training_config_sha256",
             "candidate_train_manifest_sha256",
             "candidate_model_validation_manifest_sha256",
@@ -3508,6 +3845,7 @@ def _build_candidate_bundle(
             full_report_shas=full_report_shas,
             license_allowlist=license_allowlist,
             quality_exclusions=quality_exclusions,
+            quality_assembly_bundle=quality_assembly_bundle,
             protected_sources=protected_sources,
             training_config=training_config,
             selection_bindings=proposal_selection_bindings,
@@ -3735,6 +4073,7 @@ def _build_candidate_bundle(
             path_aliases=snapshot_aliases,
         ) != dataset_content_inventory_sha:
             raise RuntimeError("dataset content inventory changed before publish")
+        _rehash_operational_quality_assembly(quality_assembly_bundle)
         _publish_directory_no_replace(stage, final)
     except Exception:
         for path in sorted(
@@ -3769,6 +4108,7 @@ def _build_candidate_bundle(
         _verify_dataset_input(record, f"source payload post-publish {index}")
     for index, record in enumerate(dataset_crop_inputs):
         _verify_dataset_input(record, f"crop payload post-publish {index}")
+    _rehash_operational_quality_assembly(quality_assembly_bundle)
     # The marker is the atomic completion seal. Until every post-publication
     # check succeeds, the exposed directory is intentionally not consumable by
     # the fail-closed launcher.
@@ -3782,8 +4122,8 @@ def _build_candidate_bundle(
 def build_preaudit_candidate_proposal(
     *, source_manifests: Sequence[Path],
     full_data_validator_reports: Sequence[Path], license_allowlist: Path,
-    quality_exclusions: Path, protected_sources: Path, training_config: Path,
-    output_dir: Path,
+    quality_exclusions: Path, quality_exclusion_assembly_receipt: Path,
+    protected_sources: Path, training_config: Path, output_dir: Path,
 ) -> dict[str, object]:
     """Create immutable inputs for the near-duplicate audit, with no authority."""
 
@@ -3792,6 +4132,7 @@ def build_preaudit_candidate_proposal(
         full_data_validator_reports=full_data_validator_reports,
         license_allowlist=license_allowlist,
         quality_exclusions=quality_exclusions,
+        quality_exclusion_assembly_receipt=quality_exclusion_assembly_receipt,
         protected_sources=protected_sources,
         training_config=training_config,
         output_dir=output_dir,
@@ -3803,7 +4144,8 @@ def build_training_authority(
     *, source_manifests: Sequence[Path],
     full_data_validator_reports: Sequence[Path], qx3_diagnostic_ready: Path,
     qx3_diagnostic_report: Path, trusted_policy: Path, license_allowlist: Path,
-    quality_exclusions: Path, protected_sources: Path,
+    quality_exclusions: Path, quality_exclusion_assembly_receipt: Path,
+    protected_sources: Path,
     near_duplicate_audit_report: Path, protected_reference_inventory: Path,
     code_inventory: Path, pretrained_backbone: Path, training_config: Path,
     host_launch_contract: Path, container_image_id: str, output_dir: Path,
@@ -3816,6 +4158,7 @@ def build_training_authority(
         full_data_validator_reports=full_data_validator_reports,
         license_allowlist=license_allowlist,
         quality_exclusions=quality_exclusions,
+        quality_exclusion_assembly_receipt=quality_exclusion_assembly_receipt,
         protected_sources=protected_sources,
         training_config=training_config,
         output_dir=output_dir,
@@ -3843,7 +4186,8 @@ def _parser() -> argparse.ArgumentParser:
         "--full-data-validator-report", action="append", type=Path, required=True
     )
     for name in (
-        "license_allowlist", "quality_exclusions", "protected_sources",
+        "license_allowlist", "quality_exclusions",
+        "quality_exclusion_assembly_receipt", "protected_sources",
         "training_config", "output_dir",
     ):
         parser.add_argument(f"--{name.replace('_', '-')}", type=Path, required=True)

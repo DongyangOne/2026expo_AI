@@ -106,15 +106,20 @@ Pi 서버의 2026-08-01 00:00 KST 이후 캡처는 141건, SHA-256 중복 제거
 선별한다.
 
 이미 확인된 촬영 실패가 v4 재현 pilot의 우선 anchor로 다시 뽑히지 않도록 SHA-only
-품질 제외 manifest를 사용한다. `scripts/build_v4_quality_exclusion_manifest.py`는 원본
-경로를 결과에 남기지 않고 `source_sha256`과 허용된 제외 사유만 기록하며, 최대 100개로
-제한한다. selector와 별도 CPU selection audit가 현재 데이터셋 membership과 완전 제외를
-재검증하고, GPU validator는 봉인된 audit 증거와 raw manifest 부재를 확인한다. 이
-manifest는 정답·학습·calibration·blind·배포 권한이 없으며, 유효한 캔·병·종이의
-구김·찌그러짐·압착을 촬영 실패로 제외하는 용도로 사용할 수 없다.
+품질 제외 manifest를 사용한다. 운영 후보용 manifest는
+`scripts/assemble_operational_quality_exclusions.py`가 teacher 주관 판정과 queue 이전
+객관 판독 실패를 함께 검증해 만든 것만 허용한다. 원본 경로를 결과에 남기지 않고
+`source_sha256`과 허용된 제외 사유만 기록하며 최대 100개로 제한한다. candidate
+preaudit/final은 `operational_quality_exclusion_assembly.json` receipt도 함께 받아 정확한
+8월 1일 cutoff, full objective+subjective mode, objective prepare bundle 검증, manifest
+digest·개수·사유, privacy/authority false 계약과 2행 marker를 다시 확인한다. receipt SHA는
+trusted policy와 authority에 결박한다. `build_v4_quality_exclusion_manifest.py` 단독 출력은
+진단용이며 candidate authority를 발급할 수 없다. 이 manifest와 receipt는 정답·학습·
+calibration·blind·배포 권한이 없으며, 유효한 캔·병·종이의 구김·찌그러짐·압착을 촬영
+실패로 제외하는 용도로 사용할 수 없다.
 
-관련 스크립트는 `prepare_operational_capture_queue.py`와
-`label_operational_captures_ollama.py`다.
+관련 스크립트는 `prepare_operational_capture_queue.py`,
+`label_operational_captures_ollama.py`, `assemble_operational_quality_exclusions.py`다.
 
 ## 학습과 승격 기준
 

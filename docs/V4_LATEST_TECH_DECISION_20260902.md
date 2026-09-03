@@ -49,8 +49,8 @@ YOLOE-26을 지원한다. 따라서 모델 이름만 바꾸는 재학습보다 �
    `teacher_required`만 받는다. 기존 train/보호 validation SHA를 teacher pseudo-label로
    재유입시키지 않으며, 최종 manifest의 절대경로 필드는 NAS 내부 후속 단계용이므로
    `portable=false`, `local_only_contains_absolute_paths=true`로 명시한다.
-10. 재현 pilot에서 이미 확인된 촬영 실패는
-    `scripts/build_v4_quality_exclusion_manifest.py`로 별도 봉인한다. 출력에는 원본
+10. 재현 pilot에서 이미 확인된 촬영 실패는 운영 teacher 판정과 queue 이전 객관 판정을
+    `scripts/assemble_operational_quality_exclusions.py`로 함께 검증해 봉인한다. 출력에는 원본
     `source_sha256`과 허용된 품질 사유만 기록하고 경로·파일명·사용자 식별자는 넣지
     않는다. manifest는 비어 있을 수 없고 최대 100개 SHA로 제한하며, selection·정답·
     replay·학습·calibration·blind·배포 권한을 모두 `false`로 고정한다.
@@ -66,19 +66,22 @@ YOLOE-26을 지원한다. 따라서 모델 이름만 바꾸는 재학습보다 �
 물체·혼잡, 경계/대상 판독 불가, 저해상도, 극단 노출 같은 촬영 실패만 제외하며,
 재활용품 자체의 구김·찌그러짐·압착은 제외 사유로 허용하지 않는다.
 
-단일 촬영 실패는 다음처럼 새 불변 파일로 만든다. 입력·출력은 심볼릭 링크가 없는
-절대 물리 경로를 사용하며 기존 출력은 덮어쓰지 않는다.
+`build_v4_quality_exclusion_manifest.py` 단독 출력은 producer 진단용일 뿐 candidate
+authority 입력으로 사용할 수 없다. 운영 후보는 `prepare_operational_capture_queue.py`의
+6개 불변 산출물과 teacher 산출물을 assembler에 함께 전달해야 한다. assembler 출력
+디렉터리는 다음 세 파일만 포함한다.
 
-```bash
-python scripts/build_v4_quality_exclusion_manifest.py \
-  --source /absolute/path/to/bad-capture.jpg \
-  --reason severe_frame_crop \
-  --output /absolute/control/quality-exclusions.json
-```
+- `operational_quality_exclusions.json`: SHA와 canonical 품질 사유만 포함
+- `operational_quality_exclusion_assembly.json`: full objective+subjective 검증 receipt
+- `assembly.sha256`: 위 두 파일의 정확한 2행 seal
 
-여러 장은 `path,reason` 두 컬럼의 UTF-8 CSV와 `--image-root`를 사용한다. 이후 selector,
-CPU audit, validator에는 동일 파일을 `--quality-exclusion-manifest` 또는
-`QUALITY_EXCLUSION_MANIFEST`로 전달한다.
+candidate preaudit/final에는 manifest와 함께
+`--quality-exclusion-assembly-receipt`를 반드시 전달한다. candidate builder는 두 파일이
+같은 non-symlink 디렉터리에 있고 파일 집합과 marker가 정확한지, cutoff가 정확히
+`2026-08-01T00:00:00+09:00`인지, `assembly_mode=objective_and_subjective_quality`와
+`objective_prepare_bundle_validated=true`인지 다시 검사한다. receipt SHA도 trusted policy와
+최종 authority에 결박한다. receipt 누락, legacy mode, 재봉인된 늦은 cutoff, manifest/receipt
+digest·count·reason 불일치, privacy/authority 타입 위장은 모두 후보 생성 전에 거부한다.
 
 ## 다음 실험 순서
 

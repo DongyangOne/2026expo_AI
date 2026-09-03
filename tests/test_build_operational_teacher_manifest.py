@@ -1396,7 +1396,7 @@ def test_operational_quality_assembler_emits_only_sha_and_canonical_reason(
     assert {path.name: path.read_bytes() for path in output.iterdir()} == before
 
 
-def test_operational_quality_assembly_is_consumed_by_full_candidate_authority(
+def test_legacy_operational_quality_assembly_is_rejected_by_candidate_authority(
     tmp_path: Path,
 ) -> None:
     args, image_paths = _quality_assembly_fixture(
@@ -1419,14 +1419,13 @@ def test_operational_quality_assembly_is_consumed_by_full_candidate_authority(
     bad_row["teacher_output_sha256"] = candidate._fake_sha("ops-teacher")
     bad_row["localizer_output_sha256"] = candidate._fake_sha("ops-localizer")
     fixture["quality"] = quality_manifest
+    fixture["quality_assembly_receipt"] = (
+        args["output_dir"] / ASSEMBLY_FILES["receipt"]
+    )
     candidate._refresh(fixture)
 
-    authority = candidate._run(fixture)
-
-    assert authority["counts"]["excluded"] == {
-        "operational/before_2026_08_01_kst": 1,
-        "quality/excessive_background_or_multi_object": 1,
-    }
+    with pytest.raises(ValueError, match="assembly_mode mismatch"):
+        candidate._run(fixture)
 
 
 def test_prepare_objective_quality_flows_through_assembler_and_candidate_authority(
@@ -1518,6 +1517,9 @@ def test_prepare_objective_quality_flows_through_assembler_and_candidate_authori
     )
     fixture["rows"].append(subjective_row)
     fixture["quality"] = manifest_path
+    fixture["quality_assembly_receipt"] = (
+        args["output_dir"] / ASSEMBLY_FILES["receipt"]
+    )
     candidate._refresh(fixture)
 
     authority = candidate._run(fixture)

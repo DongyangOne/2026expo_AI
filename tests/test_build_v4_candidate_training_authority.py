@@ -140,6 +140,97 @@ def _quality_value(entries: list[dict[str, str]]) -> dict[str, object]:
     }
 
 
+def _write_quality_assembly_bundle(
+    root: Path,
+    manifest_value: dict[str, object],
+    *,
+    scope_overrides: dict[str, object] | None = None,
+) -> tuple[Path, Path, Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = root / authority_builder.QUALITY_ASSEMBLY_FILES["manifest"]
+    receipt = root / authority_builder.QUALITY_ASSEMBLY_FILES["receipt"]
+    marker = root / authority_builder.QUALITY_ASSEMBLY_FILES["marker"]
+    manifest_content = authority_builder._canonical_json(manifest_value)
+    manifest.write_bytes(manifest_content)
+    selected_count = manifest_value["excluded_source_count"]
+    assert isinstance(selected_count, int)
+    scope: dict[str, object] = {
+        "teacher_subjective_quality_included": False,
+        "objective_queue_quality_included": True,
+        "objective_prepare_bundle_validated": True,
+        "subjective_quality_source_count": 0,
+        "objective_quality_source_count": selected_count,
+        "paths_or_private_ids_exported": False,
+        "trusted_policy_pinned": False,
+        "executed_code_cryptographically_attested": False,
+    }
+    if scope_overrides:
+        scope.update(scope_overrides)
+    receipt_value = {
+        "schema_version": 1,
+        "assembly_schema": authority_builder.QUALITY_ASSEMBLY_SCHEMA,
+        "artifact_role": authority_builder.QUALITY_ASSEMBLY_ROLE,
+        "status": authority_builder.QUALITY_ASSEMBLY_STATUS,
+        "assembly_mode": authority_builder.QUALITY_ASSEMBLY_MODE,
+        "quality_exclusion_contract": QUALITY_CONTRACT,
+        "operational_capture_cutoff_kst": OPERATIONAL_CUTOFF.isoformat(),
+        "teacher_label_schema_version": (
+            authority_builder.QUALITY_ASSEMBLY_TEACHER_SCHEMA
+        ),
+        "selected_source_count": selected_count,
+        "reason_counts": manifest_value["reason_counts"],
+        "quality_manifest_sha256": _sha(manifest_content),
+        "quality_source_list_sha256": manifest_value["source_list_sha256"],
+        "input_sha256": {
+            field: _fake_sha(f"quality-assembly-input:{field}")
+            for field in sorted(authority_builder.QUALITY_ASSEMBLY_INPUT_SHA_FIELDS)
+        },
+        "observed_code_sha256": authority_builder._quality_assembly_code_hashes(),
+        "scope": scope,
+        "authority": {
+            field: False for field in authority_builder.FALSE_AUTHORITY_FIELDS
+        },
+    }
+    receipt_content = authority_builder._canonical_json(receipt_value)
+    receipt.write_bytes(receipt_content)
+    marker.write_bytes(
+        authority_builder._quality_assembly_marker_bytes(
+            manifest_content=manifest_content,
+            receipt_content=receipt_content,
+        )
+    )
+    return manifest, receipt, marker
+
+
+def _reseal_quality_assembly(fixture: dict[str, object]) -> None:
+    quality = fixture["quality"]
+    receipt = fixture["quality_assembly_receipt"]
+    assert isinstance(quality, Path) and isinstance(receipt, Path)
+    value = json.loads(quality.read_text(encoding="utf-8"))
+    _write_quality_assembly_bundle(receipt.parent, value)
+
+
+def _rewrite_quality_assembly_receipt(
+    fixture: dict[str, object], mutate,
+    *, reseal_marker: bool = True,
+) -> None:
+    quality = fixture["quality"]
+    receipt = fixture["quality_assembly_receipt"]
+    marker = fixture["quality_assembly_marker"]
+    assert all(isinstance(path, Path) for path in (quality, receipt, marker))
+    value = json.loads(receipt.read_text(encoding="utf-8"))
+    mutate(value)
+    receipt_content = authority_builder._canonical_json(value)
+    receipt.write_bytes(receipt_content)
+    if reseal_marker:
+        marker.write_bytes(
+            authority_builder._quality_assembly_marker_bytes(
+                manifest_content=quality.read_bytes(),
+                receipt_content=receipt_content,
+            )
+        )
+
+
 def _write_manifest(fixture: dict[str, object]) -> None:
     path = fixture["manifest"]
     assert isinstance(path, Path)
@@ -157,6 +248,9 @@ def _policy_bindings(fixture: dict[str, object]) -> dict[str, str]:
         "qx3_diagnostic_report_sha256": "qx3_report",
         "license_allowlist_sha256": "license_path",
         "quality_exclusions_sha256": "quality",
+        "quality_exclusion_assembly_receipt_sha256": (
+            "quality_assembly_receipt"
+        ),
         "protected_sources_sha256": "protected",
         "candidate_near_duplicate_audit_sha256": "near_duplicate_audit",
         "protected_reference_inventory_sha256": "protected_inventory",
@@ -1046,16 +1140,18 @@ torch.onnx.export(
             },
         },
     )
-    quality = _dump(
-        global_root / "quality.json",
-        _quality_value(
-            [
-                {
-                    "source_sha256": bad_row["source_sha256"],
-                    "reason": "severe_frame_crop",
-                }
-            ]
-        ),
+    quality, quality_assembly_receipt, quality_assembly_marker = (
+        _write_quality_assembly_bundle(
+            global_root / "quality-assembly",
+            _quality_value(
+                [
+                    {
+                        "source_sha256": bad_row["source_sha256"],
+                        "reason": "severe_frame_crop",
+                    }
+                ]
+            ),
+        )
     )
     qx3_diagnostic_sources = [
         _fake_sha(f"qx3-{index}") for index in range(3500)
@@ -1378,6 +1474,9 @@ def _run(
             trusted_policy=policy,
             license_allowlist=fixture["license_path"],  # type: ignore[arg-type]
             quality_exclusions=fixture["quality"],  # type: ignore[arg-type]
+            quality_exclusion_assembly_receipt=fixture[
+                "quality_assembly_receipt"
+            ],  # type: ignore[arg-type]
             protected_sources=fixture["protected"],  # type: ignore[arg-type]
             near_duplicate_audit_report=fixture["near_duplicate_audit"],  # type: ignore[arg-type]
             protected_reference_inventory=fixture["protected_inventory"],  # type: ignore[arg-type]
@@ -1401,6 +1500,9 @@ def _build_preaudit_proposal(
         full_data_validator_reports=[fixture["full_report"]],  # type: ignore[list-item]
         license_allowlist=fixture["license_path"],  # type: ignore[arg-type]
         quality_exclusions=fixture["quality"],  # type: ignore[arg-type]
+        quality_exclusion_assembly_receipt=fixture[
+            "quality_assembly_receipt"
+        ],  # type: ignore[arg-type]
         protected_sources=fixture["protected"],  # type: ignore[arg-type]
         training_config=fixture["config"],  # type: ignore[arg-type]
         output_dir=global_root / output_name,
@@ -1474,6 +1576,11 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
         ).encode("utf-8")
     )
     policy_value = json.loads(fixture["policy"].read_text(encoding="utf-8"))  # type: ignore[union-attr]
+    receipt_path = fixture["quality_assembly_receipt"]
+    assert isinstance(receipt_path, Path)
+    assert authority["bindings"][  # type: ignore[index]
+        "quality_exclusion_assembly_receipt_sha256"
+    ] == _sha(receipt_path.read_bytes())
     for role, filename in (
         ("train", "train_manifest.csv"),
         ("model_validation", "model_validation_manifest.csv"),
@@ -1568,6 +1675,11 @@ def test_preaudit_proposal_is_non_authoritative_and_final_bytes_match(
         "operational/before_2026_08_01_kst": 1,
         "quality/severe_frame_crop": 1,
     }
+    receipt_path = fixture["quality_assembly_receipt"]
+    assert isinstance(receipt_path, Path)
+    assert proposal["bindings"][  # type: ignore[index]
+        "quality_exclusion_assembly_receipt_sha256"
+    ] == _sha(receipt_path.read_bytes())
 
     authority = _run(
         fixture,
@@ -1611,6 +1723,8 @@ def test_preaudit_proposal_cli_publishes_the_same_sealed_inputs(
             "--full-data-validator-report", os.fspath(fixture["full_report"]),
             "--license-allowlist", os.fspath(fixture["license_path"]),
             "--quality-exclusions", os.fspath(fixture["quality"]),
+            "--quality-exclusion-assembly-receipt",
+            os.fspath(fixture["quality_assembly_receipt"]),
             "--protected-sources", os.fspath(fixture["protected"]),
             "--training-config", os.fspath(fixture["config"]),
             "--output-dir", os.fspath(output),
@@ -1623,6 +1737,46 @@ def test_preaudit_proposal_cli_publishes_the_same_sealed_inputs(
     rendered = json.loads(result.stdout)
     assert rendered["training_authority"] is False
     assert (output / "preaudit_proposal.sha256").is_file()
+
+
+def test_quality_assembly_receipt_cli_argument_is_required(tmp_path: Path) -> None:
+    action = next(
+        item
+        for item in authority_builder._parser()._actions
+        if item.dest == "quality_exclusion_assembly_receipt"
+    )
+    assert action.required is True
+    script = Path(authority_builder.__file__).resolve()
+    missing = tmp_path / "missing"
+    output = tmp_path / "must-not-exist"
+    result = subprocess.run(
+        [
+            sys.executable,
+            os.fspath(script),
+            "--mode",
+            "preaudit-proposal",
+            "--source-manifest",
+            os.fspath(missing),
+            "--full-data-validator-report",
+            os.fspath(missing),
+            "--license-allowlist",
+            os.fspath(missing),
+            "--quality-exclusions",
+            os.fspath(missing),
+            "--protected-sources",
+            os.fspath(missing),
+            "--training-config",
+            os.fspath(missing),
+            "--output-dir",
+            os.fspath(output),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--quality-exclusion-assembly-receipt" in result.stderr
+    assert not output.exists()
 
 
 def test_final_builder_rejects_tampered_preaudit_manifest(tmp_path: Path) -> None:
@@ -1744,12 +1898,13 @@ def test_quality_reason_and_unknown_sha_fail_but_dent_is_preserved(tmp_path: Pat
             [{"source_sha256": _fake_sha("not-in-data"), "reason": "severe_frame_crop"}]
         ),
     )
+    _reseal_quality_assembly(fixture)
     _refresh(fixture)
     with pytest.raises(ValueError, match="absent from the full-data"):
         _run(fixture)
 
 
-def test_published_producer_manifest_is_accepted_and_uses_canonical_reason(
+def test_standalone_producer_manifest_cannot_bypass_operational_assembly(
     tmp_path: Path,
 ) -> None:
     fixture = _fixture(tmp_path)
@@ -1774,15 +1929,188 @@ def test_published_producer_manifest_is_accepted_and_uses_canonical_reason(
     fixture["quality"] = published
     _refresh(fixture)
 
-    authority = _run(fixture)
-
-    assert authority["counts"]["excluded"] == {  # type: ignore[index]
-        "operational/before_2026_08_01_kst": 1,
-        "quality/excessive_background_or_multi_object": 1,
-    }
+    with pytest.raises(ValueError, match="manifest beside the assembly receipt"):
+        _run(fixture)
     rendered = published.read_text(encoding="utf-8")
     assert "excessive_background_or_multi_object" in rendered
     assert "clutter_or_multiple_objects" not in rendered
+
+
+def test_quality_assembly_receipt_is_required_and_must_be_full_mode(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path / "missing")
+    fixture["quality_assembly_receipt"] = (
+        fixture["global_root"] / "missing-receipt.json"  # type: ignore[operator]
+    )
+    with pytest.raises(ValueError, match="must be a regular non-symlink file"):
+        _run(fixture)
+
+    fixture = _fixture(tmp_path / "legacy")
+    _rewrite_quality_assembly_receipt(
+        fixture,
+        lambda receipt: receipt.update(assembly_mode="legacy_subjective_only"),
+    )
+    with pytest.raises(ValueError, match="assembly_mode mismatch"):
+        _run(fixture)
+
+
+def test_quality_assembly_rejects_resealed_cutoff_and_manifest_mismatch(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path / "cutoff")
+    _rewrite_quality_assembly_receipt(
+        fixture,
+        lambda receipt: receipt.update(
+            operational_capture_cutoff_kst="2026-08-02T00:00:00+09:00"
+        ),
+    )
+    with pytest.raises(ValueError, match="operational_capture_cutoff_kst mismatch"):
+        _run(fixture)
+
+    fixture = _fixture(tmp_path / "manifest")
+    quality = fixture["quality"]
+    assert isinstance(quality, Path)
+    value = json.loads(quality.read_text(encoding="utf-8"))
+    value["entries"][0]["reason"] = "extreme_exposure"
+    value["reason_counts"] = {"extreme_exposure": 1}
+    value["source_list_sha256"] = _sha(
+        authority_builder._canonical_quality_entries(value["entries"])
+    )
+    quality.write_bytes(authority_builder._canonical_json(value))
+    _rewrite_quality_assembly_receipt(
+        fixture,
+        lambda receipt: receipt.update(
+            reason_counts=value["reason_counts"],
+            quality_source_list_sha256=value["source_list_sha256"],
+        ),
+    )
+    _refresh(fixture)
+    with pytest.raises(ValueError, match="manifest SHA mismatch"):
+        _run(fixture)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    (
+        (
+            lambda receipt: receipt.update(schema_version=True),
+            "schema_version mismatch",
+        ),
+        (
+            lambda receipt: receipt["authority"].update(training=0),
+            "authority.training",
+        ),
+        (
+            lambda receipt: receipt["scope"].update(
+                paths_or_private_ids_exported=0
+            ),
+            "scope.paths_or_private_ids_exported",
+        ),
+        (
+            lambda receipt: receipt["scope"].update(
+                objective_prepare_bundle_validated=1
+            ),
+            "scope.objective_prepare_bundle_validated",
+        ),
+        (
+            lambda receipt: receipt["scope"].update(
+                teacher_subjective_quality_included=True,
+                subjective_quality_source_count=1,
+            ),
+            "scope counts mismatch",
+        ),
+        (
+            lambda receipt: receipt["scope"].update(
+                teacher_subjective_quality_included=True
+            ),
+            "scope inclusion flags mismatch",
+        ),
+        (
+            lambda receipt: receipt["input_sha256"].update(
+                unexpected_input=_fake_sha("unexpected-input")
+            ),
+            "input SHA schema mismatch",
+        ),
+        (
+            lambda receipt: receipt["observed_code_sha256"].update(
+                assembler=_fake_sha("stale-assembler")
+            ),
+            "observed code is stale",
+        ),
+    ),
+)
+def test_quality_assembly_rejects_bool_int_semantic_tamper(
+    tmp_path: Path, mutate, expected: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _rewrite_quality_assembly_receipt(fixture, mutate)
+    with pytest.raises(ValueError, match=expected):
+        _run(fixture)
+
+
+def test_quality_assembly_rejects_marker_directory_and_policy_binding_tamper(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path / "marker")
+    marker = fixture["quality_assembly_marker"]
+    assert isinstance(marker, Path)
+    marker.write_bytes(marker.read_bytes() + b"0")
+    with pytest.raises(ValueError, match="marker mismatch"):
+        _run(fixture)
+
+    fixture = _fixture(tmp_path / "directory")
+    receipt = fixture["quality_assembly_receipt"]
+    assert isinstance(receipt, Path)
+    (receipt.parent / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+    with pytest.raises(ValueError, match="directory file set mismatch"):
+        _run(fixture)
+
+    fixture = _fixture(tmp_path / "policy")
+    policy = fixture["policy"]
+    assert isinstance(policy, Path)
+    value = json.loads(policy.read_text(encoding="utf-8"))
+    value["quality_exclusion_assembly_receipt_sha256"] = _fake_sha(
+        "wrong-quality-assembly-receipt"
+    )
+    _dump(policy, value)
+    with pytest.raises(
+        ValueError,
+        match="quality_exclusion_assembly_receipt_sha256 binding mismatch",
+    ):
+        _run(fixture)
+
+
+def test_quality_assembly_rejects_output_nested_beneath_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt = fixture["quality_assembly_receipt"]
+    assert isinstance(receipt, Path)
+    with pytest.raises(ValueError, match="must not be inside quality assembly"):
+        _run(fixture, output_name="quality-assembly/nested-output")
+
+
+def test_quality_assembly_receipt_toctou_leaves_no_completion_seal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt = fixture["quality_assembly_receipt"]
+    output = fixture["global_root"] / "authority"  # type: ignore[operator]
+    assert isinstance(receipt, Path)
+    real_publish = authority_builder._publish_directory_no_replace
+
+    def publish_then_mutate(source: Path, destination: Path) -> None:
+        real_publish(source, destination)
+        receipt.write_bytes(receipt.read_bytes() + b" ")
+
+    monkeypatch.setattr(
+        authority_builder, "_publish_directory_no_replace", publish_then_mutate
+    )
+    with pytest.raises(RuntimeError, match="assembly receipt changed"):
+        _run(fixture)
+    assert output.is_dir()
+    assert not (output / "training_authority.sha256").exists()
 
 
 def test_quality_manifest_limit_is_exactly_100(tmp_path: Path) -> None:
@@ -1809,6 +2137,34 @@ def test_quality_manifest_limit_is_exactly_100(tmp_path: Path) -> None:
     )
     _refresh(fixture)
     with pytest.raises(ValueError, match="at most 100"):
+        _run(fixture)
+
+    fixture = _fixture(tmp_path / "bool-reason-count")
+    quality_path = fixture["quality"]
+    assert isinstance(quality_path, Path)
+    quality_value = json.loads(quality_path.read_text(encoding="utf-8"))
+    quality_value["reason_counts"] = {"severe_frame_crop": True}
+    quality_path.write_bytes(authority_builder._canonical_json(quality_value))
+    _refresh(fixture)
+    with pytest.raises(ValueError, match="reason_counts mismatch"):
+        _run(fixture)
+
+    fixture = _fixture(tmp_path / "duplicate-source-sha")
+    quality_path = fixture["quality"]
+    assert isinstance(quality_path, Path)
+    quality_value = json.loads(quality_path.read_text(encoding="utf-8"))
+    quality_value["entries"] = [
+        quality_value["entries"][0],
+        dict(quality_value["entries"][0]),
+    ]
+    quality_value["excluded_source_count"] = 2
+    quality_value["reason_counts"] = {"severe_frame_crop": 2}
+    quality_value["source_list_sha256"] = _sha(
+        authority_builder._canonical_quality_entries(quality_value["entries"])
+    )
+    quality_path.write_bytes(authority_builder._canonical_json(quality_value))
+    _refresh(fixture)
+    with pytest.raises(ValueError, match="duplicate quality exclusion SHA"):
         _run(fixture)
 
 

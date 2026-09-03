@@ -361,6 +361,7 @@ def test_authority_and_marker_contract_is_fail_closed() -> None:
         'training_authority.sha256 must bind exactly eight expected files',
         '"dataset_snapshot_report"',
         '"candidate_dataset_snapshot_sha256"',
+        '"quality_exclusion_assembly_receipt_sha256"',
         '"dataset_snapshot_publish_receipt_sha256"',
         '"dataset_consumption_contract_sha256"',
         '"candidate_near_duplicate_audit_sha256"',

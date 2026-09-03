@@ -1040,6 +1040,7 @@ ALLOWED_QNAP_LIBRARY_MOUNTS = {
 POLICY_BINDING_FIELDS = {
     "qx3_diagnostic_ready_sha256", "qx3_diagnostic_report_sha256",
     "license_allowlist_sha256", "quality_exclusions_sha256",
+    "quality_exclusion_assembly_receipt_sha256",
     "protected_sources_sha256", "code_inventory_sha256",
     "training_config_sha256", "host_launch_contract_sha256",
     "raw_container_inspect_sha256", "pretrained_backbone_sha256",
