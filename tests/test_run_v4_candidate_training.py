@@ -108,8 +108,11 @@ def test_authority_and_marker_contract_is_fail_closed() -> None:
         '"pi_deployment_authorized", "spring_contract_modified"',
         'len(manifest_values) != 2',
         'expected_roles = {"train", "model_validation"}',
-        'len(marker_rows) != 7',
-        'training_authority.sha256 must bind exactly seven expected files',
+        'len(marker_rows) != 8',
+        'training_authority.sha256 must bind exactly eight expected files',
+        '"dataset_snapshot_report"',
+        '"candidate_dataset_snapshot_sha256"',
+        '"dataset_snapshot_publish_receipt_sha256"',
         'FORBIDDEN_DIAGNOSTIC_TOKENS',
     ):
         assert fragment in text
@@ -247,6 +250,24 @@ def test_qnap_loaded_library_provenance_is_bound_before_and_after_training() -> 
         "QNAP mapped-library provenance changed after candidate training",
     ):
         assert fragment in text
+
+
+def test_dataset_snapshot_is_policy_bound_and_reverified_at_every_boundary() -> None:
+    text = _text()
+    for fragment in (
+        '"schema") != "v4_candidate_dataset_snapshot.v1"',
+        '"candidate_dataset_snapshot_sha256"',
+        '"dataset_snapshot_publish_receipt_sha256"',
+        'candidate dataset snapshot contains duplicate sample/path/SHA',
+        'manifest rows do not consume the exact dataset snapshot object set',
+        '"candidate_dataset_snapshot": dataset_snapshot_report',
+        '"candidate_dataset_snapshot_runtime": dataset_snapshot_runtime_contract',
+        'dataset snapshot publish receipt changed',
+        'candidate_dataset_snapshot_report_sha256',
+        'candidate_dataset_snapshot_tree_sha256',
+    ):
+        assert fragment in text
+    assert text.count('verify_inputs || fail') >= 6
     assert text.count("def collect_qnap_mapped_library_contract(snapshot_report):") == 2
     assert text.count("collect_qnap_mapped_library_contract(") >= 5
 

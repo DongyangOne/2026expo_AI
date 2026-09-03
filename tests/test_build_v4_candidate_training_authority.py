@@ -136,6 +136,35 @@ def _policy_bindings(fixture: dict[str, object]) -> dict[str, str]:
     return result
 
 
+def _snapshot_report_bytes_for_policy(entries: list[dict[str, object]]) -> bytes:
+    """Render valid bytes, while allowing intentionally invalid leakage fixtures."""
+
+    try:
+        return authority_builder._dataset_snapshot_report(entries)[1]
+    except ValueError:
+        normalized = sorted(entries, key=lambda row: (str(row["role"]), str(row["sample_id"])))
+        tree_rows = [
+            {"path": row["path"], "size": row["size"], "sha256": row["sha256"]}
+            for row in sorted(normalized, key=lambda row: str(row["path"]))
+        ]
+        report = {
+            "schema": authority_builder.DATASET_SNAPSHOT_SCHEMA,
+            "artifact_role": authority_builder.DATASET_SNAPSHOT_ROLE,
+            "status": "candidate_dataset_snapshot_ready",
+            "candidate_only": True,
+            "production_deployment_authorized": False,
+            "payload_kind": "training_crop_only",
+            "source_lineage_bytes_snapshotted": False,
+            "snapshot_root_relative": "dataset_snapshot",
+            "snapshot_max_bytes": authority_builder.DATASET_SNAPSHOT_MAX_BYTES,
+            "object_count": len(normalized),
+            "total_regular_bytes": sum(int(row["size"]) for row in normalized),
+            "tree_sha256": _sha(authority_builder._canonical_compact_json(tree_rows)),
+            "objects": normalized,
+        }
+        return authority_builder._canonical_json(report)
+
+
 def _refresh(fixture: dict[str, object]) -> None:
     _write_manifest(fixture)
     manifest = fixture["manifest"]
@@ -226,6 +255,7 @@ def _refresh(fixture: dict[str, object]) -> None:
     selected: dict[str, list[dict[str, str]]] = {
         "train": [], "model_validation": []
     }
+    snapshot_plan: list[dict[str, object]] = []
     from datetime import datetime
 
     for row in rows:
@@ -242,8 +272,17 @@ def _refresh(fixture: dict[str, object]) -> None:
                 continue
         selected_row = {field: row.get(field, "") for field in OUTPUT_FIELDS}
         selected_row["source_filepath"] = Path(row["source_filepath"]).resolve().as_posix()
-        selected_row["filepath"] = Path(row["filepath"]).resolve().as_posix()
+        selected_row["filepath"] = authority_builder._snapshot_relative_path(
+            row["image_sha256"]
+        )
         selected[role].append(selected_row)
+        snapshot_plan.append({
+            "sample_id": row["sample_id"],
+            "role": role,
+            "path": selected_row["filepath"],
+            "size": Path(row["filepath"]).stat().st_size,
+            "sha256": row["image_sha256"],
+        })
     for selected_rows in selected.values():
         selected_rows.sort(key=lambda row: row["sample_id"])
     config_path = fixture["config"]
@@ -272,6 +311,9 @@ def _refresh(fixture: dict[str, object]) -> None:
         ),
         "candidate_model_validation_manifest_sha256": _sha(
             authority_builder._render_manifest(selected["model_validation"])
+        ),
+        "candidate_dataset_snapshot_sha256": _sha(
+            _snapshot_report_bytes_for_policy(snapshot_plan)
         ),
     }
     license_path = fixture["license_path"]
@@ -1034,6 +1076,8 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
     assert set(path.name for path in output.iterdir()) == {
         "train_manifest.csv",
         "model_validation_manifest.csv",
+        "candidate_dataset_snapshot.json",
+        "dataset_snapshot",
         "training_authority.json",
         "training_authority.sha256",
     }
@@ -1058,7 +1102,7 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
     assert any(row["category"] == "can" and row["dent"] == "0" for row in train_rows)
     assert all(row["sample_id"] not in {"sample-bad-shot", "sample-old-operation"} for row in train_rows)
     marker_rows = (output / "training_authority.sha256").read_text(encoding="utf-8").splitlines()
-    assert len(marker_rows) == 7
+    assert len(marker_rows) == 8
     marker_paths = set()
     for line in marker_rows:
         digest, path_text = line.split("  ", 1)
@@ -1069,6 +1113,7 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
         output / "training_authority.json",
         output / "train_manifest.csv",
         output / "model_validation_manifest.csv",
+        output / "candidate_dataset_snapshot.json",
         fixture["inventory"],
         fixture["config"],
         fixture["host"],
@@ -1106,6 +1151,22 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
         }
         assert _sha(Path(entry["source_path"]).read_bytes()) == entry["source_sha256"]
         assert _sha(Path(entry["crop_path"]).read_bytes()) == entry["crop_sha256"]
+        assert Path(entry["crop_path"]).is_relative_to(output / "dataset_snapshot")
+        assert Path(entry["crop_path"]).stat().st_nlink == 1
+        assert Path(entry["crop_path"]).stat().st_mode & 0o777 == 0o444
+    snapshot_report = json.loads(
+        (output / "candidate_dataset_snapshot.json").read_text(encoding="utf-8")
+    )
+    assert snapshot_report["schema"] == authority_builder.DATASET_SNAPSHOT_SCHEMA
+    assert snapshot_report["object_count"] == len(content_inventory)
+    assert snapshot_report["payload_kind"] == "training_crop_only"
+    assert authority["bindings"]["candidate_dataset_snapshot_sha256"] == _sha(  # type: ignore[index]
+        (output / "candidate_dataset_snapshot.json").read_bytes()
+    )
+    receipt = authority["dataset_snapshot_publish_receipt"]
+    assert authority["bindings"]["dataset_snapshot_publish_receipt_sha256"] == _sha(  # type: ignore[index]
+        authority_builder._canonical_json(receipt)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1538,6 +1599,7 @@ def test_authority_matches_strict_launcher_schema(tmp_path: Path) -> None:
     assert isinstance(artifacts, dict)
     assert set(artifacts) == {
         "manifests",
+        "dataset_snapshot_report",
         "code_inventory",
         "training_config",
         "host_launch_contract",
@@ -1551,6 +1613,7 @@ def test_authority_matches_strict_launcher_schema(tmp_path: Path) -> None:
     assert {item["role"] for item in manifests} == {"train", "model_validation"}
     for name in (
         "code_inventory",
+        "dataset_snapshot_report",
         "training_config",
         "host_launch_contract",
         "pretrained_backbone",
@@ -1673,7 +1736,10 @@ def _reseal_authority_marker(output: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("mutation", ("extra_authority_field", "forged_train_manifest"))
+@pytest.mark.parametrize(
+    "mutation",
+    ("extra_authority_field", "forged_train_manifest", "forged_snapshot_report"),
+)
 def test_launcher_rejects_consistently_rehashed_authority_forgery(
     tmp_path: Path, mutation: str
 ) -> None:
@@ -1685,7 +1751,7 @@ def test_launcher_rejects_consistently_rehashed_authority_forgery(
     authority = json.loads(authority_path.read_text(encoding="utf-8"))
     if mutation == "extra_authority_field":
         authority["unexpected"] = True
-    else:
+    elif mutation == "forged_train_manifest":
         train_path = output / "train_manifest.csv"
         rows = list(csv.DictReader(train_path.open(encoding="utf-8")))
         rows[0]["captured_at"] = "2026-08-02T00:00:00+09:00"
@@ -1697,6 +1763,14 @@ def test_launcher_rejects_consistently_rehashed_authority_forgery(
         )
         manifest["sha256"] = digest
         authority["bindings"]["candidate_train_manifest_sha256"] = digest
+    else:
+        report_path = output / "candidate_dataset_snapshot.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["snapshot_max_bytes"] += 1
+        report_path.write_bytes(authority_builder._canonical_json(report))
+        digest = _sha(report_path.read_bytes())
+        authority["artifacts"]["dataset_snapshot_report"]["sha256"] = digest
+        authority["bindings"]["candidate_dataset_snapshot_sha256"] = digest
     authority_path.write_bytes(authority_builder._canonical_json(authority))
     _reseal_authority_marker(output)
     wrapper, env, run_dir = _prepare_test_launcher(fixture)
@@ -1738,3 +1812,278 @@ def test_producer_output_runs_through_launcher_candidate_only(tmp_path: Path) ->
     assert ready["requires_independent_blind_hardware_gate"] is True
     assert ready["production_deployment_authorized"] is False
     assert not (control / "failed.txt").exists()
+
+
+def test_dataset_snapshot_is_content_addressed_and_isolated_from_live_crop(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    authority = _run(fixture)
+    output = fixture["global_root"] / "authority"  # type: ignore[operator]
+    manifest_rows = list(
+        csv.DictReader((output / "train_manifest.csv").open(encoding="utf-8"))
+    )
+    assert manifest_rows
+    for row in manifest_rows:
+        assert not Path(row["filepath"]).is_absolute()
+        assert row["filepath"] == authority_builder._snapshot_relative_path(
+            row["image_sha256"]
+        )
+        assert _sha((output / row["filepath"]).read_bytes()) == row["image_sha256"]
+    from scripts.train_multitask_verifier import read_manifests
+
+    trainer_rows = read_manifests(
+        [output / "train_manifest.csv", output / "model_validation_manifest.csv"]
+    )
+    assert trainer_rows
+    assert all(
+        item.path.is_relative_to(output / "dataset_snapshot")
+        for item in trainer_rows
+    )
+
+    original = fixture["rows"][0]  # type: ignore[index]
+    snapshot_row = next(
+        row for row in authority["dataset_content_inventory"]  # type: ignore[index]
+        if row["sample_id"] == original["sample_id"]
+    )
+    snapshot_path = Path(snapshot_row["crop_path"])
+    frozen = snapshot_path.read_bytes()
+    Path(original["filepath"]).write_bytes(b"live source changed after publication")
+    assert snapshot_path.read_bytes() == frozen
+    assert _sha(frozen) == snapshot_row["crop_sha256"]
+
+
+@pytest.mark.parametrize("duplicate_kind", ("path", "sha"))
+def test_dataset_snapshot_rejects_duplicate_crop_path_or_sha(
+    tmp_path: Path, duplicate_kind: str
+) -> None:
+    fixture = _fixture(tmp_path)
+    rows = fixture["rows"]
+    assert isinstance(rows, list)
+    first, second = rows[0], rows[1]
+    if duplicate_kind == "path":
+        second["filepath"] = first["filepath"]
+    else:
+        Path(second["filepath"]).write_bytes(Path(first["filepath"]).read_bytes())
+    second["image_sha256"] = first["image_sha256"]
+    _refresh(fixture)
+    with pytest.raises(ValueError, match="duplicate selected crop"):
+        _run(fixture)
+    assert not (fixture["global_root"] / "authority").exists()  # type: ignore[operator]
+
+
+def test_dataset_snapshot_rejects_hardlink_crop_alias(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    rows = fixture["rows"]
+    assert isinstance(rows, list)
+    first, second = rows[0], rows[1]
+    first_path = Path(first["filepath"])
+    second_path = Path(second["filepath"])
+    second_path.unlink()
+    try:
+        os.link(first_path, second_path)
+    except OSError:
+        pytest.skip("hardlink creation is unavailable")
+    second["image_sha256"] = first["image_sha256"]
+    _refresh(fixture)
+    with pytest.raises(ValueError, match="hardlink aliases are forbidden"):
+        _run(fixture)
+    assert not (fixture["global_root"] / "authority").exists()  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("alias_kind", ("leaf", "ancestor"))
+def test_dataset_snapshot_rejects_crop_symlink_leaf_or_ancestor(
+    tmp_path: Path, alias_kind: str
+) -> None:
+    fixture = _fixture(tmp_path)
+    row = fixture["rows"][0]  # type: ignore[index]
+    crop = Path(row["filepath"])
+    if alias_kind == "leaf":
+        real = crop.with_name("real-crop.jpg")
+        crop.replace(real)
+        try:
+            os.symlink(real, crop)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+    else:
+        alias = crop.parent.parent / "data-alias"
+        try:
+            os.symlink(crop.parent, alias, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlink creation is unavailable")
+        row["filepath"] = str((alias / crop.name).absolute())
+    _refresh(fixture)
+    with pytest.raises(ValueError, match="symlink"):
+        _run(fixture)
+    assert not (fixture["global_root"] / "authority").exists()  # type: ignore[operator]
+
+
+def test_dataset_snapshot_copy_detects_poison_then_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    row = fixture["rows"][0]  # type: ignore[index]
+    target = Path(row["filepath"])
+    original = (b"A" * (1024 * 1024)) + (b"B" * (1024 * 1024)) + b"tail"
+    target.write_bytes(original)
+    row["image_sha256"] = _sha(original)
+    _refresh(fixture)
+    original_open = Path.open
+    target_key = target.resolve()
+    matching_opens = 0
+
+    class PoisoningReader:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+            self.reads = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            self.handle.close()
+
+        def fileno(self) -> int:
+            return self.handle.fileno()
+
+        def read(self, size: int = -1) -> bytes:
+            self.reads += 1
+            if self.reads != 2:
+                return self.handle.read(size)
+            before = target.stat()
+            try:
+                with original_open(target, "r+b") as mutable:
+                    mutable.seek(1024 * 1024)
+                    mutable.write(b"Z" * (1024 * 1024))
+                    mutable.flush()
+                    os.fsync(mutable.fileno())
+                poisoned = self.handle.read(size)
+                with original_open(target, "r+b") as mutable:
+                    mutable.seek(0)
+                    mutable.write(original)
+                    mutable.truncate()
+                    mutable.flush()
+                    os.fsync(mutable.fileno())
+                os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+                return poisoned
+            except PermissionError:
+                pytest.skip("filesystem does not permit deterministic concurrent mutation")
+
+    def hooked_open(self: Path, *args, **kwargs):
+        nonlocal matching_opens
+        handle = original_open(self, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if self.resolve() == target_key and mode == "rb":
+            matching_opens += 1
+            if matching_opens == 3:
+                return PoisoningReader(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", hooked_open)
+    with pytest.raises(RuntimeError, match="changed during copy|approved SHA"):
+        _run(fixture)
+    global_root = fixture["global_root"]
+    assert not (global_root / "authority").exists()  # type: ignore[operator]
+    assert not list(global_root.glob(".authority.*"))  # type: ignore[union-attr]
+
+
+def test_dataset_snapshot_publish_failure_is_atomic(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    with patch.object(
+        authority_builder,
+        "_publish_directory_no_replace",
+        side_effect=OSError("injected rename failure"),
+    ):
+        with pytest.raises(OSError, match="injected rename failure"):
+            _run(fixture)
+    global_root = fixture["global_root"]
+    assert not (global_root / "authority").exists()  # type: ignore[operator]
+    assert not list(global_root.glob(".authority.*"))  # type: ignore[union-attr]
+
+
+def test_dataset_snapshot_publish_rejects_destination_race(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    global_root = fixture["global_root"]
+    final = global_root / "authority"  # type: ignore[operator]
+    original = authority_builder._publish_directory_no_replace
+    collision_inode: list[int] = []
+
+    def collide(stage: Path, destination: Path) -> None:
+        assert destination == final
+        destination.mkdir()
+        collision_inode.append(destination.stat().st_ino)
+        original(stage, destination)
+
+    with patch.object(authority_builder, "_publish_directory_no_replace", collide):
+        with pytest.raises(OSError):
+            _run(fixture)
+    assert collision_inode
+    assert final.is_dir()
+    assert final.stat().st_ino == collision_inode[0]
+    assert not list(final.iterdir())
+    assert not list(global_root.glob(".authority.*"))  # type: ignore[union-attr]
+
+
+def test_post_publish_failure_does_not_emit_completion_seal(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    original = authority_builder._verify_dataset_content_inventory
+
+    def fail_post_publish(
+        entries: object, description: str, **kwargs: object
+    ) -> str:
+        if description == "dataset content inventory post-publish":
+            raise RuntimeError("injected post-publish failure")
+        return original(entries, description, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(
+        authority_builder,
+        "_verify_dataset_content_inventory",
+        fail_post_publish,
+    ):
+        with pytest.raises(RuntimeError, match="injected post-publish failure"):
+            _run(fixture)
+    output = fixture["global_root"] / "authority"  # type: ignore[operator]
+    assert output.is_dir()
+    assert not (output / "training_authority.sha256").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+def test_dataset_snapshot_tree_rejects_special_entries(tmp_path: Path) -> None:
+    snapshot = tmp_path / "dataset_snapshot"
+    snapshot.mkdir()
+    os.mkfifo(snapshot / "extra")
+    if os.name != "nt":
+        snapshot.chmod(0o555)
+    report = {
+        "objects": [],
+        "total_regular_bytes": 0,
+        "tree_sha256": _sha(authority_builder._canonical_compact_json([])),
+    }
+    with pytest.raises(ValueError, match="regular files or directories"):
+        authority_builder._dataset_snapshot_tree_contract(
+            snapshot, report, logical_root=snapshot
+        )
+
+
+@pytest.mark.parametrize("mutation", ("mode", "inode"))
+def test_launcher_rejects_dataset_snapshot_mode_or_inode_change(
+    tmp_path: Path, mutation: str
+) -> None:
+    bash = _integration_bash(tmp_path)
+    fixture = _fixture(tmp_path)
+    authority = _run(fixture)
+    snapshot = Path(authority["dataset_content_inventory"][0]["crop_path"])  # type: ignore[index]
+    content = snapshot.read_bytes()
+    os.chmod(snapshot, 0o644)
+    if mutation == "inode":
+        snapshot.unlink()
+        snapshot.write_bytes(content)
+        os.chmod(snapshot, 0o444)
+    wrapper, env, run_dir = _prepare_test_launcher(fixture)
+    result = subprocess.run(
+        [bash, wrapper.as_posix()], env=env, text=True,
+        capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert (run_dir / "control" / "failed.txt").is_file()
+    assert not (run_dir / "control" / "candidate_training_ready.json").exists()

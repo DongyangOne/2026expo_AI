@@ -8,7 +8,9 @@ blind-test, promotion, Pi, Spring, or production authority.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import csv
+import errno
 import hashlib
 import io
 import json
@@ -17,6 +19,8 @@ import os
 import posixpath
 import re
 import shutil
+import stat
+import sys
 import tempfile
 from collections import Counter
 from datetime import datetime
@@ -111,6 +115,7 @@ POLICY_BINDING_FIELDS = {
     "raw_container_inspect_sha256", "pretrained_backbone_sha256",
     "container_image_id", "candidate_train_manifest_sha256",
     "candidate_model_validation_manifest_sha256",
+    "candidate_dataset_snapshot_sha256",
 }
 TRUST_ROOT_CODE_PATHS = {
     "configs/v4_candidate_training_trusted_policy.json",
@@ -134,6 +139,11 @@ ALLOWED_QNAP_LIBRARY_MOUNTS = {
 }
 QNAP_LIBRARY_INVENTORY_SCHEMA = "v4_qnap_library_inventory.v1"
 QNAP_LIBRARY_SNAPSHOT_MAX_BYTES = 3221225472
+DATASET_SNAPSHOT_SCHEMA = "v4_candidate_dataset_snapshot.v1"
+DATASET_SNAPSHOT_ROLE = (
+    "candidate_training_crop_bytes_not_blind_or_deployment_authority"
+)
+DATASET_SNAPSHOT_MAX_BYTES = 68719476736
 
 
 def _reject_duplicate_keys(items: list[tuple[str, object]]) -> dict[str, object]:
@@ -190,6 +200,51 @@ def _reject_symlink_components(path: Path, description: str) -> Path:
     return absolute
 
 
+def _publish_directory_no_replace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without ever replacing a destination."""
+
+    if os.name == "nt":
+        # Windows rename fails if the destination already exists.
+        os.rename(source, destination)
+        return
+    if not sys.platform.startswith("linux"):
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace directory publication is unsupported",
+            os.fspath(destination),
+        )
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "renameat2 is required for atomic no-replace publication",
+            os.fspath(destination),
+        )
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,  # AT_FDCWD
+        os.fsencode(source),
+        -100,  # AT_FDCWD
+        os.fsencode(destination),
+        1,  # RENAME_NOREPLACE
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            os.fspath(destination),
+        )
+
+
 def _regular_file(path: Path, description: str) -> Path:
     absolute = _reject_symlink_components(path, description)
     if absolute.is_symlink() or not absolute.is_file():
@@ -211,6 +266,296 @@ def _stable_bytes(path: Path, description: str) -> bytes:
     ):
         raise RuntimeError(f"{description} changed while being read: {resolved}")
     return content
+
+
+def _dataset_stat_contract(value: os.stat_result) -> dict[str, int]:
+    return {
+        "dev": int(value.st_dev),
+        "ino": int(value.st_ino),
+        "size": int(value.st_size),
+        "mode": stat.S_IMODE(value.st_mode),
+        "mtime_ns": int(value.st_mtime_ns),
+        "ctime_ns": int(value.st_ctime_ns),
+        "nlink": int(value.st_nlink),
+    }
+
+
+def _dataset_stat_core(value: Mapping[str, object]) -> tuple[object, ...]:
+    return tuple(value[key] for key in (
+        "dev", "ino", "size", "mode", "mtime_ns", "nlink"
+    ))
+
+
+def _read_dataset_input(
+    path: Path, description: str, expected_sha256: str
+) -> dict[str, object]:
+    """Hash one payload through one descriptor and bind its path identity."""
+
+    absolute = _reject_symlink_components(path, description)
+    before = absolute.stat(follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or absolute.is_symlink():
+        raise ValueError(f"{description} must be a regular non-symlink file")
+    if before.st_nlink != 1:
+        raise ValueError(f"{description} hardlink aliases are forbidden")
+    digest = hashlib.sha256()
+    with absolute.open("rb") as handle:
+        opened_before = os.fstat(handle.fileno())
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        opened_after = os.fstat(handle.fileno())
+    after = absolute.stat(follow_symlinks=False)
+    path_before = _dataset_stat_contract(before)
+    handle_before = _dataset_stat_contract(opened_before)
+    handle_after = _dataset_stat_contract(opened_after)
+    path_after = _dataset_stat_contract(after)
+    if (
+        path_before != path_after
+        or handle_before != handle_after
+        or len({
+            _dataset_stat_core(path_before),
+            _dataset_stat_core(handle_before),
+            _dataset_stat_core(handle_after),
+            _dataset_stat_core(path_after),
+        }) != 1
+    ):
+        raise RuntimeError(f"{description} changed while being hashed: {absolute}")
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(f"{description} content hash mismatch")
+    return {
+        "path": absolute.as_posix(),
+        "sha256": actual_sha256,
+        **path_before,
+    }
+
+
+def _verify_dataset_input(record: Mapping[str, object], description: str) -> None:
+    expected_fields = {
+        "path", "sha256", "dev", "ino", "size", "mode", "mtime_ns",
+        "ctime_ns", "nlink",
+    }
+    if set(record) != expected_fields:
+        raise ValueError(f"{description} input record schema mismatch")
+    path = Path(str(record["path"]))
+    current = _read_dataset_input(
+        path, description, _require_sha256(record.get("sha256"), f"{description} SHA")
+    )
+    if current != dict(record):
+        raise RuntimeError(f"{description} identity changed")
+
+
+def _snapshot_relative_path(image_sha256: str) -> str:
+    digest = _require_sha256(image_sha256, "dataset snapshot crop SHA")
+    return f"dataset_snapshot/objects/{digest[:2]}/{digest}"
+
+
+def _dataset_snapshot_report(
+    entries: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], bytes]:
+    expected_fields = {"sample_id", "role", "path", "size", "sha256"}
+    normalized: list[dict[str, object]] = []
+    seen_samples: set[str] = set()
+    seen_paths: set[str] = set()
+    seen_shas: set[str] = set()
+    total = 0
+    for index, raw in enumerate(entries):
+        if set(raw) != expected_fields:
+            raise ValueError(f"dataset snapshot plan row {index} schema mismatch")
+        sample_id = raw.get("sample_id")
+        role = raw.get("role")
+        relative = raw.get("path")
+        size = raw.get("size")
+        digest = _require_sha256(
+            raw.get("sha256"), f"dataset snapshot plan row {index} SHA"
+        )
+        if type(sample_id) is not str or not sample_id or role not in ROLE_SPLITS:
+            raise ValueError(f"dataset snapshot plan row {index} identity mismatch")
+        if type(relative) is not str or relative != _snapshot_relative_path(digest):
+            raise ValueError(f"dataset snapshot plan row {index} path mismatch")
+        if type(size) is not int or size <= 0:
+            raise ValueError(f"dataset snapshot plan row {index} size mismatch")
+        if sample_id in seen_samples:
+            raise ValueError("duplicate dataset snapshot sample_id")
+        if relative in seen_paths:
+            raise ValueError("duplicate dataset snapshot canonical path")
+        if digest in seen_shas:
+            raise ValueError("duplicate dataset snapshot crop SHA")
+        seen_samples.add(sample_id)
+        seen_paths.add(relative)
+        seen_shas.add(digest)
+        total += size
+        normalized.append({
+            "sample_id": sample_id,
+            "role": role,
+            "path": relative,
+            "size": size,
+            "sha256": digest,
+        })
+    normalized.sort(key=lambda row: (str(row["role"]), str(row["sample_id"])))
+    if not normalized:
+        raise ValueError("dataset snapshot plan is empty")
+    if total > DATASET_SNAPSHOT_MAX_BYTES:
+        raise ValueError("dataset snapshot exceeds snapshot_max_bytes")
+    tree_rows = [
+        {"path": row["path"], "size": row["size"], "sha256": row["sha256"]}
+        for row in sorted(normalized, key=lambda row: str(row["path"]))
+    ]
+    report: dict[str, object] = {
+        "schema": DATASET_SNAPSHOT_SCHEMA,
+        "artifact_role": DATASET_SNAPSHOT_ROLE,
+        "status": "candidate_dataset_snapshot_ready",
+        "candidate_only": True,
+        "production_deployment_authorized": False,
+        "payload_kind": "training_crop_only",
+        "source_lineage_bytes_snapshotted": False,
+        "snapshot_root_relative": "dataset_snapshot",
+        "snapshot_max_bytes": DATASET_SNAPSHOT_MAX_BYTES,
+        "object_count": len(normalized),
+        "total_regular_bytes": total,
+        "tree_sha256": _sha256_bytes(_canonical_compact_json(tree_rows)),
+        "objects": normalized,
+    }
+    return report, _canonical_json(report)
+
+
+def _copy_dataset_snapshot_object(
+    record: Mapping[str, object], destination: Path, description: str
+) -> dict[str, int]:
+    _verify_dataset_input(record, f"{description} pre-copy")
+    source = Path(str(record["path"]))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"dataset snapshot object already exists: {destination}")
+    digest = hashlib.sha256()
+    with source.open("rb") as source_handle, destination.open("xb") as output:
+        source_before = os.fstat(source_handle.fileno())
+        source_before_contract = _dataset_stat_contract(source_before)
+        if _dataset_stat_core(source_before_contract) != _dataset_stat_core({
+            key: record[key]
+            for key in ("dev", "ino", "size", "mode", "mtime_ns", "ctime_ns", "nlink")
+        }):
+            raise RuntimeError(f"{description} changed before copy")
+        for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            output.write(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+        source_after = os.fstat(source_handle.fileno())
+    path_after = source.stat(follow_symlinks=False)
+    expected_identity = {
+        key: record[key]
+        for key in ("dev", "ino", "size", "mode", "mtime_ns", "ctime_ns", "nlink")
+    }
+    source_after_contract = _dataset_stat_contract(source_after)
+    path_after_contract = _dataset_stat_contract(path_after)
+    if (
+        source_after_contract != source_before_contract
+        or
+        _dataset_stat_core(source_after_contract) != _dataset_stat_core(expected_identity)
+        or path_after_contract != expected_identity
+    ):
+        raise RuntimeError(f"{description} changed during copy")
+    if digest.hexdigest() != record["sha256"]:
+        raise RuntimeError(f"{description} copied bytes differ from the approved SHA")
+    os.chmod(destination, 0o444, follow_symlinks=False)
+    copied = destination.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(copied.st_mode)
+        or copied.st_nlink != 1
+        or stat.S_IMODE(copied.st_mode) != 0o444
+    ):
+        raise RuntimeError(f"{description} snapshot identity/mode mismatch")
+    return _dataset_stat_contract(copied)
+
+
+def _dataset_snapshot_tree_contract(
+    root: Path, report: Mapping[str, object], *, logical_root: Path
+) -> dict[str, object]:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("dataset snapshot root must be a non-symlink directory")
+    objects = report.get("objects")
+    if type(objects) is not list:
+        raise ValueError("dataset snapshot report objects must be a list")
+    expected: dict[Path, Mapping[str, object]] = {}
+    expected_directories = {root}
+    for index, raw in enumerate(objects):
+        if type(raw) is not dict:
+            raise ValueError(f"dataset snapshot report object {index} is not an object")
+        relative = Path(str(raw.get("path", "")))
+        if relative.parts[:1] != ("dataset_snapshot",) or relative.is_absolute():
+            raise ValueError("dataset snapshot object path escapes the snapshot root")
+        object_relative = Path(*relative.parts[1:])
+        path = root / object_relative
+        if path in expected:
+            raise ValueError("duplicate dataset snapshot object path")
+        expected[path] = raw
+        cursor = path.parent
+        while cursor != root:
+            expected_directories.add(cursor)
+            cursor = cursor.parent
+        expected_directories.add(root)
+    actual_entries = list(root.rglob("*"))
+    if any(path.is_symlink() for path in actual_entries):
+        raise ValueError("dataset snapshot tree contains a symlink")
+    for path in actual_entries:
+        entry_mode = path.stat(follow_symlinks=False).st_mode
+        if not (stat.S_ISREG(entry_mode) or stat.S_ISDIR(entry_mode)):
+            raise ValueError(
+                "dataset snapshot tree entries must be regular files or directories"
+            )
+    actual_files = {path for path in actual_entries if path.is_file()}
+    actual_directories = {root, *(path for path in actual_entries if path.is_dir())}
+    if actual_files != set(expected):
+        raise ValueError("dataset snapshot regular-file set mismatch")
+    if actual_directories != expected_directories:
+        raise ValueError("dataset snapshot directory set mismatch")
+    root_stat = root.stat(follow_symlinks=False)
+    if os.name != "nt" and stat.S_IMODE(root_stat.st_mode) != 0o555:
+        raise ValueError("dataset snapshot root mode must be 0555")
+    for directory in actual_directories:
+        current = directory.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or (
+            os.name != "nt" and stat.S_IMODE(current.st_mode) != 0o555
+        ):
+            raise ValueError("dataset snapshot directories must be mode 0555")
+    rows: list[dict[str, object]] = []
+    total = 0
+    for path in sorted(actual_files, key=lambda value: value.as_posix()):
+        raw = expected[path]
+        current = _read_dataset_input(
+            path,
+            "published dataset snapshot object",
+            _require_sha256(raw.get("sha256"), "dataset snapshot object SHA"),
+        )
+        if current["size"] != raw.get("size") or current["mode"] != 0o444:
+            raise ValueError("dataset snapshot object size/mode mismatch")
+        relative = path.relative_to(root).as_posix()
+        total += int(current["size"])
+        rows.append({
+            "path": f"dataset_snapshot/{relative}",
+            "dev": current["dev"],
+            "ino": current["ino"],
+            "mode": current["mode"],
+            "nlink": current["nlink"],
+            "size": current["size"],
+            "sha256": current["sha256"],
+        })
+    if total != report.get("total_regular_bytes"):
+        raise ValueError("dataset snapshot total bytes mismatch")
+    tree_rows = [
+        {"path": row["path"], "size": row["size"], "sha256": row["sha256"]}
+        for row in rows
+    ]
+    if _sha256_bytes(_canonical_compact_json(tree_rows)) != report.get("tree_sha256"):
+        raise ValueError("dataset snapshot tree SHA mismatch")
+    return {
+        "schema": "v4_candidate_dataset_snapshot_publish_receipt.v1",
+        "snapshot_root": logical_root.as_posix(),
+        "root_dev": int(root_stat.st_dev),
+        "root_ino": int(root_stat.st_ino),
+        "root_mode": stat.S_IMODE(root_stat.st_mode),
+        "files": rows,
+    }
 
 
 def _load_json(path: Path, description: str) -> tuple[dict[str, object], bytes]:
@@ -1244,7 +1589,8 @@ def _artifact(path: Path, content: bytes) -> dict[str, str]:
 
 
 def _verify_dataset_content_inventory(
-    entries: Sequence[Mapping[str, object]], description: str
+    entries: Sequence[Mapping[str, object]], description: str,
+    *, path_aliases: Mapping[str, Path] | None = None,
 ) -> str:
     expected_fields = {
         "sample_id", "role", "source_path", "source_size", "source_sha256",
@@ -1273,9 +1619,17 @@ def _verify_dataset_content_inventory(
             )
             if type(path_text) is not str or not Path(path_text).is_absolute():
                 raise ValueError(f"{description} row {index} {prefix} path is not absolute")
-            path = _regular_file(Path(path_text), f"{description} row {index} {prefix}")
-            if path.as_posix() != path_text:
+            declared_path = Path(path_text)
+            if declared_path.as_posix() != path_text:
                 raise ValueError(f"{description} row {index} {prefix} path is not normalized")
+            verification_path = (
+                path_aliases.get(path_text, declared_path)
+                if path_aliases is not None
+                else declared_path
+            )
+            path = _regular_file(
+                verification_path, f"{description} row {index} {prefix}"
+            )
             content = _stable_bytes(path, f"{description} row {index} {prefix}")
             if type(size) is not int or size != len(content):
                 raise RuntimeError(f"{description} row {index} {prefix} size changed")
@@ -1411,6 +1765,13 @@ def build_training_authority(
     sample_ids: set[str] = set()
     selected: dict[str, list[dict[str, str]]] = {role: [] for role in ROLE_SPLITS}
     dataset_content_inventory: list[dict[str, object]] = []
+    dataset_snapshot_plan: list[dict[str, object]] = []
+    dataset_source_inputs: list[dict[str, object]] = []
+    dataset_crop_inputs: list[dict[str, object]] = []
+    seen_source_paths: set[str] = set()
+    seen_source_shas: set[str] = set()
+    seen_crop_paths: set[str] = set()
+    seen_crop_shas: set[str] = set()
     excluded_counts: Counter[str] = Counter()
     origin_counts: Counter[str] = Counter()
     condition_counts = {head: Counter() for head in CONDITION_HEADS}
@@ -1436,10 +1797,6 @@ def build_training_authority(
             raise ValueError(f"{location} source/crop paths must be absolute")
         source_path = _regular_file(Path(source_path_text), f"{location} source")
         image_path = _regular_file(Path(image_path_text), f"{location} crop")
-        source_content = _stable_bytes(source_path, f"{location} source")
-        image_content = _stable_bytes(image_path, f"{location} crop")
-        if _sha256_bytes(source_content) != source_sha or _sha256_bytes(image_content) != image_sha:
-            raise ValueError(f"{location} content hash mismatch")
 
         origin = row.get("origin", "")
         rule = origins.get(origin)
@@ -1482,6 +1839,32 @@ def build_training_authority(
                 raise ValueError("operational trust evidence mismatch")
         elif kind != "aihub":
             raise ValueError(f"{location} license kind is unsupported")
+
+        for field, value in (("source_sha256", source_sha), ("image_sha256", image_sha)):
+            previous_role = identities[field].get(value)
+            if previous_role is not None and previous_role != role:
+                raise ValueError(f"leakage: {field} crosses train/model_validation")
+
+        source_input = _read_dataset_input(
+            source_path, f"{location} source", source_sha
+        )
+        crop_input = _read_dataset_input(
+            image_path, f"{location} crop", image_sha
+        )
+        source_input_path = str(source_input["path"])
+        crop_input_path = str(crop_input["path"])
+        if source_input_path in seen_source_paths:
+            raise ValueError("duplicate selected source payload path")
+        if source_sha in seen_source_shas:
+            raise ValueError("duplicate selected source SHA")
+        if crop_input_path in seen_crop_paths:
+            raise ValueError("duplicate selected crop payload path")
+        if image_sha in seen_crop_shas:
+            raise ValueError("duplicate selected crop SHA")
+        seen_source_paths.add(source_input_path)
+        seen_source_shas.add(source_sha)
+        seen_crop_paths.add(crop_input_path)
+        seen_crop_shas.add(image_sha)
 
         sample_id = row.get("sample_id", "")
         if not sample_id or sample_id in sample_ids:
@@ -1527,20 +1910,33 @@ def build_training_authority(
             identities[field][value] = role
         selected_row = {field: row.get(field, "") for field in OUTPUT_FIELDS}
         selected_row["source_filepath"] = source_path.as_posix()
-        selected_row["filepath"] = image_path.as_posix()
+        snapshot_relative_path = _snapshot_relative_path(image_sha)
+        selected_row["filepath"] = snapshot_relative_path
         selected[role].append(selected_row)
+        snapshot_final_path = (final / snapshot_relative_path).absolute()
         dataset_content_inventory.append(
             {
                 "sample_id": sample_id,
                 "role": role,
                 "source_path": source_path.as_posix(),
-                "source_size": len(source_content),
+                "source_size": source_input["size"],
                 "source_sha256": source_sha,
-                "crop_path": image_path.as_posix(),
-                "crop_size": len(image_content),
+                "crop_path": snapshot_final_path.as_posix(),
+                "crop_size": crop_input["size"],
                 "crop_sha256": image_sha,
             }
         )
+        dataset_snapshot_plan.append(
+            {
+                "sample_id": sample_id,
+                "role": role,
+                "path": snapshot_relative_path,
+                "size": crop_input["size"],
+                "sha256": image_sha,
+            }
+        )
+        dataset_source_inputs.append(source_input)
+        dataset_crop_inputs.append(crop_input)
         origin_counts[origin] += 1
 
     if any(not selected[role] for role in ROLE_SPLITS):
@@ -1614,8 +2010,14 @@ def build_training_authority(
     dataset_content_inventory.sort(
         key=lambda row: (str(row["role"]), str(row["sample_id"]))
     )
-    dataset_content_inventory_sha = _verify_dataset_content_inventory(
-        dataset_content_inventory, "dataset content inventory construction"
+    dataset_snapshot_plan.sort(
+        key=lambda row: (str(row["role"]), str(row["sample_id"]))
+    )
+    dataset_snapshot_value, dataset_snapshot_content = _dataset_snapshot_report(
+        dataset_snapshot_plan
+    )
+    dataset_content_inventory_sha = _sha256_bytes(
+        _canonical_json(dataset_content_inventory)
     )
     train_content = _render_manifest(selected["train"])
     validation_content = _render_manifest(selected["model_validation"])
@@ -1623,6 +2025,9 @@ def build_training_authority(
         "candidate_train_manifest_sha256": _sha256_bytes(train_content),
         "candidate_model_validation_manifest_sha256": _sha256_bytes(
             validation_content
+        ),
+        "candidate_dataset_snapshot_sha256": _sha256_bytes(
+            dataset_snapshot_content
         ),
     })
     candidate_counts: dict[str, object] = {
@@ -1673,63 +2078,121 @@ def build_training_authority(
     train_path = (final / "train_manifest.csv").absolute()
     validation_path = (final / "model_validation_manifest.csv").absolute()
     authority_path = (final / "training_authority.json").absolute()
+    snapshot_report_path = (final / "candidate_dataset_snapshot.json").absolute()
+    snapshot_root = (final / "dataset_snapshot").absolute()
     inventory_path = _regular_file(code_inventory, "code inventory")
     config_path = _regular_file(training_config, "training config")
     host_path = _regular_file(host_launch_contract, "host launch contract")
-    artifacts = {
-        "manifests": [
-            {"role": "train", **_artifact(train_path, train_content)},
-            {"role": "model_validation", **_artifact(validation_path, validation_content)},
-        ],
-        "code_inventory": _artifact(inventory_path, inventory_content),
-        "training_config": _artifact(config_path, config_content),
-        "host_launch_contract": _artifact(host_path, host_content),
-        "pretrained_backbone": _artifact(backbone_path, backbone_content),
-    }
-    authority: dict[str, object] = {
-        "schema": AUTHORITY_SCHEMA, "artifact_role": AUTHORITY_ROLE,
-        "status": AUTHORITY_STATUS, "candidate_only": True,
-        "candidate_training_input_authorized": True, "training_authority": True,
-        "lineage_execution_authorized": True, "ready_for_lineage_upgrade": True,
-        "diagnostic_only": False, "production_runtime_modified": False,
-        "blind_test_authority": False, "candidate_promotion_authorized": False,
-        "production_deployment_authorized": False,
-        "pi_deployment_authorized": False, "spring_contract_modified": False,
-        "local_only": True, "portable": False,
-        "operational_cutoff_kst": OPERATIONAL_CUTOFF.isoformat(),
-        "material_classes": list(MATERIAL_CLASSES),
-        "objectness_classes": ["background", "material"],
-        "condition_heads": list(CONDITION_HEADS), "artifacts": artifacts,
-        "trust_root": trust_root_evidence,
-        "dataset_content_inventory": dataset_content_inventory,
-        "counts": candidate_counts,
-        "bindings": {
-            "source_manifest_sha256": manifest_shas,
-            "full_data_validator_report_sha256": full_report_shas,
-            "trusted_policy_sha256": _sha256_bytes(policy_content),
-            "dataset_content_inventory_sha256": dataset_content_inventory_sha,
-            **policy_bindings,
-        },
-    }
-    authority_content = _canonical_json(authority)
-    marker_rows = (
-        (authority_path, _sha256_bytes(authority_content)),
-        (train_path, _sha256_bytes(train_content)),
-        (validation_path, _sha256_bytes(validation_content)),
-        (inventory_path, _sha256_bytes(inventory_content)),
-        (config_path, _sha256_bytes(config_content)),
-        (host_path, _sha256_bytes(host_content)),
-        (backbone_path, _sha256_bytes(backbone_content)),
-    )
-    marker_content = "".join(
-        f"{digest}  {path.as_posix()}\n" for path, digest in marker_rows
-    ).encode("utf-8")
-
     stage = Path(tempfile.mkdtemp(prefix=f".{final.name}.", dir=parent))
+    authority: dict[str, object]
+    marker_rows: tuple[tuple[Path, str], ...]
+    snapshot_publish_receipt: dict[str, object]
     try:
+        crop_inputs_by_sha = {
+            str(record["sha256"]): record for record in dataset_crop_inputs
+        }
+        if len(crop_inputs_by_sha) != len(dataset_crop_inputs):
+            raise ValueError("duplicate dataset crop input SHA")
+        snapshot_stage_root = stage / "dataset_snapshot"
+        snapshot_stage_root.mkdir()
+        objects = dataset_snapshot_value["objects"]
+        if type(objects) is not list:
+            raise RuntimeError("dataset snapshot report objects schema changed")
+        for index, raw in enumerate(objects):
+            if type(raw) is not dict:
+                raise RuntimeError("dataset snapshot report object schema changed")
+            digest = str(raw["sha256"])
+            record = crop_inputs_by_sha.get(digest)
+            if record is None:
+                raise RuntimeError("dataset snapshot plan lacks its crop input")
+            destination = stage / str(raw["path"])
+            _copy_dataset_snapshot_object(
+                record, destination, f"dataset snapshot object {index}"
+            )
+        if os.name != "nt":
+            for directory in sorted(
+                (path for path in snapshot_stage_root.rglob("*") if path.is_dir()),
+                key=lambda value: len(value.parts), reverse=True,
+            ):
+                os.chmod(directory, 0o555, follow_symlinks=False)
+            os.chmod(snapshot_stage_root, 0o555, follow_symlinks=False)
+        snapshot_publish_receipt = _dataset_snapshot_tree_contract(
+            snapshot_stage_root, dataset_snapshot_value, logical_root=snapshot_root
+        )
+        snapshot_publish_receipt_sha = _sha256_bytes(
+            _canonical_json(snapshot_publish_receipt)
+        )
+        snapshot_aliases = {
+            (final / str(raw["path"])).absolute().as_posix(): stage / str(raw["path"])
+            for raw in objects
+        }
+        if _verify_dataset_content_inventory(
+            dataset_content_inventory,
+            "dataset content inventory construction",
+            path_aliases=snapshot_aliases,
+        ) != dataset_content_inventory_sha:
+            raise RuntimeError("dataset content inventory construction changed")
+
+        artifacts = {
+            "manifests": [
+                {"role": "train", **_artifact(train_path, train_content)},
+                {"role": "model_validation", **_artifact(validation_path, validation_content)},
+            ],
+            "dataset_snapshot_report": _artifact(
+                snapshot_report_path, dataset_snapshot_content
+            ),
+            "code_inventory": _artifact(inventory_path, inventory_content),
+            "training_config": _artifact(config_path, config_content),
+            "host_launch_contract": _artifact(host_path, host_content),
+            "pretrained_backbone": _artifact(backbone_path, backbone_content),
+        }
+        authority = {
+            "schema": AUTHORITY_SCHEMA, "artifact_role": AUTHORITY_ROLE,
+            "status": AUTHORITY_STATUS, "candidate_only": True,
+            "candidate_training_input_authorized": True, "training_authority": True,
+            "lineage_execution_authorized": True, "ready_for_lineage_upgrade": True,
+            "diagnostic_only": False, "production_runtime_modified": False,
+            "blind_test_authority": False, "candidate_promotion_authorized": False,
+            "production_deployment_authorized": False,
+            "pi_deployment_authorized": False, "spring_contract_modified": False,
+            "local_only": True, "portable": False,
+            "operational_cutoff_kst": OPERATIONAL_CUTOFF.isoformat(),
+            "material_classes": list(MATERIAL_CLASSES),
+            "objectness_classes": ["background", "material"],
+            "condition_heads": list(CONDITION_HEADS), "artifacts": artifacts,
+            "trust_root": trust_root_evidence,
+            "dataset_content_inventory": dataset_content_inventory,
+            "dataset_snapshot_publish_receipt": snapshot_publish_receipt,
+            "counts": candidate_counts,
+            "bindings": {
+                "source_manifest_sha256": manifest_shas,
+                "full_data_validator_report_sha256": full_report_shas,
+                "trusted_policy_sha256": _sha256_bytes(policy_content),
+                "dataset_content_inventory_sha256": dataset_content_inventory_sha,
+                "dataset_snapshot_publish_receipt_sha256": (
+                    snapshot_publish_receipt_sha
+                ),
+                **policy_bindings,
+            },
+        }
+        authority_content = _canonical_json(authority)
+        marker_rows = (
+            (authority_path, _sha256_bytes(authority_content)),
+            (train_path, _sha256_bytes(train_content)),
+            (validation_path, _sha256_bytes(validation_content)),
+            (snapshot_report_path, _sha256_bytes(dataset_snapshot_content)),
+            (inventory_path, _sha256_bytes(inventory_content)),
+            (config_path, _sha256_bytes(config_content)),
+            (host_path, _sha256_bytes(host_content)),
+            (backbone_path, _sha256_bytes(backbone_content)),
+        )
+        marker_content = "".join(
+            f"{digest}  {path.as_posix()}\n" for path, digest in marker_rows
+        ).encode("utf-8")
         for name, content in (
             ("train_manifest.csv", train_content),
             ("model_validation_manifest.csv", validation_content),
+            ("candidate_dataset_snapshot.json", dataset_snapshot_content),
             ("training_authority.json", authority_content),
         ):
             with (stage / name).open("xb") as handle:
@@ -1740,6 +2203,7 @@ def build_training_authority(
             authority_path: stage / "training_authority.json",
             train_path: stage / "train_manifest.csv",
             validation_path: stage / "model_validation_manifest.csv",
+            snapshot_report_path: stage / "candidate_dataset_snapshot.json",
         }
         for path, expected in marker_rows:
             current = staged_paths.get(path, path)
@@ -1766,16 +2230,29 @@ def build_training_authority(
         ):
             if _sha256_bytes(_stable_bytes(path, f"{description} final rehash")) != expected:
                 raise RuntimeError(f"{description} changed before publish")
+        for index, record in enumerate(dataset_source_inputs):
+            _verify_dataset_input(record, f"source payload pre-publish {index}")
+        for index, record in enumerate(dataset_crop_inputs):
+            _verify_dataset_input(record, f"crop payload pre-publish {index}")
+        if _dataset_snapshot_tree_contract(
+            snapshot_stage_root, dataset_snapshot_value, logical_root=snapshot_root
+        ) != snapshot_publish_receipt:
+            raise RuntimeError("dataset snapshot changed before publish")
         if _verify_dataset_content_inventory(
-            dataset_content_inventory, "dataset content inventory pre-publish"
+            dataset_content_inventory,
+            "dataset content inventory pre-publish",
+            path_aliases=snapshot_aliases,
         ) != dataset_content_inventory_sha:
             raise RuntimeError("dataset content inventory changed before publish")
-        with (stage / "training_authority.sha256").open("xb") as handle:
-            handle.write(marker_content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(stage, final)
+        _publish_directory_no_replace(stage, final)
     except Exception:
+        for path in sorted(
+            stage.rglob("*"), key=lambda value: len(value.parts), reverse=True
+        ):
+            try:
+                os.chmod(path, 0o700 if path.is_dir() else 0o600)
+            except OSError:
+                pass
         shutil.rmtree(stage, ignore_errors=True)
         raise
 
@@ -1783,15 +2260,31 @@ def build_training_authority(
         authority_path: final / "training_authority.json",
         train_path: final / "train_manifest.csv",
         validation_path: final / "model_validation_manifest.csv",
+        snapshot_report_path: final / "candidate_dataset_snapshot.json",
     }
     for path, expected in marker_rows:
         current = final_mapping.get(path, path)
         if _sha256_bytes(_stable_bytes(current, "post-publish authority artifact")) != expected:
             raise RuntimeError(f"authority artifact changed after publish: {path}")
+    if _dataset_snapshot_tree_contract(
+        final / "dataset_snapshot", dataset_snapshot_value, logical_root=snapshot_root
+    ) != snapshot_publish_receipt:
+        raise RuntimeError("dataset snapshot changed after publish")
     if _verify_dataset_content_inventory(
         dataset_content_inventory, "dataset content inventory post-publish"
     ) != dataset_content_inventory_sha:
         raise RuntimeError("dataset content inventory changed after publish")
+    for index, record in enumerate(dataset_source_inputs):
+        _verify_dataset_input(record, f"source payload post-publish {index}")
+    for index, record in enumerate(dataset_crop_inputs):
+        _verify_dataset_input(record, f"crop payload post-publish {index}")
+    # The marker is the atomic completion seal. Until every post-publication
+    # check succeeds, the exposed directory is intentionally not consumable by
+    # the fail-closed launcher.
+    with (final / "training_authority.sha256").open("xb") as handle:
+        handle.write(marker_content)
+        handle.flush()
+        os.fsync(handle.fileno())
     return authority
 
 

@@ -1044,10 +1044,12 @@ POLICY_BINDING_FIELDS = {
     "raw_container_inspect_sha256", "pretrained_backbone_sha256",
     "container_image_id", "candidate_train_manifest_sha256",
     "candidate_model_validation_manifest_sha256",
+    "candidate_dataset_snapshot_sha256",
 }
 AUTHORITY_BINDING_FIELDS = {
     "source_manifest_sha256", "full_data_validator_report_sha256",
     "trusted_policy_sha256", "dataset_content_inventory_sha256",
+    "dataset_snapshot_publish_receipt_sha256",
     *POLICY_BINDING_FIELDS,
 }
 
@@ -1185,7 +1187,8 @@ authority_fields = {
     "pi_deployment_authorized", "spring_contract_modified", "local_only",
     "portable", "operational_cutoff_kst", "material_classes",
     "objectness_classes", "condition_heads", "artifacts", "trust_root",
-    "dataset_content_inventory", "counts", "bindings",
+    "dataset_content_inventory", "dataset_snapshot_publish_receipt",
+    "counts", "bindings",
 }
 if set(authority) != authority_fields:
     raise ValueError("training authority top-level schema mismatch")
@@ -1231,7 +1234,7 @@ if not isinstance(artifacts, dict) or not isinstance(bindings, dict):
     raise ValueError("training authority requires artifacts and bindings objects")
 if set(artifacts) != {
     "manifests", "code_inventory", "training_config",
-    "host_launch_contract", "pretrained_backbone",
+    "host_launch_contract", "pretrained_backbone", "dataset_snapshot_report",
 }:
     raise ValueError("training authority artifacts schema mismatch")
 if set(bindings) != AUTHORITY_BINDING_FIELDS:
@@ -1283,6 +1286,33 @@ artifact_entry("code_inventory", inventory_path, "code_inventory_sha256")
 artifact_entry("training_config", config_path, "training_config_sha256")
 artifact_entry("host_launch_contract", host_path, "host_launch_contract_sha256")
 artifact_entry("pretrained_backbone", backbone_path, "pretrained_backbone_sha256")
+
+snapshot_artifact = artifacts.get("dataset_snapshot_report")
+if not isinstance(snapshot_artifact, dict) or set(snapshot_artifact) != {"path", "sha256"}:
+    raise ValueError("authority artifacts.dataset_snapshot_report schema mismatch")
+snapshot_report_path = resolved_file(
+    snapshot_artifact.get("path", ""), "candidate dataset snapshot report"
+)
+if (
+    snapshot_report_path.name != "candidate_dataset_snapshot.json"
+    or snapshot_report_path.parent != authority_path.parent
+    or snapshot_report_path in input_bytes
+):
+    raise ValueError("candidate dataset snapshot report path mismatch")
+snapshot_report_content = stable_bytes(
+    snapshot_report_path, "candidate dataset snapshot report"
+)
+snapshot_report_sha = sha_bytes(snapshot_report_content)
+if (
+    require_sha(snapshot_artifact.get("sha256"), "dataset snapshot report SHA")
+    != snapshot_report_sha
+    or bindings.get("candidate_dataset_snapshot_sha256") != snapshot_report_sha
+):
+    raise ValueError("candidate dataset snapshot report SHA binding mismatch")
+input_bytes[snapshot_report_path] = snapshot_report_content
+dataset_snapshot_report = load_json_bytes(
+    snapshot_report_content, "candidate dataset snapshot report JSON"
+)
 
 manifest_values = artifacts.get("manifests")
 if not isinstance(manifest_values, list) or len(manifest_values) != 2:
@@ -1399,7 +1429,7 @@ if not isinstance(policy_excluded_counts, dict) or any(
     raise ValueError("trusted policy excluded counts are invalid")
 
 # A standard sha256sum marker is accepted only when it contains exactly the
-# seven authority files. Unexpected paths cannot be smuggled into verification.
+# eight authority files. Unexpected paths cannot be smuggled into verification.
 marker_rows = {}
 for number, line in enumerate(input_bytes[marker_path].decode("utf-8").splitlines(), start=1):
     match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
@@ -1411,13 +1441,207 @@ for number, line in enumerate(input_bytes[marker_path].decode("utf-8").splitline
     marker_rows[path] = match.group(1)
 expected_marker_paths = {
     authority_path, inventory_path, config_path, host_path, backbone_path,
-    *manifest_paths.values(),
+    snapshot_report_path, *manifest_paths.values(),
 }
-if set(marker_rows) != expected_marker_paths or len(marker_rows) != 7:
-    raise ValueError("training_authority.sha256 must bind exactly seven expected files")
+if set(marker_rows) != expected_marker_paths or len(marker_rows) != 8:
+    raise ValueError("training_authority.sha256 must bind exactly eight expected files")
 for path, declared in marker_rows.items():
     if declared != sha_bytes(input_bytes[path]):
         raise ValueError(f"authority marker SHA mismatch: {path}")
+
+
+def canonical_json(value) -> bytes:
+    return (
+        json.dumps(
+            value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
+        ) + "\n"
+    ).encode("utf-8")
+
+
+snapshot_report_fields = {
+    "schema", "artifact_role", "status", "candidate_only",
+    "production_deployment_authorized", "payload_kind",
+    "source_lineage_bytes_snapshotted", "snapshot_root_relative",
+    "snapshot_max_bytes", "object_count", "total_regular_bytes",
+    "tree_sha256", "objects",
+}
+if not isinstance(dataset_snapshot_report, dict) or set(dataset_snapshot_report) != snapshot_report_fields:
+    raise ValueError("candidate dataset snapshot report schema mismatch")
+if dataset_snapshot_report.get("schema") != "v4_candidate_dataset_snapshot.v1":
+    raise ValueError("candidate dataset snapshot report version mismatch")
+if dataset_snapshot_report.get("artifact_role") != (
+    "candidate_training_crop_bytes_not_blind_or_deployment_authority"
+):
+    raise ValueError("candidate dataset snapshot artifact role mismatch")
+if dataset_snapshot_report.get("status") != "candidate_dataset_snapshot_ready":
+    raise ValueError("candidate dataset snapshot status mismatch")
+require_exact_bool(
+    dataset_snapshot_report.get("candidate_only"), True,
+    "candidate dataset snapshot candidate_only",
+)
+require_exact_bool(
+    dataset_snapshot_report.get("production_deployment_authorized"), False,
+    "candidate dataset snapshot production authority",
+)
+require_exact_bool(
+    dataset_snapshot_report.get("source_lineage_bytes_snapshotted"), False,
+    "candidate dataset snapshot source lineage flag",
+)
+if dataset_snapshot_report.get("payload_kind") != "training_crop_only":
+    raise ValueError("candidate dataset snapshot payload kind mismatch")
+if dataset_snapshot_report.get("snapshot_root_relative") != "dataset_snapshot":
+    raise ValueError("candidate dataset snapshot root contract mismatch")
+if dataset_snapshot_report.get("snapshot_max_bytes") != 68719476736:
+    raise ValueError("candidate dataset snapshot byte cap mismatch")
+snapshot_objects = dataset_snapshot_report.get("objects")
+if not isinstance(snapshot_objects, list) or not snapshot_objects:
+    raise ValueError("candidate dataset snapshot objects must be nonempty")
+snapshot_object_fields = {"sample_id", "role", "path", "size", "sha256"}
+snapshot_by_sample = {}
+snapshot_paths = set()
+snapshot_shas = set()
+previous_snapshot_key = None
+snapshot_total = 0
+for index, row in enumerate(snapshot_objects):
+    if not isinstance(row, dict) or set(row) != snapshot_object_fields:
+        raise ValueError(f"candidate dataset snapshot object {index} schema mismatch")
+    sample_id = row.get("sample_id")
+    role = row.get("role")
+    relative = row.get("path")
+    size = row.get("size")
+    digest = require_sha(row.get("sha256"), f"dataset snapshot object {index} SHA")
+    if not isinstance(sample_id, str) or not sample_id or role not in {"train", "model_validation"}:
+        raise ValueError("candidate dataset snapshot object identity mismatch")
+    key = (role, sample_id)
+    if previous_snapshot_key is not None and key <= previous_snapshot_key:
+        raise ValueError("candidate dataset snapshot objects are not strictly role/sample sorted")
+    previous_snapshot_key = key
+    if (
+        not isinstance(relative, str)
+        or posixpath.normpath(relative) != relative
+        or relative.startswith("/")
+        or relative != f"dataset_snapshot/objects/{digest[:2]}/{digest}"
+    ):
+        raise ValueError("candidate dataset snapshot object path mismatch")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise ValueError("candidate dataset snapshot object size mismatch")
+    if sample_id in snapshot_by_sample or relative in snapshot_paths or digest in snapshot_shas:
+        raise ValueError("candidate dataset snapshot contains duplicate sample/path/SHA")
+    snapshot_by_sample[sample_id] = row
+    snapshot_paths.add(relative)
+    snapshot_shas.add(digest)
+    snapshot_total += size
+if dataset_snapshot_report.get("object_count") != len(snapshot_objects):
+    raise ValueError("candidate dataset snapshot object count mismatch")
+if dataset_snapshot_report.get("total_regular_bytes") != snapshot_total:
+    raise ValueError("candidate dataset snapshot total bytes mismatch")
+if snapshot_total > dataset_snapshot_report["snapshot_max_bytes"]:
+    raise ValueError("candidate dataset snapshot exceeds its byte cap")
+snapshot_tree_rows = [
+    {"path": row["path"], "size": row["size"], "sha256": row["sha256"]}
+    for row in sorted(snapshot_objects, key=lambda value: value["path"])
+]
+snapshot_tree_sha = sha_bytes(
+    (json.dumps(
+        snapshot_tree_rows, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False,
+    ) + "\n").encode("utf-8")
+)
+if dataset_snapshot_report.get("tree_sha256") != snapshot_tree_sha:
+    raise ValueError("candidate dataset snapshot tree SHA mismatch")
+
+snapshot_root = snapshot_report_path.parent / "dataset_snapshot"
+reject_symlink_components(snapshot_root, "candidate dataset snapshot root")
+snapshot_root = snapshot_root.resolve(strict=True)
+if (
+    snapshot_root.parent != authority_path.parent
+    or snapshot_root.is_symlink()
+    or not snapshot_root.is_dir()
+):
+    raise ValueError("candidate dataset snapshot root identity mismatch")
+try:
+    snapshot_root.relative_to(global_root)
+except ValueError as error:
+    raise ValueError("candidate dataset snapshot escapes GLOBAL_ROOT") from error
+expected_snapshot_files = {}
+expected_snapshot_directories = {snapshot_root}
+for row in snapshot_objects:
+    relative_parts = Path(row["path"]).parts[1:]
+    path = snapshot_root.joinpath(*relative_parts)
+    expected_snapshot_files[path] = row
+    cursor = path.parent
+    while cursor != snapshot_root:
+        expected_snapshot_directories.add(cursor)
+        cursor = cursor.parent
+snapshot_entries = list(snapshot_root.rglob("*"))
+if any(path.is_symlink() for path in snapshot_entries):
+    raise ValueError("candidate dataset snapshot tree contains a symlink")
+actual_snapshot_files = {path for path in snapshot_entries if path.is_file()}
+actual_snapshot_directories = {
+    snapshot_root, *(path for path in snapshot_entries if path.is_dir())
+}
+if actual_snapshot_files != set(expected_snapshot_files):
+    raise ValueError("candidate dataset snapshot regular-file set mismatch")
+if actual_snapshot_directories != expected_snapshot_directories:
+    raise ValueError("candidate dataset snapshot directory set mismatch")
+if any(not path.is_file() and not path.is_dir() for path in snapshot_entries):
+    raise ValueError("candidate dataset snapshot contains a special file")
+
+receipt = authority.get("dataset_snapshot_publish_receipt")
+receipt_fields = {
+    "schema", "snapshot_root", "root_dev", "root_ino", "root_mode", "files"
+}
+if not isinstance(receipt, dict) or set(receipt) != receipt_fields:
+    raise ValueError("dataset snapshot publish receipt schema mismatch")
+if receipt.get("schema") != "v4_candidate_dataset_snapshot_publish_receipt.v1":
+    raise ValueError("dataset snapshot publish receipt version mismatch")
+if receipt.get("snapshot_root") != snapshot_root.as_posix():
+    raise ValueError("dataset snapshot publish receipt root mismatch")
+if bindings.get("dataset_snapshot_publish_receipt_sha256") != sha_bytes(
+    canonical_json(receipt)
+):
+    raise ValueError("dataset snapshot publish receipt SHA binding mismatch")
+root_stat = snapshot_root.stat(follow_symlinks=False)
+if (
+    receipt.get("root_dev"), receipt.get("root_ino"), receipt.get("root_mode")
+) != (root_stat.st_dev, root_stat.st_ino, stat.S_IMODE(root_stat.st_mode)):
+    raise ValueError("dataset snapshot root device/inode/mode changed")
+if sys.platform.startswith("linux") and stat.S_IMODE(root_stat.st_mode) != 0o555:
+    raise ValueError("dataset snapshot root is not mode 0555")
+for directory in actual_snapshot_directories:
+    directory_stat = directory.stat(follow_symlinks=False)
+    if sys.platform.startswith("linux") and stat.S_IMODE(directory_stat.st_mode) != 0o555:
+        raise ValueError("dataset snapshot directory is not mode 0555")
+runtime_snapshot_rows = []
+for path in sorted(actual_snapshot_files, key=lambda value: value.as_posix()):
+    expected = expected_snapshot_files[path]
+    content = stable_bytes(path, "candidate dataset snapshot object")
+    current = path.stat(follow_symlinks=False)
+    if (
+        current.st_nlink != 1
+        or stat.S_IMODE(current.st_mode) != 0o444
+        or current.st_size != expected["size"]
+        or sha_bytes(content) != expected["sha256"]
+    ):
+        raise ValueError("candidate dataset snapshot object bytes/identity mismatch")
+    runtime_snapshot_rows.append({
+        "path": path.relative_to(snapshot_root.parent).as_posix(),
+        "dev": current.st_dev,
+        "ino": current.st_ino,
+        "mode": stat.S_IMODE(current.st_mode),
+        "nlink": current.st_nlink,
+        "size": current.st_size,
+        "sha256": sha_bytes(content),
+    })
+if receipt.get("files") != runtime_snapshot_rows:
+    raise ValueError("dataset snapshot publish receipt differs from live tree")
+dataset_snapshot_runtime_contract = {
+    "report_path": snapshot_report_path.as_posix(),
+    "report_sha256": snapshot_report_sha,
+    "tree_sha256": snapshot_tree_sha,
+    "snapshot_root": snapshot_root.as_posix(),
+    "publish_receipt": receipt,
+}
 
 # Verify the complete immutable code tree, not merely the inventory file hash.
 inventory = load_json_bytes(input_bytes[inventory_path], "code inventory JSON")
@@ -2234,6 +2458,7 @@ for origin, weight in origin_weights.items():
 manifest_rows = {}
 manifest_payload_files = {}
 dataset_content_inventory = []
+snapshot_samples_seen = set()
 train_origin_counts = Counter()
 selected_by_role = Counter()
 selected_by_origin = Counter()
@@ -2272,8 +2497,13 @@ def bind_manifest_payload(path: Path, declared_sha: str, description: str) -> No
     actual = sha_bytes(content)
     if actual != declared_sha:
         raise ValueError(f"manifest payload SHA mismatch: {path}")
+    current = path.stat(follow_symlinks=False)
+    if current.st_nlink != 1:
+        raise ValueError(f"manifest payload hardlinks are forbidden: {path}")
     manifest_payload_files[path] = {
         "path": path.as_posix(), "size": len(content), "sha256": actual,
+        "dev": current.st_dev, "ino": current.st_ino,
+        "mode": stat.S_IMODE(current.st_mode), "nlink": current.st_nlink,
     }
 
 for role, path in manifest_paths.items():
@@ -2383,6 +2613,19 @@ for role, path in manifest_paths.items():
         sample_id = str(row.get("sample_id", ""))
         if not sample_id:
             raise ValueError(f"empty sample_id at {path}:{number}")
+        snapshot_entry = snapshot_by_sample.get(sample_id)
+        if (
+            not isinstance(snapshot_entry, dict)
+            or snapshot_entry.get("role") != role
+            or snapshot_entry.get("sha256") != row.get("image_sha256")
+            or snapshot_entry.get("size") != manifest_payload_files[resolved_image]["size"]
+            or resolved_image != (
+                snapshot_root.joinpath(*Path(str(snapshot_entry.get("path"))).parts[1:])
+            )
+            or sample_id in snapshot_samples_seen
+        ):
+            raise ValueError(f"manifest row differs from dataset snapshot at {path}:{number}")
+        snapshot_samples_seen.add(sample_id)
         dataset_content_inventory.append({
             "sample_id": sample_id,
             "role": role,
@@ -2396,6 +2639,9 @@ for role, path in manifest_paths.items():
     if count == 0:
         raise ValueError(f"{role} manifest is empty")
     manifest_rows[role] = count
+
+if snapshot_samples_seen != set(snapshot_by_sample):
+    raise ValueError("manifest rows do not consume the exact dataset snapshot object set")
 
 derived_candidate_counts = {
     "selected_by_role": dict(sorted(selected_by_role.items())),
@@ -2499,6 +2745,7 @@ bound_paths = [
     authority_path, marker_path, inventory_path, config_path, host_path,
     backbone_path, trainer_path, wrapper_path,
     policy_path, raw_inspect_path, qnap_snapshot_report_path,
+    snapshot_report_path,
     manifest_paths["train"], manifest_paths["model_validation"],
 ]
 snapshot_rows = [
@@ -2527,6 +2774,8 @@ payload = {
     ),
     "qnap_library_snapshot": qnap_snapshot_report,
     "dataset_content_inventory_sha256": dataset_inventory_sha,
+    "candidate_dataset_snapshot": dataset_snapshot_report,
+    "candidate_dataset_snapshot_runtime": dataset_snapshot_runtime_contract,
     "manifests": [
         {
             "role": role,
@@ -2594,6 +2843,7 @@ verify_inputs() {
 import hashlib
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -2638,8 +2888,91 @@ for row in preflight["manifest_payload_files"]:
         path.resolve(strict=True).relative_to(global_root)
     except ValueError as error:
         raise ValueError("manifest payload escaped GLOBAL_ROOT") from error
-    if path.stat().st_size != row["size"] or sha(path) != row["sha256"]:
+    current = path.stat(follow_symlinks=False)
+    if (
+        current.st_size != row["size"]
+        or current.st_dev != row["dev"]
+        or current.st_ino != row["ino"]
+        or stat.S_IMODE(current.st_mode) != row["mode"]
+        or current.st_nlink != row["nlink"]
+        or sha(path) != row["sha256"]
+    ):
         raise ValueError(f"manifest payload changed: {path}")
+
+snapshot_report = preflight["candidate_dataset_snapshot"]
+snapshot_runtime = preflight["candidate_dataset_snapshot_runtime"]
+snapshot_root = Path(snapshot_runtime["snapshot_root"])
+reject_symlink_components(snapshot_root, "dataset snapshot root")
+snapshot_root = snapshot_root.resolve(strict=True)
+receipt = snapshot_runtime["publish_receipt"]
+root_stat = snapshot_root.stat(follow_symlinks=False)
+if (
+    snapshot_root.is_symlink()
+    or not snapshot_root.is_dir()
+    or (root_stat.st_dev, root_stat.st_ino, stat.S_IMODE(root_stat.st_mode))
+    != (receipt["root_dev"], receipt["root_ino"], receipt["root_mode"])
+):
+    raise ValueError("dataset snapshot root identity changed")
+if sys.platform.startswith("linux") and stat.S_IMODE(root_stat.st_mode) != 0o555:
+    raise ValueError("dataset snapshot root mode changed")
+expected_snapshot_files = {}
+expected_snapshot_directories = {snapshot_root}
+for row in snapshot_report["objects"]:
+    path = snapshot_root.joinpath(*Path(row["path"]).parts[1:])
+    expected_snapshot_files[path] = row
+    cursor = path.parent
+    while cursor != snapshot_root:
+        expected_snapshot_directories.add(cursor)
+        cursor = cursor.parent
+snapshot_entries = list(snapshot_root.rglob("*"))
+if any(path.is_symlink() for path in snapshot_entries):
+    raise ValueError("dataset snapshot gained a symlink")
+actual_snapshot_files = {path for path in snapshot_entries if path.is_file()}
+actual_snapshot_directories = {
+    snapshot_root, *(path for path in snapshot_entries if path.is_dir())
+}
+if actual_snapshot_files != set(expected_snapshot_files):
+    raise ValueError("dataset snapshot file set changed")
+if actual_snapshot_directories != expected_snapshot_directories:
+    raise ValueError("dataset snapshot directory set changed")
+if any(not path.is_file() and not path.is_dir() for path in snapshot_entries):
+    raise ValueError("dataset snapshot gained a special file")
+for directory in actual_snapshot_directories:
+    if sys.platform.startswith("linux") and stat.S_IMODE(
+        directory.stat(follow_symlinks=False).st_mode
+    ) != 0o555:
+        raise ValueError("dataset snapshot directory mode changed")
+snapshot_rows = []
+tree_rows = []
+for path in sorted(actual_snapshot_files, key=lambda value: value.as_posix()):
+    expected = expected_snapshot_files[path]
+    current = path.stat(follow_symlinks=False)
+    digest = sha(path)
+    if (
+        current.st_nlink != 1
+        or stat.S_IMODE(current.st_mode) != 0o444
+        or current.st_size != expected["size"]
+        or digest != expected["sha256"]
+    ):
+        raise ValueError("dataset snapshot object changed")
+    relative = path.relative_to(snapshot_root.parent).as_posix()
+    snapshot_rows.append({
+        "path": relative, "dev": current.st_dev, "ino": current.st_ino,
+        "mode": stat.S_IMODE(current.st_mode), "nlink": current.st_nlink,
+        "size": current.st_size, "sha256": digest,
+    })
+    tree_rows.append({"path": relative, "size": current.st_size, "sha256": digest})
+if snapshot_rows != receipt["files"]:
+    raise ValueError("dataset snapshot publish receipt changed")
+tree_sha = hashlib.sha256(
+    (json.dumps(
+        tree_rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ) + "\n").encode("utf-8")
+).hexdigest()
+if tree_sha != snapshot_report["tree_sha256"] or tree_sha != snapshot_runtime["tree_sha256"]:
+    raise ValueError("dataset snapshot tree SHA changed")
+
 inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
 root = Path(inventory["root"]).resolve(strict=True)
 excluded_relatives = {
@@ -3799,6 +4132,10 @@ bound_bytes = {
     path.resolve(): stable_bytes(path, f"ready input {path.name}")
     for path in bound_paths
 }
+preflight_value = json.loads(bound_bytes[preflight.resolve()].decode("utf-8"))
+dataset_snapshot_runtime = preflight_value.get("candidate_dataset_snapshot_runtime")
+if not isinstance(dataset_snapshot_runtime, dict):
+    raise ValueError("candidate dataset snapshot runtime contract is missing before ready")
 inventory_value = json.loads(bound_bytes[inventory.resolve()].decode("utf-8"))
 if set(inventory_value) != {
     "schema", "status", "candidate_only", "candidate_promotion_authorized",
@@ -3887,6 +4224,12 @@ payload = {
         "qnap_library_snapshot_report_sha256": digest(
             bound_bytes[qnap_snapshot_report.resolve()]
         ),
+        "candidate_dataset_snapshot_report_sha256": dataset_snapshot_runtime[
+            "report_sha256"
+        ],
+        "candidate_dataset_snapshot_tree_sha256": dataset_snapshot_runtime[
+            "tree_sha256"
+        ],
     },
 }
 temporary = ready.with_name(f".{ready.name}.{os.getpid()}.tmp")
