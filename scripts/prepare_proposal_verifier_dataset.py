@@ -37,7 +37,7 @@ import os
 import shutil
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
@@ -97,6 +97,8 @@ class SourceRecord:
     # Only populated by the fully revalidated source-evidence adapter. This
     # reference box is a pseudo-annotation, NEVER the runtime detector crop.
     operational_evidence: dict | None = None
+    # Original file/annotation lineage, distinct from the resized replay input.
+    audited_aihub_metadata: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -962,6 +964,20 @@ MANIFEST_FIELDS = (
     "source_height", "crop_bytes",
 )
 
+AUDITED_AIHUB_FIELDS = (
+    "original_source_id", "original_source_sha256", "original_annotation_sha256",
+    "original_source_path_b64", "original_annotation_path_b64", "materializer_report_sha256",
+)
+
+
+def _audited_aihub_reader():
+    try:
+        from scripts.audited_aihub_snapshot import load_audited_aihub_snapshot
+    except ModuleNotFoundError:
+        from audited_aihub_snapshot import load_audited_aihub_snapshot
+    return load_audited_aihub_snapshot
+
+
 CANONICAL_FIELDS = (
     "sample_id", "role", "fold", "source_sha256", "image_sha256",
     "object_group", "capture_session", "origin", "source_filepath",
@@ -1116,6 +1132,8 @@ def write_selected_crops(
             )
             if canonical_aihub_origin is not None:
                 rows[-1].update(_canonical_row_metadata(candidate, destination, canonical_aihub_origin))
+            if candidate.source.audited_aihub_metadata is not None:
+                rows[-1].update(candidate.source.audited_aihub_metadata)
     rows.sort(key=lambda row: (str(row["split"]), int(row["material"]), str(row["filepath"])))
     return rows, written_bytes, rejected
 
@@ -1219,6 +1237,7 @@ def _mark_mixed_failure(output_dir: Path, identity: tuple[int, int]) -> None:
 def _publish_mixed_metadata(
     output_dir: Path, rows: list[dict], summary: dict, *,
     validate: Callable[[bool], None], identity: tuple[int, int],
+    extra_fields: tuple[str, ...] = (),
 ) -> None:
     try:
         reject_symlinks, _ = _mixed_file_helpers()
@@ -1228,7 +1247,7 @@ def _publish_mixed_metadata(
             raise RuntimeError("mixed output directory ownership changed")
         validate(False)
         csv_buffer = io.StringIO(newline="")
-        writer = csv.DictWriter(csv_buffer, fieldnames=MANIFEST_FIELDS + CANONICAL_FIELDS)
+        writer = csv.DictWriter(csv_buffer, fieldnames=MANIFEST_FIELDS + CANONICAL_FIELDS + extra_fields)
         writer.writeheader()
         writer.writerows(rows)
         metadata = {
@@ -1284,13 +1303,23 @@ def build_proposal_verifier_dataset(
     prediction_provider: PredictionProvider | None = None,
     operational_source_evidence_dir: Path | None = None,
     aihub_origin: str | None = None,
+    audited_aihub_report: Path | None = None,
+    audited_aihub_report_sha256: str | None = None,
+    audited_aihub_cohort: Path | None = None,
+    audited_aihub_diagnostic: bool = False,
 ) -> dict:
     # This must remain the first preflight: a bad invocation can never load a
     # multi-GB model or touch an existing dataset before overwrite refusal.
     ensure_empty_output(output_dir)
+    audited_args = (audited_aihub_report, audited_aihub_report_sha256, audited_aihub_cohort)
+    if any(value is not None for value in audited_args) and not all(value is not None for value in audited_args):
+        raise ValueError("audited AIHub report, report SHA256 and cohort must be supplied together")
+    if type(audited_aihub_diagnostic) is not bool or (audited_aihub_diagnostic and audited_aihub_report is None):
+        raise ValueError("audited AIHub diagnostic requires an explicit audited snapshot")
+    canonical_mode = operational_source_evidence_dir is not None or audited_aihub_report is not None
     if operational_source_evidence_dir is not None:
         _reject_operational_material_hold(operational_source_evidence_dir)
-    if operational_source_evidence_dir is not None and (not aihub_origin or not aihub_origin.strip()):
+    if canonical_mode and (not aihub_origin or not aihub_origin.strip()):
         raise ValueError("explicit aihub_origin is required for mixed canonical manifests")
     if not 0 <= negative_iou < positive_iou <= 1:
         raise ValueError("IoU thresholds must satisfy 0 <= negative < positive <= 1")
@@ -1326,12 +1355,12 @@ def build_proposal_verifier_dataset(
 
     mixed_snapshot = None
     actual_model_path = model_path if prediction_provider is None else None
-    if operational_source_evidence_dir is not None:
+    if canonical_mode:
         _, stable_hash = _mixed_file_helpers()
         _, initial_data_sha = stable_hash(data_path, description="mixed data YAML")
     split_images = resolve_split_images(data_path, dataset_dir)
     source_hashes = None
-    if operational_source_evidence_dir is not None:
+    if canonical_mode:
         mixed_snapshot = _mixed_input_snapshot(data_path, split_images, actual_model_path)
         if mixed_snapshot[data_path][0] != initial_data_sha:
             raise RuntimeError("mixed data YAML changed during source collection")
@@ -1340,6 +1369,27 @@ def build_proposal_verifier_dataset(
         split_images, dataset_dir,
         **({"source_hashes": source_hashes} if source_hashes is not None else {}),
     )
+    audited_snapshot = None
+    audited_binding = None
+    audited_input_roots = []
+    if audited_aihub_report is not None:
+        audited_snapshot = _audited_aihub_reader()(
+            audited_aihub_report, audited_aihub_report_sha256,
+            cohort_path=audited_aihub_cohort, require_full_cohort=not audited_aihub_diagnostic,
+        )
+        audited_snapshot.assert_source_membership(split_images)
+        audited_binding = audited_snapshot.binding()
+        sources = [replace(source, audited_aihub_metadata=audited_snapshot.metadata_for(source.path)) for source in sources]
+        audited_input_roots = [audited_aihub_report.parent, audited_aihub_cohort.parent]
+        for source in sources:
+            for field in ("original_source_path_b64", "original_annotation_path_b64"):
+                value = source.audited_aihub_metadata[field]
+                original_path = Path(os.fsdecode(base64.urlsafe_b64decode(value)))
+                # The reader validates the original root/official-split/data-dir/
+                # category/file layout. Protect the entire input root, including
+                # source classes excluded by quality or crop selection.
+                audited_input_roots.append(original_path.parents[3])
+        audited_input_roots = sorted(set(audited_input_roots))
     operational_records = None
     operational_binding = None
     operational_input_roots = []
@@ -1401,12 +1451,15 @@ def build_proposal_verifier_dataset(
         )
 
     mixed_output_identity = None
-    if operational_source_evidence_dir is not None:
-        _reject_operational_material_hold(operational_source_evidence_dir)
+    if canonical_mode:
+        if operational_source_evidence_dir is not None:
+            _reject_operational_material_hold(operational_source_evidence_dir)
+        if audited_snapshot is not None:
+            audited_snapshot.recheck()
         _mixed_snapshot_unchanged(mixed_snapshot)
         mixed_output_identity = _claim_mixed_output(
-            output_dir, [dataset_dir, *operational_input_roots]
-            + sorted({Path(row["source_filepath"]).parent for row in operational_records})
+            output_dir, [dataset_dir, *operational_input_roots, *audited_input_roots]
+            + sorted({Path(row["source_filepath"]).parent for row in (operational_records or [])})
             + ([model_path] if actual_model_path is not None and model_path.is_dir() else []),
         )
     try:
@@ -1418,11 +1471,11 @@ def build_proposal_verifier_dataset(
             jpeg_quality=jpeg_quality,
             min_free_gb=min_free_gb,
             max_output_gb=max_output_gb,
-            **({"canonical_aihub_origin": aihub_origin} if operational_records is not None else {}),
+            **({"canonical_aihub_origin": aihub_origin} if canonical_mode else {}),
         )
         if not rows:
             raise RuntimeError("all selected proposal crops failed to write")
-        if operational_records is not None and {row["split"] for row in rows} != {"training", "validation"}:
+        if canonical_mode and {row["split"] for row in rows} != {"training", "validation"}:
             raise RuntimeError("mixed crop writing did not preserve both source splits")
     except Exception:
         if mixed_output_identity is not None:
@@ -1430,7 +1483,7 @@ def build_proposal_verifier_dataset(
         raise
 
     manifest_path = output_dir / "manifest.csv"
-    if operational_records is None:
+    if not canonical_mode:
         with manifest_path.open("w", encoding="utf-8", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=MANIFEST_FIELDS)
             writer.writeheader()
@@ -1508,23 +1561,31 @@ def build_proposal_verifier_dataset(
         summary["operational_sources"] = len(operational_records)
         summary["operational_crop_state_targets"] = "all_unknown_minus_one"
         summary["source_policy"] = "AIHub zero/one annotation plus verified train-only positive operational pseudo-annotations"
-    if operational_records is None:
+    if audited_binding is not None:
+        summary["audited_aihub_snapshot"] = audited_binding
+        summary["original_identity_semantics"] = "original file and annotation lineage; source-based object_group/capture_session do not prove physical object or capture session identity"
+    if not canonical_mode:
         (output_dir / "dataset_info.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
     else:
         def validate_mixed_generation(full_rehash: bool) -> None:
             _mixed_snapshot_unchanged(mixed_snapshot)
-            if _operational_bundle_binding(operational_source_evidence_dir) != operational_binding:
+            if operational_records is not None and _operational_bundle_binding(operational_source_evidence_dir) != operational_binding:
                 raise RuntimeError("operational source evidence changed during preparation")
+            if audited_snapshot is not None:
+                audited_snapshot.recheck()
+                if audited_snapshot.binding() != audited_binding:
+                    raise RuntimeError("audited AIHub snapshot binding changed during preparation")
             if full_rehash:
                 if (resolve_split_images(data_path, dataset_dir) != split_images
                         or _mixed_input_snapshot(data_path, split_images, actual_model_path) != mixed_snapshot):
                     raise RuntimeError("mixed generation input changed during preparation")
-                if _operational_bundle_reader(operational_source_evidence_dir) != operational_records:
+                if operational_records is not None and _operational_bundle_reader(operational_source_evidence_dir) != operational_records:
                     raise RuntimeError("operational source evidence changed during preparation")
         _publish_mixed_metadata(
             output_dir, rows, summary, validate=validate_mixed_generation, identity=mixed_output_identity,
+            **({"extra_fields": AUDITED_AIHUB_FIELDS} if audited_snapshot is not None else {}),
         )
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return summary
@@ -1538,6 +1599,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--operational-source-evidence-dir", type=Path)
     parser.add_argument("--aihub-origin", help="Explicit base origin for optional canonical mixed manifest; not a license approval")
+    parser.add_argument("--audited-aihub-report", type=Path)
+    parser.add_argument("--audited-aihub-report-sha256")
+    parser.add_argument("--audited-aihub-cohort", type=Path)
+    parser.add_argument("--audited-aihub-diagnostic", action="store_true", help="Explicitly allow a partial audited snapshot; replay must remain diagnostic-only")
     parser.add_argument("--device", default="0")
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -1641,6 +1706,10 @@ def main() -> None:
         background_gt_margin=args.background_gt_margin,
         operational_source_evidence_dir=args.operational_source_evidence_dir,
         aihub_origin=args.aihub_origin,
+        audited_aihub_report=args.audited_aihub_report,
+        audited_aihub_report_sha256=args.audited_aihub_report_sha256,
+        audited_aihub_cohort=args.audited_aihub_cohort,
+        audited_aihub_diagnostic=args.audited_aihub_diagnostic,
     )
 
 

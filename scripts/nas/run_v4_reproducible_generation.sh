@@ -83,6 +83,31 @@ require_file "$PREPROCESSING"
 require_file "$WRAPPER"
 require_file "$MODEL_PATH"
 require_file "$DATA_PATH"
+AUDITED_AIHUB_REPORT=${AUDITED_AIHUB_REPORT:-}
+AUDITED_AIHUB_REPORT_SHA256=${AUDITED_AIHUB_REPORT_SHA256:-}
+AUDITED_AIHUB_COHORT=${AUDITED_AIHUB_COHORT:-}
+AUDITED_AIHUB_DIAGNOSTIC=${AUDITED_AIHUB_DIAGNOSTIC:-0}
+case "$AUDITED_AIHUB_DIAGNOSTIC" in 0|1) ;; *) fail "invalid audited AIHub diagnostic flag" 64;; esac
+set --
+if [ -n "$AUDITED_AIHUB_REPORT$AUDITED_AIHUB_REPORT_SHA256$AUDITED_AIHUB_COHORT" ]; then
+  [ -n "$AUDITED_AIHUB_REPORT" ] && [ -n "$AUDITED_AIHUB_REPORT_SHA256" ] && \
+    [ -n "$AUDITED_AIHUB_COHORT" ] || fail "audited AIHub report, SHA, and cohort must be supplied together" 64
+  [ "${#AUDITED_AIHUB_REPORT_SHA256}" -eq 64 ] || fail "invalid audited AIHub report SHA" 64
+  case "$AUDITED_AIHUB_REPORT_SHA256" in *[!0-9a-f]*) fail "invalid audited AIHub report SHA" 64;; esac
+  require_file "$AUDITED_AIHUB_REPORT"
+  require_file "$AUDITED_AIHUB_COHORT"
+  [ "$(sha256sum "$AUDITED_AIHUB_REPORT" | awk '{print $1}')" = "$AUDITED_AIHUB_REPORT_SHA256" ] || fail "audited AIHub report SHA mismatch"
+  for helper in audited_aihub_snapshot.py audit_aihub_original_annotations.py materialize_audited_aihub_sources.py; do
+    require_file "$CODE_ROOT/scripts/$helper"
+  done
+  set -- --audited-aihub-report "$AUDITED_AIHUB_REPORT" \
+    --audited-aihub-report-sha256 "$AUDITED_AIHUB_REPORT_SHA256" \
+    --audited-aihub-cohort "$AUDITED_AIHUB_COHORT" \
+    --aihub-origin aihub_original_annotation_v1
+  if [ "$AUDITED_AIHUB_DIAGNOSTIC" = 1 ]; then set -- "$@" --audited-aihub-diagnostic; fi
+elif [ "$AUDITED_AIHUB_DIAGNOSTIC" = 1 ]; then
+  fail "audited AIHub diagnostic requires report, SHA, and cohort" 64
+fi
 if [ ! -d "$DATASET_DIR" ]; then
   fail "missing dataset directory: $DATASET_DIR" 66
 fi
@@ -265,6 +290,12 @@ INPUT_MARKER=$CONTROL/inputs.sha256
 temporary=$(mktemp "$CONTROL/.inputs.XXXXXX") || fail "failed to create input marker staging file"
 sha256sum "$MODEL_PATH" "$DATA_PATH" "$GENERATOR" "$PREPROCESSING" "$WRAPPER" \
   "$DATASET_INPUT_INVENTORY" > "$temporary" || fail "failed to hash generation inputs"
+if [ -n "$AUDITED_AIHUB_REPORT" ]; then
+  sha256sum "$AUDITED_AIHUB_REPORT" "$AUDITED_AIHUB_COHORT" \
+    "$CODE_ROOT/scripts/audited_aihub_snapshot.py" \
+    "$CODE_ROOT/scripts/audit_aihub_original_annotations.py" \
+    "$CODE_ROOT/scripts/materialize_audited_aihub_sources.py" >> "$temporary" || fail "failed to hash audited AIHub inputs"
+fi
 if ! ln "$temporary" "$INPUT_MARKER" 2>/dev/null; then
   rm -f "$temporary"
   fail "refusing to overwrite input marker" 73
@@ -296,7 +327,7 @@ if ! "$PYTHON_BIN" "$GENERATOR" \
   --val-max-background 2000 \
   --seed "$SEED" \
   --min-free-gb 300 \
-  --max-output-gb 30
+  --max-output-gb 30 "$@"
 then
   fail "raw proposal generation failed"
 fi
@@ -307,8 +338,10 @@ require_file "$MANIFEST"
 require_file "$DATASET_INFO"
 
 if ! "$PYTHON_BIN" - \
-  "$DATASET_INFO" "$MANIFEST" "$MODEL_PATH" "$DATA_PATH" "$DATASET_DIR" "$SEED" <<'PY'
+  "$DATASET_INFO" "$MANIFEST" "$MODEL_PATH" "$DATA_PATH" "$DATASET_DIR" "$SEED" \
+  "$AUDITED_AIHUB_REPORT" "$AUDITED_AIHUB_REPORT_SHA256" "$AUDITED_AIHUB_COHORT" "$AUDITED_AIHUB_DIAGNOSTIC" <<'PY'
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -316,6 +349,20 @@ from pathlib import Path
 info_path, manifest_path, model_path, data_path, dataset_dir = map(Path, sys.argv[1:6])
 seed = int(sys.argv[6])
 info = json.loads(info_path.read_text(encoding="utf-8"))
+audited_report, audited_sha, audited_cohort, audited_diagnostic = sys.argv[7:11]
+binding = info.get("audited_aihub_snapshot")
+if audited_report:
+    expected_binding = {
+        "report_path": Path(audited_report).resolve().as_posix(),
+        "report_sha256": audited_sha,
+        "cohort_path": Path(audited_cohort).resolve().as_posix(),
+        "cohort_sha256": hashlib.sha256(Path(audited_cohort).read_bytes()).hexdigest(),
+        "require_full_cohort": audited_diagnostic != "1",
+    }
+    if binding != expected_binding or type(binding.get("require_full_cohort")) is not bool:
+        raise ValueError("audited AIHub snapshot binding differs from launch inputs")
+elif binding is not None:
+    raise ValueError("unexpected audited AIHub snapshot binding")
 expected_paths = {
     "model": model_path.resolve(),
     "data": data_path.resolve(),

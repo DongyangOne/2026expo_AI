@@ -566,3 +566,76 @@ main/state/verifier 모델 loaded를 반환했다. PC→Pi `100.121.110.75:22`�
 NAS 비밀번호로 Pi에 로그인하지 않았다. Pi host key는 이번에 live 대조하지 못했으며
 신규 운영 사진 확보 여부는 여전히 미확인이다. health 성공은 신규 모델 성능·실제
 하드웨어/Spring callback E2E 통과 증거가 아니다.
+
+## 10. 원본 증거를 연결한 실제 GPU crop/replay (2026-09-04)
+
+기존 8절 진단은 파생 JPEG/YOLO sidecar까지만 소비했다. 이번에는
+`audited_aihub_snapshot.py`가 cohort/report/lineage와 **실제 원본 이미지·JSON에서
+재생성한 파생 JPEG·sidecar 바이트**를 대조한 뒤, crop generator와 validator에
+그 연결을 전달한다. 기존 완료 artifact는 수정하지 않았다.
+
+- `source_sha256`은 실제 detector replay 대상인 resized JPEG SHA다.
+  원본의 ID/이미지 SHA/annotation SHA/두 base64 경로와 materializer report SHA는
+  별도 6개 필드로 보존한다. 공식 training/validation과 role/fold를 대조하고 상태는 -1이다.
+- 기본은 full cohort 필수다. 이번 33장 partial 입력은 명시적 diagnostic 옵션이며
+  validator도 diagnostic-only를 요구한다. metadata 게시 전후 원본/JSON·cohort·report·
+  파생 파일·입력 membership 및 실패 marker를 다시 확인한다.
+- 파일 번호/사진 SHA를 물리적 객체 ID로 가장하지 않는다. 실제 제공기관 PDF의
+  다방향 촬영과 파일번호 정의, 라벨/외부 이물질 혼합 정의, 전체 metadata 진단은
+  `AIHUB_SOURCE_SEMANTICS_20260904.md`를 따른다.
+
+### 실제 NAS 산출물
+
+코드 root는 `J/linked_pilot_code_20260904`다. 기존 materialized 33장과
+원본 cohort/report pin(8절)을 그대로 사용했다. direct runc/device/QPKG libraries,
+고정 image와 model/spec, batch1, confidence 1e-6/bbox 1e-4를 유지했다.
+
+- `generate_original_linked_raw_pilot_33_20260904`: **14:52:01~14:52:19 KST,
+  exit 0/OOM false**. 33개 원본 증거 연결, 34개 검출 중 top1 33개 crop 생성.
+  `/share/Container/aihub_original_linked_raw_pilot_20260904/generation`의
+  ready SHA `b895f376ca5cfc9b1c8075cfec9b0403e8ca3cd147d4ec4b83379a84272637cd`,
+  raw manifest SHA `7ea619e2d1f96816b7629f772bfb589e4f02e84e754201de9107a7a6d1d8aec8`,
+  dataset_info SHA `7d4c07dbca38874aa7a33eaeb9d3e5da60ad2f2481892ec8f14afed7070f54a5`.
+- `replay_original_linked_pilot_33_20260904`: **14:54:36~14:55:06 KST,
+  exit 0/OOM false**. actual GPU A/B 각각 33/33 strict replay 통과.
+  `/share/Container/aihub_original_linked_replay_pilot_20260904/result`의
+  `diagnostic_ready.json` SHA `5bb47dda88d10e718718d00d98d7e35bc0c71b8c07397f1547f2ae680409889c`.
+  A/B manifest 동일 SHA `ffaca6edbc004d397ad94e5f6eccd20c423ac1b7f28be018918d71aa1e128023`,
+  report 동일 SHA `97d09ffd789574ad5eaad5a863eee39a8317fb95178926f7ceb6b3d8d1645388`.
+  `failed.json`은 없고 training/lineage/blind/deployment authority는 모두 false다.
+- A 17.74초/B 8.18초는 원본 증거 재검증과 초기화가 포함된 작은 진단 시간이다.
+  전체 학습 처리량이나 모델 정확도로 해석하지 않는다.
+- frozen prepare SHA `7a7b67652f98923c8cc4e263917065ffceb08cb0b52d0f1ccd02ca8e7478aca9`,
+  validator `f2b684ef59e275a1a2bcd21db233ec8d65df0de02ddc93df50bcf09e591ffbc9`,
+  reader `c31ff7ebedede62e78270caad224b4f36cc306819c887e49c648a1e36ba39a32`.
+  wrapper `be8132bb2991704b9c792445e5aa3d6a91eb5f7b6d77c9e49e759acb3066726a`,
+  runner `5320b79eab7b846de1f0191998d78999c8ef21b3fb05a9a0b6ec547eae21ee5f`.
+  runner는 generation의 11개 입력 pin, 별도 고정 spec, canonical helper 6개를
+  포함한 실행 코드도 전후 대조했다.
+
+이 결과는 **원본 증거→실제 YOLO crop→동일 GPU replay 연결의 33장 진단 통과**다.
+val battery와 background 지원은 여전히 없으며 전체 학습이나 9종 정확도 개선 완료가
+아니다. 현재 원본 162,305장 감사와 1428 bridge는 별도로 진행 중이다.
+완료된 같은 33장 probe를 반복하지 않고 전량 report/격리 사유/cohort 결과를 확인한 뒤,
+보호 legacy 2,855개 원본 연결과 alias/근접중복 검사를 이어간다.
+
+최종 동결 코드에 대해 reader, audited prepare/validator 통합, wrapper, 기존
+prepare/validator 및 운영 통합의 7개 테스트 파일을 함께 실행해 **159 passed
+(176.05초)**를 확인했다. 실제 GPU 진단과 CPU fixture 회귀를 구분한다.
+
+14:57 KST 원본 로그는 processed 116,600/162,305(71.8%), verified 116,585,
+격리 15, 선형 잔여 2,523초(약 42분)다. 상세 격리 원인은 최종 report로 확인한다.
+CPU 276.67%/RAM 1.788GiB(상한 4GiB), GPU 0%/2MiB/16,380MiB/42°C,
+디스크 2.6TiB 여유(83% 사용)였다. 원본 검사 ETA이며 학습 종료 ETA가 아니다.
+
+### 다음 연구 학습용 기존 backbone 확보
+
+실제 중지된 `train_proposal_verifier_multitask_v3_20260827`의 변경 파일 목록에서
+`/root/.cache/torch/hub/checkpoints/mobilenet_v3_small-047dcff4.pth`를 찾았다.
+컨테이너를 실행하지 않고 `docker cp`로 새 `J/pretrained_reuse_v1_20260904/`에
+10,306,551바이트를 복사했다. SHA256은
+`047dcff4addef86ea5bc2eff13c9614dc11f47ab1160d0a71a25e7db994f4e1f`다.
+원본 컨테이너 ID `2923d7a57e1a1c988a0c92975e047a971b62f77f78529955f517750725690532`와
+exited/exit0/OOMfalse가 복사 전후 같았다. `source_container_before.txt`,
+`source_container_after.txt`, `pretrained.sha256`를 함께 남겼다. 외부 다운로드나
+기존 모델 교체는 하지 않았다. 이 파일은 backbone 초기값이지 새 쓰레기 분류 후보가 아니다.

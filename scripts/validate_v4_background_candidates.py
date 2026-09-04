@@ -40,6 +40,7 @@ import numpy as np
 
 try:
     from scripts.prepare_proposal_verifier_dataset import (
+        AUDITED_AIHUB_FIELDS,
         BACKGROUND_CLASS_ID,
         CLASS_NAMES,
         GroundTruth,
@@ -47,6 +48,7 @@ try:
         Proposal,
         SourceRecord,
         _label_path,
+        _audited_aihub_reader,
         _reject_operational_material_hold,
         assign_proposal,
         bbox_iou,
@@ -64,6 +66,7 @@ try:
     )
 except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
     from prepare_proposal_verifier_dataset import (  # type: ignore[no-redef]
+        AUDITED_AIHUB_FIELDS,
         BACKGROUND_CLASS_ID,
         CLASS_NAMES,
         GroundTruth,
@@ -71,6 +74,7 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
         Proposal,
         SourceRecord,
         _label_path,
+        _audited_aihub_reader,
         _reject_operational_material_hold,
         assign_proposal,
         bbox_iou,
@@ -311,6 +315,67 @@ def _verify_operational_evidence(evidence: _OperationalEvidence) -> None:
     if _stable_read_bytes(evidence.reader_source, description="operational reader") != evidence.reader_source_bytes:
         raise ValueError("operational evidence reader changed during revalidation")
     _reject_operational_material_hold(evidence.root)
+
+
+def _audited_binding_preflight(info: Mapping[str, object], *, diagnostic_only: bool,
+                              report: Path | None, report_sha256: str | None,
+                              cohort: Path | None) -> dict | None:
+    supplied = (report, report_sha256, cohort)
+    if any(value is not None for value in supplied) and not all(value is not None for value in supplied):
+        raise ValueError("audited AIHub report, report SHA256 and cohort must be supplied together")
+    binding = info.get("audited_aihub_snapshot")
+    if binding is None:
+        if any(value is not None for value in supplied):
+            raise ValueError("dataset_info must bind the audited AIHub snapshot")
+        return None
+    expected_keys = {"report_path", "report_sha256", "cohort_path", "cohort_sha256", "require_full_cohort"}
+    if (not isinstance(binding, dict) or set(binding) != expected_keys
+            or type(binding.get("require_full_cohort")) is not bool
+            or any(not isinstance(binding.get(key), str) or not binding[key] for key in expected_keys - {"require_full_cohort"})):
+        raise ValueError("invalid audited AIHub snapshot binding")
+    if binding["require_full_cohort"] is False and not diagnostic_only:
+        raise ValueError("partial audited AIHub snapshot requires diagnostic_only=True")
+    if report is not None and (
+        Path(binding["report_path"]).resolve() != report.resolve()
+        or binding["report_sha256"] != report_sha256
+        or Path(binding["cohort_path"]).resolve() != cohort.resolve()
+    ):
+        raise ValueError("supplied audited AIHub snapshot conflicts with dataset_info")
+    return dict(binding)
+
+
+def _check_audited_rows(rows: Sequence[Mapping[str, str]], snapshot, *,
+                        operational_evidence: _OperationalEvidence | None,
+                        output_paths: Sequence[Path]) -> None:
+    binding = snapshot.binding() if snapshot is not None else None
+    protected_roots = set() if binding is None else {Path(binding[key]).parent for key in ("report_path", "cohort_path")}
+    for row in rows:
+        operational = operational_evidence is not None and row["source_id"] in operational_evidence.records
+        if snapshot is None or operational:
+            if any(row.get(field, "") for field in AUDITED_AIHUB_FIELDS):
+                raise ValueError("original AIHub provenance requires the bound audited snapshot and an AIHub source")
+            continue
+        raw_source = Path(os.fsdecode(base64.urlsafe_b64decode(row["source_path_b64"])))
+        if not raw_source.is_absolute():
+            raise ValueError("audited AIHub manifest source must be absolute")
+        _no_symlink_components(raw_source, "audited AIHub manifest source")
+        source = _decode_source_path(row["source_path_b64"], location="audited AIHub row")
+        expected = snapshot.metadata_for(source)
+        if set(expected) != set(AUDITED_AIHUB_FIELDS) or any(row.get(field) != expected[field] for field in AUDITED_AIHUB_FIELDS):
+            raise ValueError("audited AIHub original provenance mismatch")
+        official_split = snapshot.split_for(source)
+        role = "train" if official_split == "training" else "model_validation"
+        if (row.get("split") != official_split or row.get("role") != role or row.get("fold") != role):
+            raise ValueError("audited AIHub row does not preserve the official split")
+        if (row.get("annotation_authority") != AIHUB_ANNOTATION_AUTHORITY
+                or row.get("source_filepath") != source.as_posix()
+                or any(row.get(field) != "-1" for field in ("dent", "label", "foreign_material"))):
+            raise ValueError("audited AIHub canonical source or unknown state targets mismatch")
+        for field in ("original_source_path_b64", "original_annotation_path_b64"):
+            # Fixed layout has already been checked by the snapshot reader.
+            protected_roots.add(Path(os.fsdecode(base64.urlsafe_b64decode(expected[field]))).parents[3])
+    if snapshot is not None:
+        _check_operational_output_paths(output_paths, tuple(root.resolve() for root in protected_roots))
 
 
 def _row_annotation(
@@ -1007,6 +1072,9 @@ def validate_manifest(
     prediction_provider: PredictionProvider | None = None,
     diagnostic_only: bool = False,
     operational_source_evidence_dir: Path | None = None,
+    audited_aihub_report: Path | None = None,
+    audited_aihub_report_sha256: str | None = None,
+    audited_aihub_cohort: Path | None = None,
 ) -> dict:
     paths = [input_manifest, dataset_info, detector_model, inference_spec]
     for path in paths:
@@ -1020,6 +1088,12 @@ def validate_manifest(
     info, info_bytes = _read_json(dataset_info, description="dataset info")
     spec, spec_bytes = _read_json(inference_spec, description="inference spec")
     _validate_dataset_contract(info, spec)
+    audited_binding = _audited_binding_preflight(
+        info, diagnostic_only=diagnostic_only, report=audited_aihub_report,
+        report_sha256=audited_aihub_report_sha256, cohort=audited_aihub_cohort,
+    )
+    if audited_binding is not None and (dataset_info.parent / "failed.json").exists():
+        raise ValueError("audited AIHub dataset generation has a failure marker")
     operational_evidence = None
     if operational_source_evidence_dir is not None:
         _reject_operational_material_hold(operational_source_evidence_dir)
@@ -1068,6 +1142,17 @@ def validate_manifest(
                 operational_source_evidence_dir, info, input_manifest.parent,
                 (output_manifest, output_report),
             )
+        audited_snapshot = None
+        if audited_binding is not None:
+            audited_snapshot = _audited_aihub_reader()(
+                Path(audited_binding["report_path"]), audited_binding["report_sha256"],
+                cohort_path=Path(audited_binding["cohort_path"]),
+                require_full_cohort=audited_binding["require_full_cohort"],
+            )
+            if audited_snapshot.binding() != audited_binding:
+                raise ValueError("audited AIHub snapshot binding mismatch")
+        _check_audited_rows(rows, audited_snapshot, operational_evidence=operational_evidence,
+                            output_paths=(output_manifest, output_report))
         detector_snapshot: Path | None = None
         replay_snapshot_dir: Path | None = None
         if authoritative:
@@ -1219,11 +1304,22 @@ def validate_manifest(
         }
         report_bytes = _json_bytes(report)
         def recheck_operational_inputs() -> None:
-            if operational_evidence is None:
+            if operational_evidence is None and audited_snapshot is None:
                 return
             if (dataset_info.parent / "failed.json").exists():
                 raise ValueError("operational dataset generation has a failure marker")
-            _verify_operational_evidence(operational_evidence)
+            if operational_evidence is not None:
+                _verify_operational_evidence(operational_evidence)
+            if audited_snapshot is not None:
+                audited_snapshot.recheck()
+                if audited_snapshot.binding() != audited_binding:
+                    raise ValueError("audited AIHub snapshot binding changed during replay")
+                _check_audited_rows(rows, audited_snapshot, operational_evidence=operational_evidence,
+                                    output_paths=(output_manifest, output_report))
+                if authoritative and _sha256_bytes(_stable_read_bytes(
+                    detector_model, description="audited AIHub detector final rehash"
+                )) != detector_sha:
+                    raise ValueError("audited AIHub detector model changed during publication")
             for path, expected in ((input_manifest, manifest_bytes), (dataset_info, info_bytes), (inference_spec, spec_bytes)):
                 if _stable_read_bytes(path, description="operational validation input") != expected:
                     raise ValueError("operational validation input changed during replay")
@@ -1250,6 +1346,9 @@ def main() -> None:
     parser.add_argument("--output-manifest", required=True, type=Path)
     parser.add_argument("--output-report", required=True, type=Path)
     parser.add_argument("--operational-source-evidence-dir", type=Path)
+    parser.add_argument("--audited-aihub-report", type=Path)
+    parser.add_argument("--audited-aihub-report-sha256")
+    parser.add_argument("--audited-aihub-cohort", type=Path)
     parser.add_argument(
         "--diagnostic-only",
         action="store_true",
@@ -1268,6 +1367,9 @@ def main() -> None:
         output_report=args.output_report,
         diagnostic_only=args.diagnostic_only,
         operational_source_evidence_dir=args.operational_source_evidence_dir,
+        audited_aihub_report=args.audited_aihub_report,
+        audited_aihub_report_sha256=args.audited_aihub_report_sha256,
+        audited_aihub_cohort=args.audited_aihub_cohort,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
 
