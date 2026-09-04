@@ -8,6 +8,7 @@ import ipaddress
 import json
 import math
 import os
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -232,6 +233,76 @@ def _atomic_write(path: Path, content: str) -> None:
     os.replace(temporary, path)
 
 
+def _checked_path(path: Path, description: str) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"{description} must not contain symlink components")
+    return absolute
+
+
+def _immutable_write(path: Path, content: str, *, allow_identical: bool = False) -> None:
+    """Publish shared cache/output bytes without replacing another run's file."""
+    path = _checked_path(path, "immutable teacher artifact")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _checked_path(path, "immutable teacher artifact")
+    encoded = content.encode("utf-8")
+    descriptor, raw = tempfile.mkstemp(prefix=".teacher-", suffix=".tmp", dir=path.parent)
+    temporary = Path(raw)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            # Cache entries are content addressed; an identical concurrent
+            # publication is harmless, but a replacement is never allowed.
+            if not allow_identical:
+                raise
+            _checked_path(path, "immutable teacher artifact")
+            if not path.is_file() or path.read_bytes() != encoded:
+                raise ValueError("immutable teacher artifact already exists with different bytes")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _shared_checkpoint_candidates(directory: Path) -> list[dict]:
+    directory = _checked_path(directory, "shared checkpoint directory")
+    if not directory.exists():
+        return []
+    if not directory.is_dir():
+        raise ValueError("shared checkpoint directory must be a directory")
+    rows = []
+    for path in sorted(directory.iterdir()):
+        _checked_path(path, "shared checkpoint file")
+        # A concurrent atomic publication can have an incomplete private file.
+        if path.name.startswith(".teacher-") and path.name.endswith(".tmp"):
+            continue
+        if path.suffix != ".json" or _valid_sha256(path.stem) != path.stem or not path.is_file():
+            raise ValueError("unexpected shared checkpoint file")
+        content = path.read_bytes()
+        if _sha256_bytes(content) != path.stem:
+            raise ValueError("shared checkpoint content digest mismatch")
+        try:
+            row = json.loads(content)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("shared checkpoint is not valid JSON") from error
+        if not isinstance(row, dict):
+            raise ValueError("shared checkpoint must be an object")
+        rows.append(row)
+    return rows
+
+
+def _save_shared_checkpoint(directory: Path, row: dict) -> None:
+    content = _canonical_json(row) + "\n"
+    digest = _sha256_bytes(content.encode("utf-8"))
+    _immutable_write(directory / f"{digest}.json", content, allow_identical=True)
+
+
 def _checkpoint_path(checkpoint_dir: Path, sha256: str) -> Path:
     return checkpoint_dir / f"{sha256}.json"
 
@@ -316,6 +387,7 @@ def label_queue(
     timeout: int,
     retries: int,
     allow_external_url: bool = False,
+    checkpoint_dir: Path | None = None,
 ) -> dict:
     _validate_teacher_url(url, allow_external_url=allow_external_url)
     image_root = image_root.resolve(strict=True)
@@ -363,21 +435,45 @@ def label_queue(
         normalized_queue[sha256] = dict(row, sha256=sha256)
 
     contract, contract_sha256 = build_teacher_contract(model, observed_digest)
-    checkpoint_dir = output_path.parent / f"{output_path.name}.checkpoints"
+    shared_cache = checkpoint_dir is not None
+    if shared_cache:
+        assert checkpoint_dir is not None
+        cache_root = _checked_path(checkpoint_dir, "shared checkpoint directory")
+        output_path = _checked_path(output_path, "teacher output")
+        if output_path.is_relative_to(cache_root) or cache_root.is_relative_to(output_path):
+            raise ValueError("teacher output and shared checkpoint directory must not overlap")
+        if output_path.exists():
+            raise FileExistsError("shared-cache labeling requires a new immutable output file")
+        for source_path in (queue_path, known_audit):
+            if _checked_path(source_path, "teacher input").is_relative_to(cache_root):
+                raise ValueError("shared checkpoint directory must not contain teacher inputs")
+        checkpoint_dir = cache_root / contract_sha256
+    else:
+        checkpoint_dir = output_path.parent / f"{output_path.name}.checkpoints"
+    checkpoint_dir = _checked_path(checkpoint_dir, "checkpoint directory")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _checked_path(checkpoint_dir, "checkpoint directory")
     completed: dict[str, dict] = {}
+    source_bindings: dict[Path, str] = {}
+    # newly_labeled counts completed decisions produced now, including successful
+    # retries. retried counts images with an earlier incomplete/incompatible attempt.
+    counters = {"reused": 0, "newly_labeled": 0, "retried": 0, "image_error": 0}
     ordered_queue = [normalized_queue[sha] for sha in sorted(normalized_queue)]
     for index, row in enumerate(ordered_queue, start=1):
         sha256 = row["sha256"]
         checkpoint = _checkpoint_path(checkpoint_dir, sha256)
+        shared_source_dir = checkpoint_dir / sha256
         if _observe_model_digest(url, model, timeout) != observed_digest:
             raise ValueError("Ollama model digest changed before image labeling")
         try:
             image_path, image_ref = _resolve_image_ref(image_root, row.get("image_ref"))
+            if shared_cache and image_path.is_relative_to(cache_root):
+                raise ValueError("image must not be inside shared checkpoint directory")
             image = image_path.read_bytes()
             input_image_sha256 = _sha256_bytes(image)
             if input_image_sha256 != sha256:
                 raise ValueError("image_sha256_mismatch")
+            source_bindings[image_path] = input_image_sha256
         except (OSError, ValueError) as error:
             result = {
                 "schema_version": TEACHER_LABEL_SCHEMA_VERSION,
@@ -394,25 +490,35 @@ def label_queue(
                 "consensus_decision": None,
                 "minimum_confidence": 0.0,
             }
-            _atomic_write(checkpoint, _canonical_json(result) + "\n")
+            if shared_cache:
+                _save_shared_checkpoint(shared_source_dir, result)
+            else:
+                _atomic_write(checkpoint, _canonical_json(result) + "\n")
+            counters["image_error"] += 1
             completed[sha256] = result
             print(f"[{index}/{len(queue)}] {sha256[:12]} image_error", flush=True)
             continue
 
-        previous = _load_checkpoint(checkpoint)
+        if shared_cache:
+            previous_rows = _shared_checkpoint_candidates(shared_source_dir)
+        else:
+            _checked_path(checkpoint, "checkpoint file")
+            previous = _load_checkpoint(checkpoint)
+            previous_rows = [previous] if previous is not None else []
         # A row with two valid passes is a completed teacher decision even when
         # the passes disagree.  Transport/truncation errors must be retried;
         # treating them as completed made resumable NAS jobs permanently skip
         # the failed images.
-        if previous is not None and _current_completed_label(
-            previous,
-            teacher_contract=contract,
-            teacher_contract_sha256=contract_sha256,
-            input_image_sha256=input_image_sha256,
-            image_ref=image_ref,
-        ):
+        previous = next((candidate for candidate in previous_rows if _current_completed_label(
+            candidate, teacher_contract=contract, teacher_contract_sha256=contract_sha256,
+            input_image_sha256=input_image_sha256, image_ref=image_ref,
+        )), None)
+        if previous is not None:
             completed[sha256] = previous
+            counters["reused"] += 1
             continue
+        if previous_rows:
+            counters["retried"] += 1
         passes = []
         errors = []
         for prompt in PROMPTS:
@@ -460,26 +566,41 @@ def label_queue(
         }
         if _observe_model_digest(url, model, timeout) != observed_digest:
             raise ValueError("Ollama model digest changed during image labeling")
+        if _sha256_bytes(image_path.read_bytes()) != input_image_sha256:
+            raise ValueError("source image changed during teacher labeling")
         completed[sha256] = result
-        _atomic_write(checkpoint, _canonical_json(result) + "\n")
+        if shared_cache:
+            _save_shared_checkpoint(shared_source_dir, result)
+        else:
+            _atomic_write(checkpoint, _canonical_json(result) + "\n")
+        if _current_completed_label(
+            result, teacher_contract=contract, teacher_contract_sha256=contract_sha256,
+            input_image_sha256=input_image_sha256, image_ref=image_ref,
+        ):
+            counters["newly_labeled"] += 1
         print(f"[{index}/{len(queue)}] {sha256[:12]} consensus={consensus}", flush=True)
 
     final_digest = _observe_model_digest(url, model, timeout)
     if final_digest != observed_digest:
         raise ValueError("Ollama model digest changed during teacher labeling")
+    for source_path, expected_sha in source_bindings.items():
+        if _sha256_bytes(source_path.read_bytes()) != expected_sha:
+            raise ValueError("source image changed before teacher output publication")
     rows = [completed[sha] for sha in sorted(completed)]
     # The portable final artifact is emitted once, atomically, from the
     # per-image checkpoints.  A killed process can resume without either an
     # O(N^2) rewrite or duplicate/stale rows.
-    _atomic_write(
-        output_path,
-        "".join(_canonical_json(row) + "\n" for row in rows),
-    )
+    output_content = "".join(_canonical_json(row) + "\n" for row in rows)
+    if shared_cache:
+        _immutable_write(output_path, output_content)
+    else:
+        _atomic_write(output_path, output_content)
     return {
         "schema_version": TEACHER_LABEL_SCHEMA_VERSION,
         "teacher_contract_sha256": contract_sha256,
         "queued": len(queue),
         "completed": len(rows),
+        **counters,
         "consensus": sum(row["consensus"] for row in rows),
         "high_confidence_consensus": sum(
             row["consensus"] and row["minimum_confidence"] >= 0.8 for row in rows
@@ -505,6 +626,10 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--allow-external-url", action="store_true")
+    parser.add_argument(
+        "--checkpoint-dir", type=Path,
+        help="Optional shared cache root; immutable entries are isolated by teacher contract SHA",
+    )
     args = parser.parse_args()
     summary = label_queue(
         args.queue,
@@ -517,6 +642,7 @@ def main() -> None:
         timeout=args.timeout,
         retries=args.retries,
         allow_external_url=args.allow_external_url,
+        checkpoint_dir=args.checkpoint_dir,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 

@@ -1,6 +1,8 @@
 import json
 import hashlib
 import io
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -111,6 +113,10 @@ def test_label_queue_records_failed_image_and_continues(tmp_path, monkeypatch):
         "teacher_contract_sha256": summary["teacher_contract_sha256"],
         "queued": 2,
         "completed": 2,
+        "reused": 0,
+        "newly_labeled": 1,
+        "retried": 0,
+        "image_error": 0,
         "consensus": 1,
         "high_confidence_consensus": 1,
         "high_confidence_training_usable_consensus": 1,
@@ -913,6 +919,218 @@ def test_mid_image_digest_drift_leaves_no_checkpoint_and_rollback_relabels(
     )
     assert calls == 2
     assert checkpoint.exists()
+
+
+def _shared_fixture(tmp_path):
+    image = tmp_path / "capture.jpg"
+    image.write_bytes(b"shared-capture")
+    queue = tmp_path / "queue.jsonl"
+    queue.write_text(json.dumps(_queue_row(image)) + "\n", encoding="utf-8")
+    _known(tmp_path)
+    return image, queue, tmp_path / "teacher-cache"
+
+
+def _shared_run(tmp_path, queue, cache, name, **kwargs):
+    return teacher.label_queue(
+        queue, tmp_path / name, image_root=tmp_path,
+        known_audit=tmp_path / "known_audit.json", url="http://127.0.0.1:11434",
+        model=kwargs.pop("model", "model-v1"),
+        model_digest=kwargs.pop("model_digest", "a" * 64),
+        timeout=1, retries=1, checkpoint_dir=cache, **kwargs,
+    )
+
+
+def test_shared_cache_reuses_same_image_for_new_immutable_output(tmp_path, monkeypatch):
+    _, queue, cache = _shared_fixture(tmp_path)
+    calls = []
+    monkeypatch.setattr(teacher, "_request", lambda *args: calls.append(args) or _answer("can", .9))
+    first = _shared_run(tmp_path, queue, cache, "first.jsonl")
+    assert len(calls) == 2
+    assert first["newly_labeled"] == 1 and first["reused"] == 0
+    existing = {path.relative_to(cache): path.read_bytes() for path in cache.rglob("*.json")}
+    monkeypatch.setattr(teacher, "_request", lambda *_: pytest.fail("cached image must not call chat"))
+    second = _shared_run(tmp_path, queue, cache, "second.jsonl")
+    assert second["reused"] == 1 and second["newly_labeled"] == second["retried"] == 0
+    assert second["image_error"] == 0
+    assert (tmp_path / "first.jsonl").read_bytes() == (tmp_path / "second.jsonl").read_bytes()
+    assert {path.relative_to(cache): path.read_bytes() for path in cache.rglob("*.json")} == existing
+    assert set(second).isdisjoint({"client_id", "image_ref", "checkpoint_dir"})
+
+
+def test_shared_cache_labels_only_new_images(tmp_path, monkeypatch):
+    image, queue, cache = _shared_fixture(tmp_path)
+    calls = []
+    monkeypatch.setattr(teacher, "_request", lambda *args: calls.append(args[2]) or _answer("paper", .9))
+    _shared_run(tmp_path, queue, cache, "first.jsonl")
+    calls.clear()
+    new_image = tmp_path / "new.jpg"
+    new_image.write_bytes(b"new-capture")
+    queue.write_text("".join(json.dumps(_queue_row(path)) + "\n" for path in (image, new_image)), encoding="utf-8")
+    summary = _shared_run(tmp_path, queue, cache, "second.jsonl")
+    assert calls == [b"new-capture", b"new-capture"]
+    assert summary["reused"] == summary["newly_labeled"] == 1
+    assert summary["retried"] == 0
+
+
+@pytest.mark.parametrize("change", ["model", "prompt"])
+def test_shared_cache_contract_namespaces_preserve_prior_results(tmp_path, monkeypatch, change):
+    _, queue, cache = _shared_fixture(tmp_path)
+    calls = []
+    monkeypatch.setattr(teacher, "_request", lambda *args: calls.append(args) or _answer("paper", .9))
+    first = _shared_run(tmp_path, queue, cache, "first.jsonl")
+    original_root = cache / first["teacher_contract_sha256"]
+    original = {path.relative_to(original_root): path.read_bytes() for path in original_root.rglob("*.json")}
+    kwargs = {}
+    if change == "model":
+        kwargs = {"model": "model-v2", "model_digest": "b" * 64}
+    else:
+        build = teacher.build_teacher_contract
+        def changed_contract(model, digest):
+            contract, _ = build(model, digest)
+            contract["rendered_prompts"]["initial"][0] += " changed"
+            return contract, teacher._sha256_bytes(teacher._canonical_json(contract).encode())
+        monkeypatch.setattr(teacher, "build_teacher_contract", changed_contract)
+    calls.clear()
+    second = _shared_run(tmp_path, queue, cache, "second.jsonl", **kwargs)
+    assert len(calls) == 2
+    assert second["reused"] == 0 and second["newly_labeled"] == 1
+    assert first["teacher_contract_sha256"] != second["teacher_contract_sha256"]
+    assert {path.relative_to(original_root): path.read_bytes() for path in original_root.rglob("*.json")} == original
+    assert len(list(cache.iterdir())) == 2
+
+
+def test_shared_cache_retries_incomplete_without_overwriting_previous_attempt(tmp_path, monkeypatch):
+    _, queue, cache = _shared_fixture(tmp_path)
+    def failed_request(*_):
+        raise ValueError("truncated response")
+    monkeypatch.setattr(teacher, "_request", failed_request)
+    first = _shared_run(tmp_path, queue, cache, "first.jsonl")
+    assert first["newly_labeled"] == 0 and first["reused"] == 0
+    previous = {path: path.read_bytes() for path in cache.rglob("*.json")}
+    calls = []
+    monkeypatch.setattr(teacher, "_request", lambda *args: calls.append(args) or _answer("can", .9))
+    second = _shared_run(tmp_path, queue, cache, "second.jsonl")
+    assert len(calls) == 2
+    assert second["retried"] == second["newly_labeled"] == 1
+    assert second["reused"] == 0
+    assert len(list(cache.rglob("*.json"))) == 2
+    assert all(path.read_bytes() == content for path, content in previous.items())
+    monkeypatch.setattr(teacher, "_request", lambda *_: pytest.fail("completed retry must be reused"))
+    third = _shared_run(tmp_path, queue, cache, "third.jsonl")
+    assert third["reused"] == 1 and third["retried"] == 0
+
+
+def test_shared_cache_never_reuses_prediction_for_modified_source(tmp_path, monkeypatch):
+    image, queue, cache = _shared_fixture(tmp_path)
+    monkeypatch.setattr(teacher, "_request", lambda *_: _answer("can", .9))
+    _shared_run(tmp_path, queue, cache, "first.jsonl")
+    image.write_bytes(b"changed bytes")
+    monkeypatch.setattr(teacher, "_request", lambda *_: pytest.fail("bad source must not call chat"))
+    summary = _shared_run(tmp_path, queue, cache, "modified.jsonl")
+    assert summary["reused"] == summary["newly_labeled"] == 0
+    assert summary["image_error"] == 1
+    row = json.loads((tmp_path / "modified.jsonl").read_text(encoding="utf-8"))
+    assert row["consensus"] is False
+    assert "image_sha256_mismatch" in row["errors"][0]
+
+
+def test_shared_cache_source_change_during_labeling_cannot_publish_success(tmp_path, monkeypatch):
+    image, queue, cache = _shared_fixture(tmp_path)
+    def changing_request(*_):
+        image.write_bytes(b"changed while labeling")
+        return _answer("can", .9)
+    monkeypatch.setattr(teacher, "_request", changing_request)
+    with pytest.raises(ValueError, match="source image changed"):
+        _shared_run(tmp_path, queue, cache, "first.jsonl")
+    assert not (tmp_path / "first.jsonl").exists()
+    assert not list(cache.rglob("*.json"))
+
+
+@pytest.mark.parametrize("ancestor", [False, True])
+def test_shared_cache_rejects_symlink_directory_and_ancestors(tmp_path, monkeypatch, ancestor):
+    _, queue, _ = _shared_fixture(tmp_path)
+    real = tmp_path / "real-cache"
+    real.mkdir()
+    linked = tmp_path / "linked-cache"
+    try:
+        os.symlink(real, linked, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    monkeypatch.setattr(teacher, "_request", lambda *_: pytest.fail("unsafe cache must not call chat"))
+    with pytest.raises(ValueError, match="symlink"):
+        _shared_run(tmp_path, queue, linked / "nested" if ancestor else linked, "labels.jsonl")
+    assert not list(real.iterdir())
+
+
+def test_shared_cache_rejects_output_overlap_and_existing_output(tmp_path, monkeypatch):
+    _, queue, cache = _shared_fixture(tmp_path)
+    monkeypatch.setattr(teacher, "_request", lambda *_: pytest.fail("unsafe output must not call chat"))
+    with pytest.raises(ValueError, match="must not overlap"):
+        _shared_run(tmp_path, queue, cache, "teacher-cache/labels.jsonl")
+    output = tmp_path / "existing.jsonl"
+    output.write_bytes(b"keep previous run")
+    with pytest.raises(FileExistsError, match="new immutable output"):
+        _shared_run(tmp_path, queue, cache, output.name)
+    assert output.read_bytes() == b"keep previous run"
+
+
+def test_shared_cache_rejects_corrupt_content_addressed_entry(tmp_path, monkeypatch):
+    _, queue, cache = _shared_fixture(tmp_path)
+    monkeypatch.setattr(teacher, "_request", lambda *_: _answer("can", .9))
+    _shared_run(tmp_path, queue, cache, "first.jsonl")
+    cached = next(cache.rglob("*.json"))
+    cached.write_bytes(cached.read_bytes() + b" ")
+    monkeypatch.setattr(teacher, "_request", lambda *_: pytest.fail("corrupt cache must fail closed"))
+    with pytest.raises(ValueError, match="content digest mismatch"):
+        _shared_run(tmp_path, queue, cache, "second.jsonl")
+    assert not (tmp_path / "second.jsonl").exists()
+
+
+def test_shared_cache_cli_passes_optional_directory(tmp_path, monkeypatch):
+    seen = {}
+    def fake_label(queue, output, **kwargs):
+        seen.update(kwargs)
+        return {"reused": 0, "newly_labeled": 0, "retried": 0, "image_error": 0}
+    cache = tmp_path / "shared-cache"
+    monkeypatch.setattr(teacher, "label_queue", fake_label)
+    monkeypatch.setattr(sys, "argv", [
+        "label_operational_captures_ollama.py", "--queue", "queue.jsonl",
+        "--output", "labels.jsonl", "--image-root", str(tmp_path),
+        "--known-audit", "known.json", "--model-digest", "a" * 64,
+        "--checkpoint-dir", str(cache),
+    ])
+    teacher.main()
+    assert seen["checkpoint_dir"] == cache
+
+
+def test_shared_cache_final_output_race_preserves_other_run(tmp_path, monkeypatch):
+    _, queue, cache = _shared_fixture(tmp_path)
+    output = tmp_path / "raced.jsonl"
+    def racing_request(*_):
+        output.write_bytes(b"another-run")
+        return _answer("can", .9)
+    monkeypatch.setattr(teacher, "_request", racing_request)
+    with pytest.raises(FileExistsError):
+        _shared_run(tmp_path, queue, cache, output.name)
+    assert output.read_bytes() == b"another-run"
+
+
+def test_shared_cache_completed_entry_symlink_is_never_followed(tmp_path, monkeypatch):
+    _, queue, cache = _shared_fixture(tmp_path)
+    monkeypatch.setattr(teacher, "_request", lambda *_: _answer("can", .9))
+    _shared_run(tmp_path, queue, cache, "first.jsonl")
+    entry = next(cache.rglob("*.json"))
+    original = tmp_path / "outside-cache.json"
+    original.write_bytes(entry.read_bytes())
+    entry.unlink()
+    try:
+        os.symlink(original, entry)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    monkeypatch.setattr(teacher, "_request", lambda *_: pytest.fail("cache symlink must fail closed"))
+    with pytest.raises(ValueError, match="symlink"):
+        _shared_run(tmp_path, queue, cache, "second.jsonl")
+    assert not (tmp_path / "second.jsonl").exists()
 
 
 def test_request_rejects_response_model_mismatch(monkeypatch):
