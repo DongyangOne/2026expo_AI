@@ -24,11 +24,15 @@ import sys
 import tempfile
 import types
 from collections import Counter
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
-from zoneinfo import ZoneInfo
+
+try:
+    from scripts import operational_quality_assembly_contract as quality_assembly_contract
+except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
+    import operational_quality_assembly_contract as quality_assembly_contract
+
 
 AUTHORITY_SCHEMA = "v4_candidate_training_authority.v3"
 AUTHORITY_ROLE = "v4_candidate_training_input_authority_not_blind_or_deployment"
@@ -49,94 +53,22 @@ TRUST_ROOT_METHOD = "git_bundled_code_sha256_pin"
 FULL_DATA_REPORT_ROLE = "v4_development_candidates_not_blind_or_deployment_authority"
 QX3_READY_ROLE = "v4_reproducibility_diagnostic_not_candidate_or_deployment_authority"
 QX3_REPORT_ROLE = "v4_batch1_validator_reproducibility_diagnostic_only"
-QUALITY_CONTRACT = "v4_capture_quality_exclusions.sha256_reason_only.v1"
-QUALITY_ROLE = (
-    "v4_capture_quality_exclusion_manifest_selection_only_"
-    "not_ground_truth_or_authority"
-)
-QUALITY_REASONS = {
-    "severe_frame_crop",
-    "person_occlusion_or_dominance",
-    "excessive_background_or_multi_object",
-    "unreadable_boundary",
-    "too_low_resolution",
-    "extreme_exposure",
-}
-QUALITY_ASSEMBLY_SCHEMA = "operational_quality_exclusion_assembly.v1"
-QUALITY_ASSEMBLY_ROLE = (
-    "operational_quality_exclusion_assembly_selection_only_"
-    "not_ground_truth_or_authority"
-)
-QUALITY_ASSEMBLY_STATUS = "operational_quality_exclusions_assembled"
-QUALITY_ASSEMBLY_MODE = "objective_and_subjective_quality"
-QUALITY_ASSEMBLY_TEACHER_SCHEMA = "operational_teacher_label.v3"
-QUALITY_ASSEMBLY_FILES = {
-    "manifest": "operational_quality_exclusions.json",
-    "receipt": "operational_quality_exclusion_assembly.json",
-    "marker": "assembly.sha256",
-}
-QUALITY_ASSEMBLY_INPUT_SHA_FIELDS = {
-    "teacher_queue",
-    "teacher_labels",
-    "capture_inventory",
-    "known_audit",
-    "provider_a_manifest",
-    "provider_a_model",
-    "provider_a_spec",
-    "provider_b_manifest",
-    "provider_b_model",
-    "provider_b_spec",
-    "teacher_output_csv",
-    "teacher_output_jsonl",
-    "teacher_output_empty_scene_csv",
-    "teacher_output_empty_scene_jsonl",
-    "teacher_output_rejections",
-    "teacher_output_lineage",
-    "objective_prepare_capture_index",
-    "objective_prepare_capture_inventory",
-    "objective_prepare_teacher_queue",
-    "objective_prepare_objective_rejections",
-    "objective_prepare_summary",
-    "objective_prepare_objective_receipt",
-}
-QUALITY_ASSEMBLY_CODE_SHA_FIELDS = {
-    "assembler",
-    "quality_producer",
-    "teacher_builder",
-    "teacher_contract",
-    "objective_queue_preparer",
-}
-QUALITY_ASSEMBLY_SCOPE_FIELDS = {
-    "teacher_subjective_quality_included",
-    "objective_queue_quality_included",
-    "objective_prepare_bundle_validated",
-    "subjective_quality_source_count",
-    "objective_quality_source_count",
-    "paths_or_private_ids_exported",
-    "trusted_policy_pinned",
-    "executed_code_cryptographically_attested",
-}
-QUALITY_ASSEMBLY_RECEIPT_FIELDS = {
-    "schema_version",
-    "assembly_schema",
-    "artifact_role",
-    "status",
-    "assembly_mode",
-    "quality_exclusion_contract",
-    "operational_capture_cutoff_kst",
-    "teacher_label_schema_version",
-    "selected_source_count",
-    "reason_counts",
-    "quality_manifest_sha256",
-    "quality_source_list_sha256",
-    "input_sha256",
-    "observed_code_sha256",
-    "scope",
-    "authority",
-}
-KST = ZoneInfo("Asia/Seoul")
-OPERATIONAL_CUTOFF = datetime(2026, 8, 1, 0, 0, 0, tzinfo=KST)
-SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+QUALITY_CONTRACT = quality_assembly_contract.QUALITY_CONTRACT
+QUALITY_ROLE = quality_assembly_contract.QUALITY_ROLE
+QUALITY_REASONS = quality_assembly_contract.QUALITY_REASONS
+QUALITY_ASSEMBLY_SCHEMA = quality_assembly_contract.QUALITY_ASSEMBLY_SCHEMA
+QUALITY_ASSEMBLY_ROLE = quality_assembly_contract.QUALITY_ASSEMBLY_ROLE
+QUALITY_ASSEMBLY_STATUS = quality_assembly_contract.QUALITY_ASSEMBLY_STATUS
+QUALITY_ASSEMBLY_MODE = quality_assembly_contract.QUALITY_ASSEMBLY_MODE
+QUALITY_ASSEMBLY_TEACHER_SCHEMA = quality_assembly_contract.QUALITY_ASSEMBLY_TEACHER_SCHEMA
+QUALITY_ASSEMBLY_FILES = quality_assembly_contract.QUALITY_ASSEMBLY_FILES
+QUALITY_ASSEMBLY_INPUT_SHA_FIELDS = quality_assembly_contract.QUALITY_ASSEMBLY_INPUT_SHA_FIELDS
+QUALITY_ASSEMBLY_CODE_SHA_FIELDS = quality_assembly_contract.QUALITY_ASSEMBLY_CODE_SHA_FIELDS
+QUALITY_ASSEMBLY_SCOPE_FIELDS = quality_assembly_contract.QUALITY_ASSEMBLY_SCOPE_FIELDS
+QUALITY_ASSEMBLY_RECEIPT_FIELDS = quality_assembly_contract.QUALITY_ASSEMBLY_RECEIPT_FIELDS
+KST = quality_assembly_contract.KST
+OPERATIONAL_CUTOFF = quality_assembly_contract.OPERATIONAL_CUTOFF
+SHA256_RE = quality_assembly_contract.SHA256_RE
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MATERIAL_CLASSES = (
@@ -160,10 +92,7 @@ PROTECTED_FIELDS = (
     "known_audit_source_sha256", "calibration_source_sha256",
     "blind_test_source_sha256",
 )
-FALSE_AUTHORITY_FIELDS = (
-    "selection", "ground_truth", "replay", "training", "calibration",
-    "blind_test", "deployment",
-)
+FALSE_AUTHORITY_FIELDS = quality_assembly_contract.FALSE_AUTHORITY_FIELDS
 CONFIG_FIELDS = {
     "schema", "backbone", "pretrained", "input_size", "epochs", "patience",
     "batch", "workers", "lr", "backbone_lr", "head_lr", "label_smoothing",
@@ -826,301 +755,14 @@ def _render_manifest(rows: Sequence[Mapping[str, str]]) -> bytes:
     return stream.getvalue().encode("utf-8")
 
 
-def _canonical_quality_entries(entries: Sequence[Mapping[str, str]]) -> bytes:
-    return (
-        json.dumps(
-            list(entries), ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"), allow_nan=False,
-        )
-        + "\n"
-    ).encode("utf-8")
-
-
-def _validate_quality_manifest(value: Mapping[str, object]) -> dict[str, str]:
-    expected_fields = {
-        "schema_version", "artifact_role", "quality_exclusion_contract", "status",
-        "excluded_source_count", "max_excluded_sources", "reason_counts",
-        "source_list_sha256", "entries", "authority",
-    }
-    if set(value) != expected_fields:
-        raise ValueError("quality exclusion top-level schema mismatch")
-    if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
-        raise ValueError("quality exclusion schema_version must be integer 1")
-    if value.get("artifact_role") != QUALITY_ROLE:
-        raise ValueError("quality exclusion artifact_role mismatch")
-    if value.get("quality_exclusion_contract") != QUALITY_CONTRACT:
-        raise ValueError("quality exclusion contract mismatch")
-    if value.get("status") != "quality_exclusions_ready":
-        raise ValueError("quality exclusion status mismatch")
-    authority = value.get("authority")
-    if type(authority) is not dict or set(authority) != set(FALSE_AUTHORITY_FIELDS):
-        raise ValueError("quality exclusion authority schema mismatch")
-    for field in FALSE_AUTHORITY_FIELDS:
-        _require_bool(authority.get(field), False, f"quality authority.{field}")
-    entries = value.get("entries")
-    if type(entries) is not list or not entries:
-        raise ValueError("quality exclusions must contain at least one entry")
-    if len(entries) > 100:
-        raise ValueError("quality exclusions may contain at most 100 entries")
-    parsed: dict[str, str] = {}
-    normalized: list[dict[str, str]] = []
-    for index, entry in enumerate(entries):
-        if type(entry) is not dict or set(entry) != {"source_sha256", "reason"}:
-            raise ValueError(f"quality exclusion entry {index} must be SHA/reason only")
-        source_sha = _require_sha256(entry.get("source_sha256"), "quality source")
-        reason = entry.get("reason")
-        if type(reason) is not str or reason not in QUALITY_REASONS:
-            raise ValueError("dent/crush/object condition is not a capture-quality exclusion")
-        if source_sha in parsed:
-            raise ValueError("duplicate quality exclusion SHA")
-        parsed[source_sha] = reason
-        normalized.append({"source_sha256": source_sha, "reason": reason})
-    normalized.sort(key=lambda row: row["source_sha256"])
-    if type(value.get("excluded_source_count")) is not int or value.get(
-        "excluded_source_count"
-    ) != len(normalized):
-        raise ValueError("quality excluded_source_count mismatch")
-    if type(value.get("max_excluded_sources")) is not int or value.get(
-        "max_excluded_sources"
-    ) != 100:
-        raise ValueError("quality max_excluded_sources must be exactly 100")
-    reason_counts = dict(sorted(Counter(row["reason"] for row in normalized).items()))
-    if not _exact_json_equal(value.get("reason_counts"), reason_counts):
-        raise ValueError("quality reason_counts mismatch")
-    expected_sha = _sha256_bytes(_canonical_quality_entries(normalized))
-    if value.get("source_list_sha256") != expected_sha:
-        raise ValueError("quality source_list_sha256 mismatch")
-    return parsed
-
-
-@dataclass(frozen=True)
-class _QualityAssemblyBundle:
-    root: Path
-    manifest_path: Path
-    receipt_path: Path
-    marker_path: Path
-    manifest_content: bytes
-    receipt_content: bytes
-    marker_content: bytes
-    observed_code_sha256: dict[str, str]
-
-
-def _quality_assembly_code_paths() -> dict[str, Path]:
-    root = Path(__file__).resolve().parents[1]
-    return {
-        "assembler": root / "scripts" / "assemble_operational_quality_exclusions.py",
-        "quality_producer": root / "scripts" / "build_v4_quality_exclusion_manifest.py",
-        "teacher_builder": root / "scripts" / "build_operational_teacher_manifest.py",
-        "teacher_contract": root / "scripts" / "operational_teacher_contract.py",
-        "objective_queue_preparer": root
-        / "scripts"
-        / "prepare_operational_capture_queue.py",
-    }
-
-
-def _quality_assembly_code_hashes() -> dict[str, str]:
-    return {
-        name: _sha256_bytes(
-            _stable_bytes(path, f"quality assembly observed code {name}")
-        )
-        for name, path in sorted(_quality_assembly_code_paths().items())
-    }
-
-
-def _quality_assembly_marker_bytes(
-    *, manifest_content: bytes, receipt_content: bytes
-) -> bytes:
-    contents = {
-        QUALITY_ASSEMBLY_FILES["manifest"]: manifest_content,
-        QUALITY_ASSEMBLY_FILES["receipt"]: receipt_content,
-    }
-    return "".join(
-        f"{_sha256_bytes(content)}  {name}\n"
-        for name, content in sorted(contents.items())
-    ).encode("ascii")
-
-
-def _validate_operational_quality_assembly(
-    *,
-    receipt_path: Path,
-    quality_path: Path,
-    quality_value: Mapping[str, object],
-    quality_content: bytes,
-    output_dir: Path,
-) -> _QualityAssemblyBundle:
-    """Validate the immutable full objective+subjective quality bundle."""
-
-    resolved_receipt = _regular_file(
-        receipt_path, "quality exclusion assembly receipt"
-    )
-    root = _reject_symlink_components(
-        resolved_receipt.parent, "quality exclusion assembly directory"
-    )
-    if root.is_symlink() or not root.is_dir():
-        raise ValueError("quality exclusion assembly parent must be a directory")
-    expected_names = set(QUALITY_ASSEMBLY_FILES.values())
-    if {entry.name for entry in root.iterdir()} != expected_names:
-        raise ValueError("quality exclusion assembly directory file set mismatch")
-    expected_receipt = root / QUALITY_ASSEMBLY_FILES["receipt"]
-    expected_manifest = root / QUALITY_ASSEMBLY_FILES["manifest"]
-    expected_marker = root / QUALITY_ASSEMBLY_FILES["marker"]
-    resolved_manifest = _regular_file(
-        quality_path, "quality exclusion assembly manifest"
-    )
-    if resolved_receipt != expected_receipt:
-        raise ValueError("quality exclusion assembly receipt basename mismatch")
-    if resolved_manifest != expected_manifest:
-        raise ValueError(
-            "quality exclusions must be the manifest beside the assembly receipt"
-        )
-    marker_path = _regular_file(expected_marker, "quality exclusion assembly marker")
-    normalized_output = Path(os.path.abspath(output_dir))
-    if normalized_output.is_relative_to(root):
-        raise ValueError("output directory must not be inside quality assembly evidence")
-
-    receipt, receipt_content = _load_json(
-        resolved_receipt, "quality exclusion assembly receipt"
-    )
-    marker_content = _stable_bytes(marker_path, "quality exclusion assembly marker")
-    if quality_content != _canonical_json(quality_value):
-        raise ValueError("quality exclusion assembly manifest is not canonical JSON")
-    if receipt_content != _canonical_json(receipt):
-        raise ValueError("quality exclusion assembly receipt is not canonical JSON")
-    if set(receipt) != QUALITY_ASSEMBLY_RECEIPT_FIELDS:
-        raise ValueError("quality exclusion assembly receipt schema mismatch")
-    if type(receipt.get("schema_version")) is not int or receipt.get(
-        "schema_version"
-    ) != 1:
-        raise ValueError("quality exclusion assembly schema_version mismatch")
-    exact_fields = {
-        "assembly_schema": QUALITY_ASSEMBLY_SCHEMA,
-        "artifact_role": QUALITY_ASSEMBLY_ROLE,
-        "status": QUALITY_ASSEMBLY_STATUS,
-        "assembly_mode": QUALITY_ASSEMBLY_MODE,
-        "quality_exclusion_contract": QUALITY_CONTRACT,
-        "operational_capture_cutoff_kst": OPERATIONAL_CUTOFF.isoformat(),
-        "teacher_label_schema_version": QUALITY_ASSEMBLY_TEACHER_SCHEMA,
-    }
-    for field, expected in exact_fields.items():
-        if receipt.get(field) != expected:
-            raise ValueError(f"quality exclusion assembly {field} mismatch")
-
-    selected_count = receipt.get("selected_source_count")
-    if type(selected_count) is not int or selected_count <= 0:
-        raise ValueError("quality exclusion assembly selected_source_count mismatch")
-    if selected_count != quality_value.get("excluded_source_count"):
-        raise ValueError("quality exclusion assembly selected count mismatch")
-    if not _exact_json_equal(
-        receipt.get("reason_counts"), quality_value.get("reason_counts")
-    ):
-        raise ValueError("quality exclusion assembly reason counts mismatch")
-    if receipt.get("quality_manifest_sha256") != _sha256_bytes(quality_content):
-        raise ValueError("quality exclusion assembly manifest SHA mismatch")
-    if receipt.get("quality_source_list_sha256") != quality_value.get(
-        "source_list_sha256"
-    ):
-        raise ValueError("quality exclusion assembly source-list SHA mismatch")
-
-    scope = receipt.get("scope")
-    if type(scope) is not dict or set(scope) != QUALITY_ASSEMBLY_SCOPE_FIELDS:
-        raise ValueError("quality exclusion assembly scope schema mismatch")
-    for field in (
-        "teacher_subjective_quality_included",
-        "objective_queue_quality_included",
-    ):
-        if type(scope.get(field)) is not bool:
-            raise ValueError(f"quality exclusion assembly scope.{field} must be boolean")
-    _require_bool(
-        scope.get("objective_prepare_bundle_validated"),
-        True,
-        "quality exclusion assembly scope.objective_prepare_bundle_validated",
-    )
-    for field in (
-        "paths_or_private_ids_exported",
-        "trusted_policy_pinned",
-        "executed_code_cryptographically_attested",
-    ):
-        _require_bool(
-            scope.get(field), False, f"quality exclusion assembly scope.{field}"
-        )
-    subjective_count = scope.get("subjective_quality_source_count")
-    objective_count = scope.get("objective_quality_source_count")
-    if (
-        type(subjective_count) is not int
-        or subjective_count < 0
-        or type(objective_count) is not int
-        or objective_count < 0
-        or subjective_count + objective_count != selected_count
-    ):
-        raise ValueError("quality exclusion assembly scope counts mismatch")
-    if scope.get("teacher_subjective_quality_included") is not (
-        subjective_count > 0
-    ) or scope.get("objective_queue_quality_included") is not (objective_count > 0):
-        raise ValueError("quality exclusion assembly scope inclusion flags mismatch")
-
-    authority = receipt.get("authority")
-    if type(authority) is not dict or set(authority) != set(FALSE_AUTHORITY_FIELDS):
-        raise ValueError("quality exclusion assembly authority schema mismatch")
-    for field in FALSE_AUTHORITY_FIELDS:
-        _require_bool(
-            authority.get(field), False, f"quality exclusion assembly authority.{field}"
-        )
-
-    input_sha256 = receipt.get("input_sha256")
-    if type(input_sha256) is not dict or set(input_sha256) != (
-        QUALITY_ASSEMBLY_INPUT_SHA_FIELDS
-    ):
-        raise ValueError("quality exclusion assembly input SHA schema mismatch")
-    for field, digest in input_sha256.items():
-        _require_sha256(digest, f"quality exclusion assembly input_sha256.{field}")
-
-    observed_code = receipt.get("observed_code_sha256")
-    if type(observed_code) is not dict or set(observed_code) != (
-        QUALITY_ASSEMBLY_CODE_SHA_FIELDS
-    ):
-        raise ValueError("quality exclusion assembly observed-code schema mismatch")
-    normalized_observed = {
-        str(field): _require_sha256(
-            digest, f"quality exclusion assembly observed_code_sha256.{field}"
-        )
-        for field, digest in observed_code.items()
-    }
-    if normalized_observed != _quality_assembly_code_hashes():
-        raise ValueError("quality exclusion assembly observed code is stale")
-
-    expected_marker_content = _quality_assembly_marker_bytes(
-        manifest_content=quality_content, receipt_content=receipt_content
-    )
-    if marker_content != expected_marker_content:
-        raise ValueError("quality exclusion assembly marker mismatch")
-    return _QualityAssemblyBundle(
-        root=root,
-        manifest_path=resolved_manifest,
-        receipt_path=resolved_receipt,
-        marker_path=marker_path,
-        manifest_content=quality_content,
-        receipt_content=receipt_content,
-        marker_content=marker_content,
-        observed_code_sha256=normalized_observed,
-    )
-
-
-def _rehash_operational_quality_assembly(bundle: _QualityAssemblyBundle) -> None:
-    if {entry.name for entry in bundle.root.iterdir()} != set(
-        QUALITY_ASSEMBLY_FILES.values()
-    ):
-        raise RuntimeError("quality exclusion assembly directory changed")
-    for path, expected, description in (
-        (bundle.manifest_path, bundle.manifest_content, "manifest"),
-        (bundle.receipt_path, bundle.receipt_content, "receipt"),
-        (bundle.marker_path, bundle.marker_content, "marker"),
-    ):
-        if _stable_bytes(path, f"quality exclusion assembly {description} final rehash") != (
-            expected
-        ):
-            raise RuntimeError(f"quality exclusion assembly {description} changed")
-    if _quality_assembly_code_hashes() != bundle.observed_code_sha256:
-        raise RuntimeError("quality exclusion assembly observed code changed")
+_canonical_quality_entries = quality_assembly_contract._canonical_quality_entries
+_validate_quality_manifest = quality_assembly_contract._validate_quality_manifest
+_QualityAssemblyBundle = quality_assembly_contract._QualityAssemblyBundle
+_quality_assembly_code_paths = quality_assembly_contract._quality_assembly_code_paths
+_quality_assembly_code_hashes = quality_assembly_contract._quality_assembly_code_hashes
+_quality_assembly_marker_bytes = quality_assembly_contract._quality_assembly_marker_bytes
+_validate_operational_quality_assembly = quality_assembly_contract._validate_operational_quality_assembly
+_rehash_operational_quality_assembly = quality_assembly_contract._rehash_operational_quality_assembly
 
 
 def _validate_full_data_report(
@@ -1236,7 +878,50 @@ def _validate_full_data_report(
             raise ValueError(f"full-data validator provenance.{field} mismatch")
 
 
-def _validate_qx3_ready(value: Mapping[str, object]) -> None:
+def _validate_qx3_quality_bindings(
+    value: Mapping[str, object], *, description: str,
+    quality_exclusions_sha256: str,
+    quality_exclusion_assembly_receipt_sha256: str,
+) -> None:
+    bindings = value.get("bindings")
+    if type(bindings) is not dict:
+        raise ValueError(f"{description} bindings are missing")
+    manifest_sha = _require_sha256(
+        bindings.get("quality_exclusions_sha256"),
+        f"{description} quality_exclusions_sha256",
+    )
+    legacy_alias_sha = _require_sha256(
+        bindings.get("quality_exclusion_manifest_sha256"),
+        f"{description} quality_exclusion_manifest_sha256",
+    )
+    receipt_sha = _require_sha256(
+        bindings.get("quality_exclusion_assembly_receipt_sha256"),
+        f"{description} quality_exclusion_assembly_receipt_sha256",
+    )
+    validator_sha = _require_sha256(
+        bindings.get("quality_assembly_validator_sha256"),
+        f"{description} quality_assembly_validator_sha256",
+    )
+    if manifest_sha != legacy_alias_sha:
+        raise ValueError(f"{description} quality manifest aliases mismatch")
+    if manifest_sha != quality_exclusions_sha256:
+        raise ValueError(f"{description} quality exclusions binding mismatch")
+    if receipt_sha != quality_exclusion_assembly_receipt_sha256:
+        raise ValueError(f"{description} quality assembly receipt binding mismatch")
+    current_validator_sha = _sha256_bytes(
+        _stable_bytes(
+            Path(quality_assembly_contract.__file__).resolve(),
+            "quality assembly validator code",
+        )
+    )
+    if validator_sha != current_validator_sha:
+        raise ValueError(f"{description} quality assembly validator binding mismatch")
+
+
+def _validate_qx3_ready(
+    value: Mapping[str, object], *, quality_exclusions_sha256: str,
+    quality_exclusion_assembly_receipt_sha256: str,
+) -> None:
     if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
         raise ValueError("qx3 ready schema_version mismatch")
     if value.get("artifact_role") != QX3_READY_ROLE:
@@ -1258,9 +943,20 @@ def _validate_qx3_ready(value: Mapping[str, object]) -> None:
         raise ValueError("qx3 ready selected_source_coverage is invalid")
     if not math.isfinite(float(coverage)) or not 0.99 <= float(coverage) <= 1:
         raise ValueError("qx3 ready selected_source_coverage is below 99 percent")
+    _validate_qx3_quality_bindings(
+        value,
+        description="qx3 ready",
+        quality_exclusions_sha256=quality_exclusions_sha256,
+        quality_exclusion_assembly_receipt_sha256=(
+            quality_exclusion_assembly_receipt_sha256
+        ),
+    )
 
 
-def _validate_qx3_report(value: Mapping[str, object]) -> None:
+def _validate_qx3_report(
+    value: Mapping[str, object], *, quality_exclusions_sha256: str,
+    quality_exclusion_assembly_receipt_sha256: str,
+) -> None:
     if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
         raise ValueError("qx3 report schema_version mismatch")
     if value.get("artifact_role") != QX3_REPORT_ROLE:
@@ -1277,6 +973,14 @@ def _validate_qx3_report(value: Mapping[str, object]) -> None:
         "blind_test_authority", "production_deployment_authorized",
     ):
         _require_bool(value.get(field), False, f"qx3 report.{field}")
+    _validate_qx3_quality_bindings(
+        value,
+        description="qx3 report",
+        quality_exclusions_sha256=quality_exclusions_sha256,
+        quality_exclusion_assembly_receipt_sha256=(
+            quality_exclusion_assembly_receipt_sha256
+        ),
+    )
 
 
 def _validate_license_allowlist(value: Mapping[str, object]) -> Mapping[str, object]:
@@ -3344,8 +3048,24 @@ def _build_candidate_bundle(
         qx3_report, qx3_report_content = _load_json(
             qx3_diagnostic_report, "qx3 diagnostic report"
         )
-        _validate_qx3_ready(qx3_ready)
-        _validate_qx3_report(qx3_report)
+        quality_exclusions_sha256 = _sha256_bytes(quality_content)
+        quality_exclusion_assembly_receipt_sha256 = _sha256_bytes(
+            quality_assembly_bundle.receipt_content
+        )
+        _validate_qx3_ready(
+            qx3_ready,
+            quality_exclusions_sha256=quality_exclusions_sha256,
+            quality_exclusion_assembly_receipt_sha256=(
+                quality_exclusion_assembly_receipt_sha256
+            ),
+        )
+        _validate_qx3_report(
+            qx3_report,
+            quality_exclusions_sha256=quality_exclusions_sha256,
+            quality_exclusion_assembly_receipt_sha256=(
+                quality_exclusion_assembly_receipt_sha256
+            ),
+        )
         qx3_bindings = qx3_ready.get("bindings")
         if type(qx3_bindings) is not dict or qx3_bindings.get(
             "comparison_sha256"
@@ -3353,6 +3073,8 @@ def _build_candidate_bundle(
             raise ValueError(
                 "qx3 ready does not bind the diagnostic comparison report"
             )
+        quality_validator_path = Path(quality_assembly_contract.__file__).resolve()
+        quality_validator_sha256 = qx3_bindings["quality_assembly_validator_sha256"]
         near_duplicate_value, near_duplicate_content = _load_json(
             near_duplicate_audit_report, "near-duplicate audit report"
         )
@@ -4030,6 +3752,7 @@ def _build_candidate_bundle(
         for path, expected, description in (
             (qx3_diagnostic_ready, policy_bindings["qx3_diagnostic_ready_sha256"], "qx3 ready"),
             (qx3_diagnostic_report, policy_bindings["qx3_diagnostic_report_sha256"], "qx3 report"),
+            (quality_validator_path, quality_validator_sha256, "quality assembly validator"),
             (trusted_policy, _sha256_bytes(policy_content), "trusted policy"),
             (license_allowlist, policy_bindings["license_allowlist_sha256"], "license allowlist"),
             (quality_exclusions, policy_bindings["quality_exclusions_sha256"], "quality exclusions"),
@@ -4108,6 +3831,27 @@ def _build_candidate_bundle(
         _verify_dataset_input(record, f"source payload post-publish {index}")
     for index, record in enumerate(dataset_crop_inputs):
         _verify_dataset_input(record, f"crop payload post-publish {index}")
+    for path, expected, description in (
+        (
+            quality_validator_path,
+            quality_validator_sha256,
+            "quality assembly validator",
+        ),
+        (
+            qx3_diagnostic_ready,
+            policy_bindings["qx3_diagnostic_ready_sha256"],
+            "qx3 ready",
+        ),
+        (
+            qx3_diagnostic_report,
+            policy_bindings["qx3_diagnostic_report_sha256"],
+            "qx3 report",
+        ),
+    ):
+        if _sha256_bytes(
+            _stable_bytes(path, f"{description} post-publish rehash")
+        ) != expected:
+            raise RuntimeError(f"{description} changed after publish")
     _rehash_operational_quality_assembly(quality_assembly_bundle)
     # The marker is the atomic completion seal. Until every post-publication
     # check succeeds, the exposed directory is intentionally not consumable by

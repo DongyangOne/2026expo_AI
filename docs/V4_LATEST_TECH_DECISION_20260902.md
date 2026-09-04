@@ -83,6 +83,26 @@ candidate preaudit/final에는 manifest와 함께
 최종 authority에 결박한다. receipt 누락, legacy mode, 재봉인된 늦은 cutoff, manifest/receipt
 digest·count·reason 불일치, privacy/authority 타입 위장은 모두 후보 생성 전에 거부한다.
 
+QX3 재현 체인도 같은 full assembly를 필수 입력으로 사용한다. selector에는
+`--quality-exclusion-assembly-receipt`, selection audit와 pilot validation에는
+`QUALITY_EXCLUSION_ASSEMBLY_RECEIPT`를 전달한다. pilot inventory/ready → CPU selection
+audit → cohort → A/B comparison → diagnostic ready가 `quality_exclusions_sha256`와
+`quality_exclusion_assembly_receipt_sha256`를 함께 결박한다. 기존 manifest SHA 필드는
+호환용 alias이며 canonical SHA와 반드시 같아야 한다. assembly 검증기 소스 SHA도
+실행 의존성으로 결박해 다른 검증기 바이트로 만든 증거를 재사용하지 않는다.
+공유 검증기는 `scripts/operational_quality_assembly_contract.py`이며 candidate의 승인
+policy pin과 분리되어 있어 source SHA와 policy SHA가 서로를 요구하는 순환이 없다.
+공유 bundle은 검증기 소스 자체도 snapshot하고 preaudit/final 게시 전후에 재확인한다.
+이는 관측한 파일 바이트의 일관성 검사이며 실행 코드의 암호학적 증명은 아니다.
+`executed_code_cryptographically_attested=false`를 유지한다.
+
+최종 candidate는 QX3 ready와 comparison의 두 품질 SHA가 자신의 검증된 assembly 및
+trusted policy와 같은지 확인한다. 각각 유효한 assembly라도 QX3=A, candidate=B인 조합은
+거부한다. 파일·상위 경로 symlink, 추가 파일, marker/receipt 변조 및 게시 중 입력 변경은
+완료 seal을 남기지 않는다. 이전 naked/legacy QX3 marker에 필드만 덧붙여 승격하지 않고,
+새 불변 경로에서 체인을 다시 생성해야 한다. 이는 CPU 계약 검증 보강이며 새 모델의
+정확도 확인이나 NAS 학습·배포 완료를 뜻하지 않는다.
+
 ## 다음 실험 순서
 
 ### 1. bbox/라벨 자동 감사

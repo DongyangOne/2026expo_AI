@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from collections import Counter
 from pathlib import Path
 from unittest.mock import patch
@@ -231,6 +232,39 @@ def _rewrite_quality_assembly_receipt(
         )
 
 
+def _sync_qx3_quality_bindings(fixture: dict[str, object]) -> None:
+    quality = fixture["quality"]
+    receipt = fixture["quality_assembly_receipt"]
+    qx3_report = fixture["qx3_report"]
+    qx3_ready = fixture["qx3_ready"]
+    assert all(
+        isinstance(path, Path)
+        for path in (quality, receipt, qx3_report, qx3_ready)
+    )
+    quality_sha = _sha(quality.read_bytes())
+    receipt_sha = _sha(receipt.read_bytes())
+    validator_sha = _sha(
+        Path(authority_builder.quality_assembly_contract.__file__).resolve().read_bytes()
+    )
+    report_value = json.loads(qx3_report.read_text(encoding="utf-8"))
+    report_value["bindings"] = {
+        "quality_exclusion_manifest_sha256": quality_sha,
+        "quality_exclusions_sha256": quality_sha,
+        "quality_exclusion_assembly_receipt_sha256": receipt_sha,
+        "quality_assembly_validator_sha256": validator_sha,
+    }
+    _dump(qx3_report, report_value)
+    ready_value = json.loads(qx3_ready.read_text(encoding="utf-8"))
+    ready_value["bindings"] = {
+        "comparison_sha256": _sha(qx3_report.read_bytes()),
+        "quality_exclusion_manifest_sha256": quality_sha,
+        "quality_exclusions_sha256": quality_sha,
+        "quality_exclusion_assembly_receipt_sha256": receipt_sha,
+        "quality_assembly_validator_sha256": validator_sha,
+    }
+    _dump(qx3_ready, ready_value)
+
+
 def _write_manifest(fixture: dict[str, object]) -> None:
     path = fixture["manifest"]
     assert isinstance(path, Path)
@@ -303,6 +337,7 @@ def _snapshot_report_bytes_for_policy(entries: list[dict[str, object]]) -> bytes
 
 def _refresh(fixture: dict[str, object]) -> None:
     _write_manifest(fixture)
+    _sync_qx3_quality_bindings(fixture)
     manifest = fixture["manifest"]
     report = fixture["full_report"]
     rows = fixture["rows"]
@@ -3117,3 +3152,183 @@ def test_launcher_rejects_dataset_snapshot_mode_or_inode_change(
     assert result.returncode != 0
     assert (run_dir / "control" / "failed.txt").is_file()
     assert not (run_dir / "control" / "candidate_training_ready.json").exists()
+
+
+@pytest.mark.parametrize("artifact", ("qx3_ready", "qx3_report"))
+@pytest.mark.parametrize(
+    "field",
+    (
+        "quality_exclusion_manifest_sha256",
+        "quality_exclusions_sha256",
+        "quality_exclusion_assembly_receipt_sha256",
+        "quality_assembly_validator_sha256",
+    ),
+)
+def test_qx3_quality_binding_is_required(
+    tmp_path: Path, artifact: str, field: str
+) -> None:
+    fixture = _fixture(tmp_path)
+    path = fixture[artifact]
+    assert isinstance(path, Path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    del value["bindings"][field]
+    _dump(path, value)
+    with pytest.raises(ValueError, match=field):
+        _run(fixture)
+
+
+@pytest.mark.parametrize("artifact", ("qx3_ready", "qx3_report"))
+def test_qx3_quality_manifest_aliases_must_match(
+    tmp_path: Path, artifact: str
+) -> None:
+    fixture = _fixture(tmp_path)
+    path = fixture[artifact]
+    assert isinstance(path, Path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["bindings"]["quality_exclusion_manifest_sha256"] = _fake_sha(
+        "different-quality-alias"
+    )
+    _dump(path, value)
+    with pytest.raises(ValueError, match="quality manifest aliases mismatch"):
+        _run(fixture)
+
+
+def test_candidate_rejects_valid_qx3_assembly_a_with_valid_candidate_assembly_b(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    qx3_ready = fixture["qx3_ready"]
+    qx3_report = fixture["qx3_report"]
+    quality = fixture["quality"]
+    receipt = fixture["quality_assembly_receipt"]
+    bad_row = fixture["bad_row"]
+    policy = fixture["policy"]
+    assert all(
+        isinstance(path, Path)
+        for path in (qx3_ready, qx3_report, quality, receipt, policy)
+    )
+    assert isinstance(bad_row, dict)
+    ready_a = qx3_ready.read_bytes()
+    report_a = qx3_report.read_bytes()
+
+    quality_b = _quality_value(
+        [
+            {
+                "source_sha256": str(bad_row["source_sha256"]),
+                "reason": "extreme_exposure",
+            }
+        ]
+    )
+    _write_quality_assembly_bundle(receipt.parent, quality_b)
+    _refresh(fixture)
+
+    qx3_ready.write_bytes(ready_a)
+    qx3_report.write_bytes(report_a)
+    policy_value = json.loads(policy.read_text(encoding="utf-8"))
+    policy_value["qx3_diagnostic_ready_sha256"] = _sha(ready_a)
+    policy_value["qx3_diagnostic_report_sha256"] = _sha(report_a)
+    _dump(policy, policy_value)
+
+    with pytest.raises(ValueError, match="quality exclusions binding mismatch"):
+        _run(fixture)
+
+
+def test_evidence_post_publish_mutation_leaves_no_completion_seal(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    ready = fixture["qx3_ready"]
+    assert isinstance(ready, Path)
+    original = authority_builder._publish_directory_no_replace
+
+    def mutate_after_publish(stage: Path, destination: Path) -> None:
+        original(stage, destination)
+        ready.write_bytes(ready.read_bytes() + b" ")
+
+    with patch.object(
+        authority_builder, "_publish_directory_no_replace", mutate_after_publish
+    ):
+        with pytest.raises(RuntimeError, match="qx3 ready changed after publish"):
+            _run(fixture)
+    output = fixture["global_root"] / "authority"  # type: ignore[operator]
+    assert output.is_dir()
+    assert not (output / "training_authority.sha256").exists()
+
+
+@pytest.mark.parametrize("phase", ("pre", "post"))
+def test_quality_validator_source_mutation_leaves_no_completion_seal(
+    tmp_path: Path, phase: str,
+) -> None:
+    source = Path(authority_builder.quality_assembly_contract.__file__)
+    copied = tmp_path / "operational_quality_assembly_contract.py"
+    copied.write_bytes(source.read_bytes())
+    validator_reference = SimpleNamespace(__file__=str(copied))
+    with patch.object(authority_builder, "quality_assembly_contract", validator_reference):
+        fixture = _fixture(tmp_path)
+        if phase == "pre":
+            original = authority_builder._validate_near_duplicate_audit
+
+            def mutate(*args, **kwargs):
+                result = original(*args, **kwargs)
+                copied.write_bytes(copied.read_bytes() + b"\n# changed\n")
+                return result
+
+            target = "_validate_near_duplicate_audit"
+        else:
+            original = authority_builder._publish_directory_no_replace
+
+            def mutate(*args, **kwargs):
+                result = original(*args, **kwargs)
+                copied.write_bytes(copied.read_bytes() + b"\n# changed\n")
+                return result
+
+            target = "_publish_directory_no_replace"
+        with patch.object(authority_builder, target, mutate):
+            with pytest.raises(RuntimeError, match="quality assembly validator changed"):
+                _run(fixture)
+    output = fixture["global_root"] / "authority"  # type: ignore[operator]
+    assert not (output / "training_authority.sha256").exists()
+
+
+@pytest.mark.parametrize("phase", ("snapshot", "post_publish"))
+def test_preaudit_shared_validator_source_mutation_leaves_no_completion_seal(
+    tmp_path: Path, phase: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+    shared_validator = authority_builder.quality_assembly_contract
+    source = Path(shared_validator.__file__)
+    original_source_content = source.read_bytes()
+    copied_source = tmp_path / "preaudit-validator-copy.py"
+    copied_source.write_bytes(original_source_content)
+    target = (
+        "_copy_dataset_snapshot_object"
+        if phase == "snapshot"
+        else "_publish_directory_no_replace"
+    )
+    original = getattr(authority_builder, target)
+    mutation_performed = False
+
+    def mutate_after_step(*args, **kwargs):
+        nonlocal mutation_performed
+        result = original(*args, **kwargs)
+        if not mutation_performed:
+            copied_source.write_bytes(original_source_content + b"\n# source changed\n")
+            mutation_performed = True
+        return result
+
+    with (
+        patch.object(
+            shared_validator, "_quality_assembly_validator_path",
+            lambda: copied_source,
+        ),
+        patch.object(authority_builder, target, mutate_after_step),
+    ):
+        with pytest.raises(RuntimeError, match="quality.*validator.*changed"):
+            _build_preaudit_proposal(fixture)
+
+    assert mutation_performed
+    assert copied_source.read_bytes() != original_source_content
+    assert source.read_bytes() == original_source_content
+    output = fixture["global_root"] / "preaudit-proposal"  # type: ignore[operator]
+    assert not (output / "preaudit_proposal.sha256").exists()
+    assert not (output / "training_authority.sha256").exists()

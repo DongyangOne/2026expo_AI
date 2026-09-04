@@ -17,7 +17,7 @@ require_env() {
 
 for name in \
   VALIDATION_DIR CODE_ROOT GEN_DIR PILOT_INPUT_DIR SELECTION_AUDIT_DIR \
-  QUALITY_EXCLUSION_MANIFEST DETECTOR_MODEL INFERENCE_SPEC
+  QUALITY_EXCLUSION_MANIFEST QUALITY_EXCLUSION_ASSEMBLY_RECEIPT DETECTOR_MODEL INFERENCE_SPEC
 do
   require_env "$name"
 done
@@ -31,6 +31,9 @@ PILOT_BUILDER=$CODE_ROOT/scripts/build_v4_repro_pilot_inputs.py
 PROPOSAL_PREPARE=$CODE_ROOT/scripts/prepare_proposal_verifier_dataset.py
 PREPROCESSING=$CODE_ROOT/scripts/verifier_preprocessing_contract.py
 QUALITY_MANIFEST=$QUALITY_EXCLUSION_MANIFEST
+QUALITY_RECEIPT=$QUALITY_EXCLUSION_ASSEMBLY_RECEIPT
+QUALITY_MARKER=$(dirname "$QUALITY_RECEIPT")/assembly.sha256
+QUALITY_VALIDATOR=$CODE_ROOT/scripts/operational_quality_assembly_contract.py
 PILOT_READY=$PILOT_INPUT_DIR/input_ready.json
 PILOT_INPUTS=$PILOT_INPUT_DIR/inputs.sha256
 PILOT_INVENTORY=$PILOT_INPUT_DIR/selection_inventory.json
@@ -56,6 +59,23 @@ GEN_OUTPUTS=$GEN_CONTROL/outputs.sha256
 GEN_DATASET_INPUT_INVENTORY=$GEN_CONTROL/dataset_input_inventory.json
 RAW_INVENTORY=$GEN_CONTROL/raw_output_inventory.json
 GEN_READY=$GEN_CONTROL/raw_generation_ready.json
+
+# Do not contaminate immutable assembly evidence before its file-set check.
+if ! "$PYTHON_BIN" - "$VALIDATION_DIR" "$QUALITY_MANIFEST" "$QUALITY_RECEIPT" <<'PY'
+import sys
+from pathlib import Path
+
+for argument in sys.argv[1:4]:
+    if not Path(argument).is_absolute() or "\n" in argument or "\r" in argument:
+        raise ValueError("validation and quality inputs must be absolute newline-free paths")
+output, manifest, receipt = map(lambda value: Path(value).resolve(), sys.argv[1:4])
+if output.is_relative_to(receipt.parent):
+    raise ValueError("VALIDATION_DIR must not be inside quality assembly evidence")
+PY
+then
+  printf '%s\n' "validation output or quality evidence path is invalid" >&2
+  exit 64
+fi
 
 if ! mkdir "$VALIDATION_DIR" 2>/dev/null; then
   printf '%s\n' "refusing to reuse immutable VALIDATION_DIR: $VALIDATION_DIR" >&2
@@ -142,7 +162,7 @@ for artifact in \
   "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$AUDIT_WRAPPER" \
   "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
   "$PREPROCESSING" "$DETECTOR_MODEL" "$INFERENCE_SPEC" \
-  "$QUALITY_MANIFEST" \
+  "$QUALITY_MANIFEST" "$QUALITY_RECEIPT" "$QUALITY_MARKER" "$QUALITY_VALIDATOR" \
   "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
   "$PILOT_TRAIN" "$PILOT_VALIDATION" \
   "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" "$SELECTION_AUDIT_EVIDENCE" \
@@ -164,7 +184,7 @@ fi
 
 if ! "$PYTHON_BIN" - \
   "$VALIDATION_DIR" "$GEN_DIR" "$PILOT_INPUT_DIR" "$SELECTION_AUDIT_DIR" \
-  "$QUALITY_MANIFEST" <<'PY'
+  "$QUALITY_MANIFEST" "$QUALITY_RECEIPT" "$QUALITY_VALIDATOR" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -193,6 +213,14 @@ if (
 ):
     raise ValueError("QUALITY_EXCLUSION_MANIFEST must be an absolute regular file")
 reject_symlink_components(quality_arg, description="QUALITY_EXCLUSION_MANIFEST")
+for name, argument in zip(
+    ("QUALITY_EXCLUSION_ASSEMBLY_RECEIPT", "QUALITY_ASSEMBLY_VALIDATOR"),
+    sys.argv[6:8],
+):
+    path = Path(argument)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise ValueError(f"{name} must be an absolute regular file")
+    reject_symlink_components(path, description=name)
 roots = {
     "VALIDATION_DIR": validation,
     "GEN_DIR": generation,
@@ -301,13 +329,15 @@ verify_pilot_contract() {
     "$SELECTION_AUDIT_RECOMPUTE" "$SELECTION_AUDIT_INVENTORY" \
     "$SELECTION_AUDIT_TRAIN" "$SELECTION_AUDIT_VALIDATION" \
     "$SELECTION_AUDIT_YAML" "$SELECTION_AUDIT_INPUTS" \
-    "$SELECTION_AUDIT_INPUT_READY" <<'PY'
+    "$SELECTION_AUDIT_INPUT_READY" \
+    "$QUALITY_RECEIPT" "$QUALITY_VALIDATOR" "$VALIDATION_DIR" <<'PY'
 import csv
 import hashlib
 import json
 import os
 import re
 import sys
+import types
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -321,6 +351,7 @@ import yaml
     recomputed_inventory, recomputed_train,
     recomputed_validation, recomputed_yaml, recomputed_inputs, recomputed_ready,
 ) = map(Path, sys.argv[1:22])
+quality_receipt_path, quality_validator_path, validation_dir = map(Path, sys.argv[22:25])
 role = (
     "v4_batch1_reproducibility_pilot_inputs_diagnostic_only_"
     "not_training_blind_or_deployment_authority"
@@ -374,6 +405,71 @@ def reject_symlink_components(path: Path, *, description: str) -> None:
 
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def stable_bytes(path: Path) -> bytes:
+    reject_symlink_components(path, description="quality evidence")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("quality evidence must be a regular file")
+    before = path.stat()
+    with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        content = handle.read()
+        closed = os.fstat(handle.fileno())
+    after = path.stat()
+    identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+    if not identity(before) == identity(opened) == identity(closed) == identity(after):
+        raise RuntimeError("quality evidence changed while reading")
+    return content
+
+# Execute the exact bytes whose digest is bound; avoid a stale bytecode import.
+quality_validator_content = stable_bytes(quality_validator_path)
+quality_validator_sha = hashlib.sha256(quality_validator_content).hexdigest()
+quality_validator = types.ModuleType("_qx3_quality_assembly_validator")
+quality_validator.__file__ = str(quality_validator_path)
+sys.modules[quality_validator.__name__] = quality_validator
+exec(compile(quality_validator_content, str(quality_validator_path), "exec"), quality_validator.__dict__)
+quality_value, quality_content = quality_validator._load_json(
+    quality_manifest_path, "QX3 quality manifest"
+)
+quality_validator._validate_quality_manifest(quality_value)
+quality_bundle = quality_validator._validate_operational_quality_assembly(
+    receipt_path=quality_receipt_path,
+    quality_path=quality_manifest_path,
+    quality_value=quality_value,
+    quality_content=quality_content,
+    output_dir=validation_dir,
+)
+quality_receipt = json.loads(quality_bundle.receipt_content)
+quality_assembly_metadata = {
+    "assembly_schema": quality_receipt["assembly_schema"],
+    "assembly_mode": quality_receipt["assembly_mode"],
+    "operational_capture_cutoff_kst": quality_receipt["operational_capture_cutoff_kst"],
+    "objective_prepare_bundle_validated": quality_receipt["scope"]["objective_prepare_bundle_validated"],
+    "assembly_receipt_path": quality_bundle.receipt_path.as_posix(),
+    "assembly_receipt_sha256": hashlib.sha256(quality_bundle.receipt_content).hexdigest(),
+    "assembly_marker_path": quality_bundle.marker_path.as_posix(),
+    "assembly_marker_sha256": hashlib.sha256(quality_bundle.marker_content).hexdigest(),
+    "assembly_validator_path": quality_validator_path.resolve().as_posix(),
+    "assembly_validator_sha256": quality_validator_sha,
+}
+quality_digest_bindings = {
+    "quality_exclusions_sha256": hashlib.sha256(quality_content).hexdigest(),
+    "quality_exclusion_manifest_sha256": hashlib.sha256(quality_content).hexdigest(),
+    "quality_exclusion_assembly_receipt_sha256": quality_assembly_metadata["assembly_receipt_sha256"],
+    "quality_exclusion_assembly_marker_sha256": quality_assembly_metadata["assembly_marker_sha256"],
+    "quality_assembly_validator_sha256": quality_validator_sha,
+}
+quality_path_bindings = {
+    "quality_exclusion_manifest_path": quality_bundle.manifest_path.as_posix(),
+    "quality_exclusion_assembly_receipt_path": quality_bundle.receipt_path.as_posix(),
+    "quality_exclusion_assembly_marker_path": quality_bundle.marker_path.as_posix(),
+    "quality_assembly_validator_path": quality_validator_path.resolve().as_posix(),
+}
+
+def verify_quality_bindings(value, description, *, paths=False):
+    expected = {**quality_digest_bindings, **(quality_path_bindings if paths else {})}
+    if type(value) is not dict or any(value.get(key) != item for key, item in expected.items()):
+        raise ValueError(f"{description} quality assembly bindings mismatch")
 
 def exact_json_equal(actual, expected) -> bool:
     try:
@@ -514,11 +610,12 @@ expected_inventory_quality = {
     "reason_counts": dict(sorted(actual_quality_reason_counts.items())),
     "source_list_sha256": source_list_sha,
     **quality_false_fields,
+    **quality_assembly_metadata,
 }
 expected_ready_quality = {
     key: value
     for key, value in expected_inventory_quality.items()
-    if key not in {"manifest_path", "matched_resolved_sources"}
+    if key not in {"manifest_path", "assembly_receipt_path", "assembly_marker_path", "assembly_validator_path", "matched_resolved_sources"}
 }
 
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
@@ -537,7 +634,7 @@ for value, description, status in (
     (ready, "pilot ready", "pilot_inputs_ready"),
     (inventory, "pilot inventory", "selection_complete_not_replay_validated"),
 ):
-    if value.get("schema_version") != 1:
+    if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
         raise ValueError(f"{description} schema mismatch")
     if value.get("artifact_role") != role:
         raise ValueError(f"{description} role mismatch")
@@ -639,6 +736,7 @@ if declared != artifact_hashes:
 bindings = ready.get("bindings")
 if not isinstance(bindings, dict):
     raise ValueError("pilot ready bindings are missing")
+verify_quality_bindings(bindings, "pilot ready")
 if bindings.get("inputs_marker_sha256") != sha(marker_path):
     raise ValueError("pilot ready input marker binding mismatch")
 if bindings.get("artifacts") != artifact_hashes:
@@ -646,6 +744,7 @@ if bindings.get("artifacts") != artifact_hashes:
 inventory_bindings = inventory.get("bindings")
 if not isinstance(inventory_bindings, dict):
     raise ValueError("pilot inventory bindings are missing")
+verify_quality_bindings(inventory_bindings, "pilot inventory", paths=True)
 if (
     inventory_bindings.get("quality_exclusion_manifest_path")
     != quality_manifest_path.resolve().as_posix()
@@ -1063,7 +1162,7 @@ for description, artifacts in (
             raise ValueError(f"{description} artifact is missing or unsafe: {name}")
 
 audit_value = json.loads(audit_ready_path.read_text(encoding="utf-8"))
-if audit_value.get("schema_version") != 1:
+if type(audit_value.get("schema_version")) is not int or audit_value.get("schema_version") != 1:
     raise ValueError("selection audit ready schema mismatch")
 if audit_value.get("artifact_role") != audit_role:
     raise ValueError("selection audit ready role mismatch")
@@ -1106,6 +1205,7 @@ for field in (
 audit_bindings = audit_value.get("bindings")
 if not isinstance(audit_bindings, dict):
     raise ValueError("selection audit bindings are missing")
+verify_quality_bindings(audit_bindings, "selection audit", paths=True)
 expected_pilot_audit_hashes = {
     name: sha(path) for name, path in sorted(pilot_artifacts_for_audit.items())
 }
@@ -1136,7 +1236,8 @@ if audit_bindings.get("selection_audit_evidence_sha256") != sha(audit_evidence_p
 
 audit_evidence = json.loads(audit_evidence_path.read_text(encoding="utf-8"))
 if (
-    audit_evidence.get("schema_version") != 1
+    type(audit_evidence.get("schema_version")) is not int
+    or audit_evidence.get("schema_version") != 1
     or audit_evidence.get("artifact_role") != audit_role
     or audit_evidence.get("audit_contract") != audit_contract
     or audit_evidence.get("status") != "selection_recomputed_byte_exact"
@@ -1181,6 +1282,7 @@ for field in (
 evidence_bindings = audit_evidence.get("bindings")
 if not isinstance(evidence_bindings, dict):
     raise ValueError("selection audit evidence bindings are missing")
+verify_quality_bindings(evidence_bindings, "selection audit evidence", paths=True)
 if evidence_bindings.get("selector_sha256") != sha(builder_path):
     raise ValueError("selection audit evidence selector hash mismatch")
 if (
@@ -1291,8 +1393,12 @@ for line in recomputed_inputs.read_text(encoding="ascii").splitlines():
 if declared_recomputed_hashes != expected_recomputed_input_hashes:
     raise ValueError("selection recompute marker does not bind its exact artifacts")
 recomputed_ready_value = json.loads(recomputed_ready.read_text(encoding="utf-8"))
+verify_quality_bindings(recomputed_inventory_value.get("bindings"), "selection recompute inventory", paths=True)
+verify_quality_bindings(recomputed_ready_value.get("bindings"), "selection recompute ready")
 if (
-    recomputed_ready_value.get("status") != "pilot_inputs_ready"
+    type(recomputed_ready_value.get("schema_version")) is not int
+    or recomputed_ready_value.get("schema_version") != 1
+    or recomputed_ready_value.get("status") != "pilot_inputs_ready"
     or recomputed_ready_value.get("selection_contract") != contract
     or type(recomputed_ready_value.get("seed")) is not int
     or recomputed_ready_value.get("seed") != seed
@@ -1305,6 +1411,9 @@ if (
     )
 ):
     raise ValueError("selection recompute ready marker is invalid")
+quality_validator._rehash_operational_quality_assembly(quality_bundle)
+if stable_bytes(quality_validator_path) != quality_validator_content:
+    raise RuntimeError("quality assembly validator changed during verification")
 PY
   then
     fail "pilot input contract verification failed" 65
@@ -1324,7 +1433,8 @@ seal_or_verify_cohort() {
   if ! "$PYTHON_BIN" - \
     "$mode" "$COHORT_BINDING" "$PILOT_READY" "$PILOT_INVENTORY" \
     "$PILOT_YAML" "$GEN_DATASET_INPUT_INVENTORY" "$RAW_INVENTORY" \
-    "$RAW_MANIFEST" "$QUALITY_MANIFEST" <<'PY'
+    "$RAW_MANIFEST" "$QUALITY_MANIFEST" "$QUALITY_RECEIPT" \
+    "$QUALITY_MARKER" "$QUALITY_VALIDATOR" <<'PY'
 import base64
 import binascii
 import csv
@@ -1341,7 +1451,8 @@ mode = sys.argv[1]
 (
     output, ready_path, selection_path, pilot_yaml, generation_inventory_path,
     raw_inventory_path, raw_manifest, quality_manifest_path,
-) = map(Path, sys.argv[2:10])
+    quality_receipt_path, quality_marker_path, quality_validator_path,
+) = map(Path, sys.argv[2:13])
 if mode not in {"create", "verify"}:
     raise ValueError("invalid cohort binding mode")
 sha_re = re.compile(r"^[0-9a-f]{64}$")
@@ -1702,7 +1813,7 @@ if (
     raise ValueError("verified historical observation priority count differs")
 
 generation_inventory = json.loads(generation_inventory_path.read_text(encoding="utf-8"))
-if generation_inventory.get("schema_version") != 1 or generation_inventory.get("contract") != "resolved_yolo_train_val_sources_and_label_sidecars_sha256.v1":
+if type(generation_inventory.get("schema_version")) is not int or generation_inventory.get("schema_version") != 1 or generation_inventory.get("contract") != "resolved_yolo_train_val_sources_and_label_sidecars_sha256.v1":
     raise ValueError("generation dataset input inventory contract mismatch")
 selection_bindings = selection.get("bindings")
 if not isinstance(selection_bindings, dict):
@@ -1881,6 +1992,10 @@ payload = {
         "raw_output_inventory_sha256": sha(raw_inventory_path),
         "quality_exclusion_manifest_path": quality_manifest_path.resolve().as_posix(),
         "quality_exclusion_manifest_sha256": sha(quality_manifest_path),
+        "quality_exclusions_sha256": sha(quality_manifest_path),
+        "quality_exclusion_assembly_receipt_sha256": sha(quality_receipt_path),
+        "quality_exclusion_assembly_marker_sha256": sha(quality_marker_path),
+        "quality_assembly_validator_sha256": sha(quality_validator_path),
         "historical_manifest_sha256": old_sha,
         "historical_manifest_size": old_size,
         "historical_drift_report_sha256": drift_sha,
@@ -1940,7 +2055,7 @@ from pathlib import Path
 ) = map(Path, sys.argv[1:14])
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 pilot_ready = json.loads(pilot_ready_path.read_text(encoding="utf-8"))
-if ready.get("schema_version") != 1:
+if type(ready.get("schema_version")) is not int or ready.get("schema_version") != 1:
     raise ValueError("generation ready schema mismatch")
 if ready.get("status") != "raw_generation_ready":
     raise ValueError("generation ready status mismatch")
@@ -2094,7 +2209,7 @@ from pathlib import Path
 
 validated, report_path, raw, info, detector, spec = map(Path, sys.argv[1:7])
 report = json.loads(report_path.read_text(encoding="utf-8"))
-if report.get("schema_version") != 1:
+if type(report.get("schema_version")) is not int or report.get("schema_version") != 1:
     raise ValueError("validator report schema mismatch")
 if report.get("artifact_role") != "v4_runtime_replay_diagnostic_not_lineage_blind_or_deployment_authority":
     raise ValueError("validator report is not runtime diagnostic evidence")
@@ -2182,7 +2297,7 @@ write_marker "$CONTROL/00_raw_generation.sha256" \
   "$VALIDATOR" "$WRAPPER" "$GEN_WRAPPER" "$AUDIT_WRAPPER" \
   "$PILOT_BUILDER" "$PROPOSAL_PREPARE" \
   "$PREPROCESSING" "$DETECTOR_MODEL" "$INFERENCE_SPEC" \
-  "$QUALITY_MANIFEST" \
+  "$QUALITY_MANIFEST" "$QUALITY_RECEIPT" "$QUALITY_MARKER" "$QUALITY_VALIDATOR" \
   "$PILOT_READY" "$PILOT_INPUTS" "$PILOT_INVENTORY" "$PILOT_YAML" \
   "$PILOT_TRAIN" "$PILOT_VALIDATION" \
   "$SELECTION_AUDIT_READY" "$SELECTION_AUDIT_MARKER" "$SELECTION_AUDIT_EVIDENCE" \
@@ -2332,6 +2447,16 @@ payload = {
         "validator_a_report_sha256": sha(a_report_path),
         "validator_b_report_sha256": sha(b_report_path),
         "cohort_binding_sha256": sha(cohort_path),
+        **{
+            key: cohort["bindings"][key]
+            for key in (
+                "quality_exclusions_sha256",
+                "quality_exclusion_manifest_sha256",
+                "quality_exclusion_assembly_receipt_sha256",
+                "quality_exclusion_assembly_marker_sha256",
+                "quality_assembly_validator_sha256",
+            )
+        },
     },
     "lineage_execution_authorized": False,
     "training_authority": False,
@@ -2380,7 +2505,8 @@ if ! "$PYTHON_BIN" - \
   "$SELECTION_AUDIT_INVENTORY" "$SELECTION_AUDIT_TRAIN" \
   "$SELECTION_AUDIT_VALIDATION" "$SELECTION_AUDIT_YAML" \
   "$SELECTION_AUDIT_INPUTS" "$SELECTION_AUDIT_INPUT_READY" \
-  "$QUALITY_MANIFEST" "$COHORT_BINDING" <<'PY'
+  "$QUALITY_MANIFEST" "$COHORT_BINDING" "$QUALITY_RECEIPT" \
+  "$QUALITY_MARKER" "$QUALITY_VALIDATOR" <<'PY'
 import hashlib
 import json
 import os
@@ -2395,7 +2521,8 @@ from pathlib import Path
     selection_audit_inventory, selection_audit_train,
     selection_audit_validation, selection_audit_yaml, selection_audit_inputs,
     selection_audit_input_ready, quality_manifest, cohort_binding,
-) = map(Path, sys.argv[1:27])
+    quality_receipt, quality_marker, quality_validator,
+) = map(Path, sys.argv[1:30])
 if ready.exists() or ready.is_symlink():
     raise FileExistsError("diagnostic ready marker already exists")
 if failed.exists() or failed.is_symlink():
@@ -2407,6 +2534,15 @@ def sha(path: Path) -> str:
 comparison_value = json.loads(comparison.read_text(encoding="utf-8"))
 if comparison_value.get("status") != "validator_ab_exact_reproduction":
     raise ValueError("comparison status mismatch")
+quality_bindings = {
+    "quality_exclusions_sha256": sha(quality_manifest),
+    "quality_exclusion_manifest_sha256": sha(quality_manifest),
+    "quality_exclusion_assembly_receipt_sha256": sha(quality_receipt),
+    "quality_exclusion_assembly_marker_sha256": sha(quality_marker),
+    "quality_assembly_validator_sha256": sha(quality_validator),
+}
+if any(comparison_value.get("bindings", {}).get(key) != value for key, value in quality_bindings.items()):
+    raise ValueError("comparison quality assembly binding mismatch")
 payload = {
     "schema_version": 1,
     "status": "batch1_validator_ab_reproducibility_passed",
@@ -2463,7 +2599,7 @@ payload = {
         "selection_audit_dataset_yaml_sha256": sha(selection_audit_yaml),
         "selection_audit_inputs_marker_sha256": sha(selection_audit_inputs),
         "selection_audit_input_ready_sha256": sha(selection_audit_input_ready),
-        "quality_exclusion_manifest_sha256": sha(quality_manifest),
+        **quality_bindings,
         "cohort_binding_sha256": sha(cohort_binding),
     },
 }
@@ -2478,7 +2614,13 @@ then
   fail "failed to publish reproducibility diagnostic ready marker"
 fi
 
-# Ready publication is the final fallible operation. Consumers must require the
-# complete 03 chain and absence of failed.txt. This marker grants no authority.
+# Recheck after terminal publication too; fail() removes ready on a late swap.
+verify_generation_contract
+seal_or_verify_cohort verify
+verify_marker "$CONTROL/00_raw_generation.sha256"
+verify_marker "$CONTROL/01_validator_a.sha256"
+verify_marker "$CONTROL/02_validator_b.sha256"
+verify_marker "$CONTROL/03_reproducibility.sha256"
+# Consumers must require the complete 03 chain and absence of failed.txt.
 terminal_state=1
 exit 0

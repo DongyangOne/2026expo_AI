@@ -118,6 +118,17 @@ trusted policy와 authority에 결박한다. `build_v4_quality_exclusion_manifes
 calibration·blind·배포 권한이 없으며, 유효한 캔·병·종이의 구김·찌그러짐·압착을 촬영
 실패로 제외하는 용도로 사용할 수 없다.
 
+QX3 selector와 CPU selection audit, pilot validation도 동일한 manifest+receipt를 받아야
+한다. selector CLI의 `--quality-exclusion-assembly-receipt`와 두 wrapper의
+`QUALITY_EXCLUSION_ASSEMBLY_RECEIPT`는 필수다. 모든 QX3 증거에는
+`quality_exclusions_sha256`, `quality_exclusion_assembly_receipt_sha256` 및 assembly
+검증기 소스 SHA를 결박한다. 기존 `quality_exclusion_manifest_sha256` alias는 canonical
+manifest SHA와 같아야 한다. candidate는 QX3 ready/comparison의 품질 해시를 자신이
+검증한 assembly와 trusted policy에 대조하므로, 각자 유효하더라도 QX3와 candidate가
+다른 assembly를 사용하면 중단한다. missing/naked/legacy 입력, 경로·schema·해시 불일치,
+symlink·추가 파일·실행 중 변경은 완료 seal 없이 거부한다. 이 계약 검증은 GPU 모델
+정확도 평가나 production 승격을 대신하지 않는다.
+
 관련 스크립트는 `prepare_operational_capture_queue.py`,
 `label_operational_captures_ollama.py`, `assemble_operational_quality_exclusions.py`다.
 

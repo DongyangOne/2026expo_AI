@@ -4,12 +4,15 @@ import csv
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 
+from scripts import operational_quality_assembly_contract as authority_builder
 from scripts.build_v4_repro_pilot_inputs import (
     ScannedSource,
     _selection_rows,
@@ -180,6 +183,55 @@ def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _receipt(tmp_path: Path) -> Path:
+    return tmp_path / "quality-assembly" / authority_builder.QUALITY_ASSEMBLY_FILES["receipt"]
+
+
+def _seal_receipt(manifest: Path, receipt_value: dict) -> None:
+    receipt = manifest.with_name(authority_builder.QUALITY_ASSEMBLY_FILES["receipt"])
+    receipt.write_bytes(authority_builder._canonical_json(receipt_value))
+    manifest.with_name(authority_builder.QUALITY_ASSEMBLY_FILES["marker"]).write_bytes(
+        authority_builder._quality_assembly_marker_bytes(
+            manifest_content=manifest.read_bytes(), receipt_content=receipt.read_bytes()
+        )
+    )
+
+
+def _write_assembly_receipt(manifest: Path) -> None:
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    count = value["excluded_source_count"]
+    _seal_receipt(manifest, {
+        "schema_version": 1,
+        "assembly_schema": authority_builder.QUALITY_ASSEMBLY_SCHEMA,
+        "artifact_role": authority_builder.QUALITY_ASSEMBLY_ROLE,
+        "status": authority_builder.QUALITY_ASSEMBLY_STATUS,
+        "assembly_mode": authority_builder.QUALITY_ASSEMBLY_MODE,
+        "quality_exclusion_contract": authority_builder.QUALITY_CONTRACT,
+        "operational_capture_cutoff_kst": authority_builder.OPERATIONAL_CUTOFF.isoformat(),
+        "teacher_label_schema_version": authority_builder.QUALITY_ASSEMBLY_TEACHER_SCHEMA,
+        "selected_source_count": count,
+        "reason_counts": value["reason_counts"],
+        "quality_manifest_sha256": _sha(manifest),
+        "quality_source_list_sha256": value["source_list_sha256"],
+        "input_sha256": {
+            name: hashlib.sha256(name.encode()).hexdigest()
+            for name in sorted(authority_builder.QUALITY_ASSEMBLY_INPUT_SHA_FIELDS)
+        },
+        "observed_code_sha256": authority_builder._quality_assembly_code_hashes(),
+        "scope": {
+            "teacher_subjective_quality_included": False,
+            "objective_queue_quality_included": True,
+            "objective_prepare_bundle_validated": True,
+            "subjective_quality_source_count": 0,
+            "objective_quality_source_count": count,
+            "paths_or_private_ids_exported": False,
+            "trusted_policy_pinned": False,
+            "executed_code_cryptographically_attested": False,
+        },
+        "authority": {name: False for name in authority_builder.FALSE_AUTHORITY_FIELDS},
+    })
+
+
 def _quality_manifest(tmp_path: Path, entries: list[dict[str, str]] | None = None) -> Path:
     if entries is None:
         default_source = tmp_path / "dataset" / "train" / "images" / "unreadable.jpg"
@@ -187,14 +239,15 @@ def _quality_manifest(tmp_path: Path, entries: list[dict[str, str]] | None = Non
         entries = [
             {
                 "source_sha256": _sha(default_source),
-                "reason": "objective_unreadable",
+                "reason": "unreadable_boundary",
             }
         ]
     entries = sorted(entries, key=lambda row: row["source_sha256"])
     reason_counts: dict[str, int] = {}
     for row in entries:
         reason_counts[row["reason"]] = reason_counts.get(row["reason"], 0) + 1
-    path = tmp_path / "quality-exclusions.json"
+    path = tmp_path / "quality-assembly" / authority_builder.QUALITY_ASSEMBLY_FILES["manifest"]
+    path.parent.mkdir(exist_ok=True)
     path.write_text(
         json.dumps(
             {
@@ -236,6 +289,8 @@ def _quality_manifest(tmp_path: Path, entries: list[dict[str, str]] | None = Non
         ),
         encoding="utf-8",
     )
+    path.write_bytes(authority_builder._canonical_json(json.loads(path.read_text(encoding="utf-8"))))
+    _write_assembly_receipt(path)
     return path
 
 
@@ -249,6 +304,7 @@ def test_deterministic_selection_and_invalid_source_quarantine(tmp_path: Path) -
         dataset_dir=dataset_dir,
         output_dir=first,
         quality_exclusion_manifest=_quality_manifest(tmp_path),
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         seed=77,
         training_quota=1,
         validation_quota=1,
@@ -258,6 +314,7 @@ def test_deterministic_selection_and_invalid_source_quarantine(tmp_path: Path) -
         dataset_dir=dataset_dir,
         output_dir=second,
         quality_exclusion_manifest=_quality_manifest(tmp_path),
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         seed=77,
         training_quota=1,
         validation_quota=1,
@@ -303,6 +360,7 @@ def test_historical_drift_anchor_is_selection_only_and_has_priority(tmp_path: Pa
         dataset_dir=dataset_dir,
         output_dir=default_output,
         quality_exclusion_manifest=_quality_manifest(tmp_path),
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         seed=11,
         training_quota=1,
         validation_quota=1,
@@ -348,6 +406,7 @@ def test_historical_drift_anchor_is_selection_only_and_has_priority(tmp_path: Pa
         dataset_dir=dataset_dir,
         output_dir=anchored_output,
         quality_exclusion_manifest=_quality_manifest(tmp_path),
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         seed=11,
         training_quota=1,
         validation_quota=1,
@@ -412,6 +471,7 @@ def test_capture_quality_exclusion_removes_bad_drift_anchor_but_keeps_normal_anc
         dataset_dir=dataset_dir,
         output_dir=output,
         quality_exclusion_manifest=exclusions,
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         training_quota=1,
         validation_quota=1,
         old_manifest=old_manifest,
@@ -430,6 +490,16 @@ def test_capture_quality_exclusion_removes_bad_drift_anchor_but_keeps_normal_anc
         "manifest_contract": "v4_capture_quality_exclusions.sha256_reason_only.v1",
         "manifest_path": exclusions.resolve().as_posix(),
         "manifest_sha256": _sha(exclusions),
+        "assembly_schema": authority_builder.QUALITY_ASSEMBLY_SCHEMA,
+        "assembly_mode": authority_builder.QUALITY_ASSEMBLY_MODE,
+        "operational_capture_cutoff_kst": "2026-08-01T00:00:00+09:00",
+        "objective_prepare_bundle_validated": True,
+        "assembly_receipt_path": _receipt(tmp_path).resolve().as_posix(),
+        "assembly_receipt_sha256": _sha(_receipt(tmp_path)),
+        "assembly_marker_path": (exclusions.parent / "assembly.sha256").resolve().as_posix(),
+        "assembly_marker_sha256": _sha(exclusions.parent / "assembly.sha256"),
+        "assembly_validator_path": Path(authority_builder.__file__).resolve().as_posix(),
+        "assembly_validator_sha256": _sha(Path(authority_builder.__file__)),
         "source_list_sha256": hashlib.sha256(
             (
                 json.dumps(
@@ -472,7 +542,7 @@ def test_quality_exclusion_sha_must_exist_in_resolved_dataset(tmp_path: Path) ->
         [
             {
                 "source_sha256": "f" * 64,
-                "reason": "captured_before_2026_08_01",
+                "reason": "severe_frame_crop",
             }
         ],
     )
@@ -483,6 +553,7 @@ def test_quality_exclusion_sha_must_exist_in_resolved_dataset(tmp_path: Path) ->
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=exclusions,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -498,7 +569,7 @@ def test_quality_matched_count_is_unique_sha_not_duplicate_path_count(
     assert duplicate_sha == _sha(sources["train_dup_b"])
     exclusions = _quality_manifest(
         tmp_path,
-        [{"source_sha256": duplicate_sha, "reason": "boundary_unreadable"}],
+        [{"source_sha256": duplicate_sha, "reason": "unreadable_boundary"}],
     )
     replacement = _write_source(
         dataset_dir,
@@ -516,6 +587,7 @@ def test_quality_matched_count_is_unique_sha_not_duplicate_path_count(
         dataset_dir=dataset_dir,
         output_dir=output,
         quality_exclusion_manifest=exclusions,
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         training_quota=1,
         validation_quota=1,
     )
@@ -523,23 +595,23 @@ def test_quality_matched_count_is_unique_sha_not_duplicate_path_count(
     assert inventory["quality_exclusion"]["excluded_source_count"] == 1
     assert inventory["quality_exclusion"]["matched_resolved_sources"] == 1
     assert inventory["rejections"]["counts"][
-        "quality_excluded/boundary_unreadable"
+        "quality_excluded/unreadable_boundary"
     ] == 2
 
 
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("duplicate", "duplicates source SHA"),
-        ("unknown_reason", "unknown reason"),
-        ("malformed", "malformed"),
-        ("canonical_hash", "canonical source-list hash is inconsistent"),
-        ("too_many", "bounded maximum"),
-        ("duplicate_key", "contains duplicate key"),
-        ("authority_zero", "contract or authority is invalid"),
-        ("schema_true", "contract or authority is invalid"),
-        ("max_float", "contract or authority is invalid"),
-        ("reason_count_bool", "reason counts are inconsistent"),
+        ("duplicate", "duplicate quality exclusion SHA"),
+        ("unknown_reason", "not a capture-quality exclusion"),
+        ("malformed", "must be SHA/reason only"),
+        ("canonical_hash", "quality source_list_sha256 mismatch"),
+        ("too_many", "at most 100 entries"),
+        ("duplicate_key", "duplicate JSON key"),
+        ("authority_zero", "authority.training"),
+        ("schema_true", "schema_version must be integer 1"),
+        ("max_float", "quality max_excluded_sources must be exactly 100"),
+        ("reason_count_bool", "quality reason_counts mismatch"),
     ],
 )
 def test_quality_exclusion_manifest_fails_closed_on_invalid_entries(
@@ -604,6 +676,7 @@ def test_quality_exclusion_manifest_fails_closed_on_invalid_entries(
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=path,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -625,6 +698,7 @@ def test_selector_rejects_symlink_quality_manifest_before_resolve(tmp_path: Path
             dataset_dir=dataset_dir,
             output_dir=tmp_path / "symlink-quality-output",
             quality_exclusion_manifest=linked,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -648,6 +722,7 @@ def test_selector_rejects_quality_manifest_ancestor_symlink(tmp_path: Path) -> N
             dataset_dir=dataset_dir,
             output_dir=tmp_path / "ancestor-quality-output",
             quality_exclusion_manifest=linked_parent / manifest.name,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -680,6 +755,7 @@ def test_historical_background_probe_fills_quota_without_relabeling(
         dataset_dir=dataset_dir,
         output_dir=output,
         quality_exclusion_manifest=_quality_manifest(tmp_path),
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         seed=17,
         training_quota=1,
         validation_quota=1,
@@ -819,6 +895,7 @@ def test_historical_background_probe_requires_same_split_membership(
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
             old_manifest=old_manifest,
@@ -861,6 +938,7 @@ def test_historical_manifest_mutation_is_detected_before_ready(
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
             old_manifest=old_manifest,
@@ -990,6 +1068,7 @@ def test_ready_marker_binds_every_input_and_is_published_last(tmp_path: Path) ->
         dataset_dir=dataset_dir,
         output_dir=output,
         quality_exclusion_manifest=_quality_manifest(tmp_path),
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
         seed=99,
         training_quota=1,
         validation_quota=1,
@@ -1013,6 +1092,234 @@ def test_ready_marker_binds_every_input_and_is_published_last(tmp_path: Path) ->
     assert on_disk["blind_test_authorized"] is False
     assert on_disk["production_deployment_authorized"] is False
     assert not (output / "failed.txt").exists()
+    assert not list(output.glob(".input_ready.json.*.tmp"))
+    manifest = _receipt(tmp_path).with_name("operational_quality_exclusions.json")
+    expected_evidence = {
+        "quality_exclusion_manifest_sha256": _sha(manifest),
+        "quality_exclusions_sha256": _sha(manifest),
+        "quality_exclusion_assembly_receipt_sha256": _sha(_receipt(tmp_path)),
+        "quality_exclusion_assembly_marker_sha256": _sha(manifest.parent / "assembly.sha256"),
+        "quality_assembly_validator_sha256": _sha(Path(authority_builder.__file__)),
+    }
+    for report in (ready, _inventory(output)):
+        for field, digest in expected_evidence.items():
+            assert report["bindings"][field] == digest
+        assert report["quality_exclusion"]["assembly_mode"] == "objective_and_subjective_quality"
+        assert report["quality_exclusion"]["objective_prepare_bundle_validated"] is True
+        assert report["quality_exclusion"]["operational_capture_cutoff_kst"] == "2026-08-01T00:00:00+09:00"
+
+
+def test_selector_cli_requires_quality_assembly_receipt(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path)
+    output = tmp_path / "cli-without-receipt"
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "scripts.build_v4_repro_pilot_inputs",
+            "--data", str(data), "--dataset-dir", str(dataset_dir),
+            "--output-dir", str(output), "--quality-exclusion-manifest", str(manifest),
+        ],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "--quality-exclusion-assembly-receipt" in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("naked", "receipt must be a regular non-symlink file"),
+        ("legacy", "assembly_mode mismatch"),
+        ("later_cutoff", "operational_capture_cutoff_kst mismatch"),
+        ("manifest_receipt_mismatch", "manifest SHA mismatch"),
+        ("extra_file", "directory file set mismatch"),
+        ("marker", "marker mismatch"),
+        ("schema_bool", "schema_version mismatch"),
+        ("authority_int", "authority.training"),
+        ("objective_validated_int", "objective_prepare_bundle_validated"),
+        ("scope_count_bool", "scope counts mismatch"),
+        ("receipt_extra_field", "receipt schema mismatch"),
+        ("source_hash_malformed", "input_sha256.teacher_queue"),
+        ("stale_code", "observed code is stale"),
+    ],
+)
+def test_selector_requires_valid_full_operational_quality_assembly(
+    tmp_path: Path, mutation: str, message: str,
+) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path)
+    receipt = _receipt(tmp_path)
+    value = json.loads(receipt.read_text(encoding="utf-8"))
+    if mutation == "naked":
+        receipt.unlink()
+    elif mutation == "extra_file":
+        (manifest.parent / "unexpected.json").write_text("{}", encoding="utf-8")
+    elif mutation == "marker":
+        (manifest.parent / "assembly.sha256").write_text("forged\n", encoding="ascii")
+    else:
+        if mutation == "legacy":
+            value["assembly_mode"] = "subjective_only"
+        elif mutation == "later_cutoff":
+            value["operational_capture_cutoff_kst"] = "2026-08-02T00:00:00+09:00"
+        elif mutation == "manifest_receipt_mismatch":
+            value["quality_manifest_sha256"] = "f" * 64
+        elif mutation == "schema_bool":
+            value["schema_version"] = True
+        elif mutation == "authority_int":
+            value["authority"]["training"] = 0
+        elif mutation == "objective_validated_int":
+            value["scope"]["objective_prepare_bundle_validated"] = 1
+        elif mutation == "scope_count_bool":
+            value["scope"]["objective_quality_source_count"] = True
+        elif mutation == "receipt_extra_field":
+            value["unknown"] = "untrusted"
+        elif mutation == "source_hash_malformed":
+            value["input_sha256"]["teacher_queue"] = "F" * 64
+        else:
+            value["observed_code_sha256"]["assembler"] = "f" * 64
+        _seal_receipt(manifest, value)
+    output = tmp_path / f"invalid-assembly-{mutation}"
+    with pytest.raises(ValueError, match=message):
+        build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=output,
+            quality_exclusion_manifest=manifest,
+            quality_exclusion_assembly_receipt=receipt,
+            training_quota=1, validation_quota=1,
+        )
+    assert not (output / "input_ready.json").exists()
+    if output.exists():
+        assert (output / "failed.txt").is_file()
+
+
+def test_selector_rejects_manifest_a_with_other_valid_bundle_b(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest_a = _quality_manifest(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    manifest_b = _quality_manifest(
+        other, [{"source_sha256": "a" * 64, "reason": "severe_frame_crop"}]
+    )
+    assert _sha(manifest_a) != _sha(manifest_b)
+    output = tmp_path / "mixed-bundles"
+    with pytest.raises(ValueError, match="manifest beside the assembly receipt"):
+        build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=output,
+            quality_exclusion_manifest=manifest_a,
+            quality_exclusion_assembly_receipt=_receipt(other),
+            training_quota=1, validation_quota=1,
+        )
+    assert (output / "failed.txt").is_file()
+    assert not (output / "input_ready.json").exists()
+
+
+def test_selector_nested_output_cannot_mutate_quality_assembly(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path)
+    before = {path.name: path.read_bytes() for path in manifest.parent.iterdir()}
+    output = manifest.parent / "pilot-output"
+    with pytest.raises(ValueError, match="output directory must not be inside quality assembly evidence"):
+        build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=output,
+            quality_exclusion_manifest=manifest,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
+            training_quota=1, validation_quota=1,
+        )
+    assert not output.exists()
+    assert {path.name: path.read_bytes() for path in manifest.parent.iterdir()} == before
+
+
+def test_selector_rejects_output_ancestor_symlink_before_publication(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path)
+    real = tmp_path / "real-output"
+    real.mkdir()
+    linked = tmp_path / "linked-output"
+    try:
+        os.symlink(real, linked, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    with pytest.raises(ValueError, match="pilot output directory path.*symlink"):
+        build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=linked / "pilot",
+            quality_exclusion_manifest=manifest,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
+            training_quota=1, validation_quota=1,
+        )
+    assert list(real.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "artifact", ["receipt", "manifest", "marker", "observed_code", "validator_source"]
+)
+@pytest.mark.parametrize("publication_boundary", ["inputs.sha256", "input_ready.json"])
+def test_selector_rehashes_actual_quality_evidence_before_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str,
+    publication_boundary: str,
+) -> None:
+    import scripts.build_v4_repro_pilot_inputs as builder
+
+    data, dataset_dir, _ = _fixture(tmp_path)
+    code_paths = authority_builder._quality_assembly_code_paths()
+    copied_code = tmp_path / "assembler-copy.py"
+    copied_code.write_bytes(code_paths["assembler"].read_bytes())
+    code_paths["assembler"] = copied_code
+    monkeypatch.setattr(authority_builder, "_quality_assembly_code_paths", lambda: code_paths)
+    copied_validator = tmp_path / "assembly-validator-copy.py"
+    copied_validator.write_bytes(Path(authority_builder.__file__).read_bytes())
+    monkeypatch.setattr(authority_builder, "__file__", str(copied_validator))
+    manifest = _quality_manifest(tmp_path)
+    mutation_path = {
+        "receipt": _receipt(tmp_path), "manifest": manifest,
+        "marker": manifest.parent / "assembly.sha256", "observed_code": copied_code,
+        "validator_source": copied_validator,
+    }[artifact]
+    original_content = mutation_path.read_bytes()
+    original = builder._publish_exclusive
+
+    def publish_then_mutate(path: Path, content: bytes, **kwargs) -> None:
+        original(path, content, **kwargs)
+        if path.name == publication_boundary:
+            mutation_path.write_bytes(original_content + b"\n")
+
+    monkeypatch.setattr(builder, "_publish_exclusive", publish_then_mutate)
+    output = tmp_path / f"evidence-toctou-{artifact}"
+    with pytest.raises(RuntimeError, match="quality (exclusion assembly .*|assembly validator )changed"):
+        builder.build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=output,
+            quality_exclusion_manifest=manifest,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
+            training_quota=1, validation_quota=1,
+        )
+    assert mutation_path.read_bytes() != original_content
+    assert (output / "failed.txt").is_file()
+    assert not (output / "input_ready.json").exists()
+    assert not list(output.glob(".input_ready.json.*.tmp"))
+
+
+@pytest.mark.parametrize("artifact", ["receipt", "marker"])
+def test_selector_rejects_symlink_assembly_member(
+    tmp_path: Path, artifact: str,
+) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path)
+    path = manifest.parent / authority_builder.QUALITY_ASSEMBLY_FILES[artifact]
+    target = tmp_path / f"outside-{path.name}"
+    target.write_bytes(path.read_bytes())
+    path.unlink()
+    try:
+        os.symlink(target, path)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    output = tmp_path / f"symlink-{artifact}"
+    with pytest.raises(ValueError, match="symlink"):
+        build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=output,
+            quality_exclusion_manifest=manifest,
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
+            training_quota=1, validation_quota=1,
+        )
+    assert not (output / "input_ready.json").exists()
 
 
 def test_failure_after_directory_creation_publishes_failed_without_ready(
@@ -1035,6 +1342,7 @@ def test_failure_after_directory_creation_publishes_failed_without_ready(
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -1064,6 +1372,7 @@ def test_unreadable_required_source_causes_shortage_failure(tmp_path: Path) -> N
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -1081,8 +1390,8 @@ def test_ready_publish_race_also_publishes_failure(
     output = tmp_path / "ready-race"
     original = builder._publish_exclusive
 
-    def publish_then_fail(path: Path, content: bytes) -> None:
-        original(path, content)
+    def publish_then_fail(path: Path, content: bytes, **kwargs) -> None:
+        original(path, content, **kwargs)
         if path.name == "input_ready.json":
             raise RuntimeError("simulated failure after ready publication")
 
@@ -1093,16 +1402,52 @@ def test_ready_publish_race_also_publishes_failure(
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
 
-    assert (output / "input_ready.json").is_file()
+    assert not (output / "input_ready.json").exists()
     assert (output / "failed.txt").is_file()
-    assert not (
-        (output / "input_ready.json").is_file()
-        and not (output / "failed.txt").exists()
-    )
+    assert not list(output.glob(".input_ready.json.*.tmp"))
+
+
+@pytest.mark.parametrize("replace_after_publish", [False, True])
+def test_ready_failure_does_not_delete_forged_or_replaced_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replace_after_publish: bool,
+) -> None:
+    import scripts.build_v4_repro_pilot_inputs as builder
+
+    data, dataset_dir, _ = _fixture(tmp_path)
+    output = tmp_path / "forged-ready"
+    original = builder._publish_exclusive
+    forged = b'{"forged":true}\n'
+
+    def publish_with_forged_ready(path: Path, content: bytes, **kwargs) -> None:
+        if path.name != "input_ready.json":
+            original(path, content, **kwargs)
+            return
+        if replace_after_publish:
+            original(path, content, **kwargs)
+            replacement = tmp_path / "forged-replacement.json"
+            replacement.write_bytes(forged)
+            os.replace(replacement, path)
+        else:
+            path.write_bytes(forged)
+            original(path, content, **kwargs)
+
+    monkeypatch.setattr(builder, "_publish_exclusive", publish_with_forged_ready)
+    expected_error = RuntimeError if replace_after_publish else FileExistsError
+    with pytest.raises(expected_error):
+        builder.build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=output,
+            quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
+            training_quota=1, validation_quota=1,
+        )
+    assert (output / "input_ready.json").read_bytes() == forged
+    assert (output / "failed.txt").is_file()
+    assert not list(output.glob(".input_ready.json.*.tmp"))
 
 
 def test_existing_output_directory_is_never_reused(tmp_path: Path) -> None:
@@ -1118,6 +1463,7 @@ def test_existing_output_directory_is_never_reused(tmp_path: Path) -> None:
             dataset_dir=dataset_dir,
             output_dir=output,
             quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             training_quota=1,
             validation_quota=1,
         )
@@ -1136,6 +1482,7 @@ def test_builder_rejects_non_exact_integer_seed(tmp_path: Path, seed: object) ->
             dataset_dir=dataset_dir,
             output_dir=tmp_path / "pilot-invalid-seed",
             quality_exclusion_manifest=_quality_manifest(tmp_path),
+            quality_exclusion_assembly_receipt=_receipt(tmp_path),
             seed=seed,  # type: ignore[arg-type]
             training_quota=1,
             validation_quota=1,

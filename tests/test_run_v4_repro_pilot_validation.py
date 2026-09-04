@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts import build_v4_candidate_training_authority as quality_authority
+
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
@@ -196,11 +198,16 @@ def _fixture(
     *,
     mode: str = "success",
     cohort: dict[str, object] | None = None,
+    quality_bundle: tuple[Path, Path] | None = None,
 ) -> dict[str, str]:
     code = tmp_path / "code"
     scripts = code / "scripts"
     nas = scripts / "nas"
     nas.mkdir(parents=True)
+    quality_validator = scripts / "operational_quality_assembly_contract.py"
+    quality_validator.write_bytes((SCRIPT.parents[1] / quality_validator.name).read_bytes())
+    for source in quality_authority._quality_assembly_code_paths().values():
+        (scripts / source.name).write_bytes(source.read_bytes())
     (nas / SCRIPT.name).write_bytes(SCRIPT.read_bytes())
     audit_wrapper_source = SCRIPT.parent / "run_v4_repro_selection_audit.sh"
     (nas / audit_wrapper_source.name).write_bytes(audit_wrapper_source.read_bytes())
@@ -232,6 +239,7 @@ p.add_argument('--validation-quota-per-stratum',required=True)
 p.add_argument('--old-manifest')
 p.add_argument('--drift-report')
 p.add_argument('--quality-exclusion-manifest',required=True)
+p.add_argument('--quality-exclusion-assembly-receipt',required=True)
 a=p.parse_args()
 reference=Path(os.environ['FAKE_SELECTION_RECOMPUTE_REFERENCE'])
 output=Path(a.output_dir)
@@ -297,6 +305,15 @@ if mode == 'ready_race' and run == 'a':
 if mode == 'raw_mutation' and run == 'a':
     raw=Path(a.input_manifest).resolve()
     raw.write_bytes(raw.read_bytes()+b'changed')
+if mode in {'quality_receipt_stage_mutation', 'quality_validator_stage_mutation'} and run == 'a':
+    target = (
+        Path(os.environ['QUALITY_EXCLUSION_ASSEMBLY_RECEIPT'])
+        if mode == 'quality_receipt_stage_mutation'
+        else Path(os.environ['CODE_ROOT'])/'scripts'/'operational_quality_assembly_contract.py'
+    )
+    before = target.stat()
+    target.write_bytes(target.read_bytes()+b'\n')
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
 validated=Path(a.output_manifest)
 content=Path(a.input_manifest).read_text(encoding='utf-8')
 if mode == 'ab_mismatch' and run == 'b':
@@ -566,7 +583,11 @@ print(json.dumps(report,sort_keys=True))
         )
         + "\n"
     ).encode("utf-8")
-    quality_manifest = tmp_path / "quality-exclusions.json"
+    quality_root = tmp_path / "quality-assembly"
+    quality_root.mkdir()
+    quality_manifest = quality_root / "operational_quality_exclusions.json"
+    quality_receipt = quality_root / "operational_quality_exclusion_assembly.json"
+    quality_marker = quality_root / "assembly.sha256"
     quality_manifest_value = {
         "schema_version": 1,
         "artifact_role": (
@@ -596,16 +617,69 @@ print(json.dumps(report,sort_keys=True))
         quality_manifest_value["reason_counts"] = {quality_reason: 2}
     if mode == "quality_numeric_false_authority":
         quality_manifest_value["authority"]["selection"] = 0
-    quality_manifest.write_text(
-        json.dumps(
-            quality_manifest_value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    if quality_bundle is not None:
+        quality_manifest_value = json.loads(quality_bundle[0].read_bytes())
+    quality_manifest.write_bytes(quality_authority._canonical_json(quality_manifest_value))
+    quality_count = quality_manifest_value["excluded_source_count"]
+    quality_reason_counts = quality_manifest_value["reason_counts"]
+    receipt_value = {
+        "schema_version": 1,
+        "assembly_schema": quality_authority.QUALITY_ASSEMBLY_SCHEMA,
+        "artifact_role": quality_authority.QUALITY_ASSEMBLY_ROLE,
+        "status": quality_authority.QUALITY_ASSEMBLY_STATUS,
+        "assembly_mode": quality_authority.QUALITY_ASSEMBLY_MODE,
+        "quality_exclusion_contract": quality_authority.QUALITY_CONTRACT,
+        "operational_capture_cutoff_kst": quality_authority.OPERATIONAL_CUTOFF.isoformat(),
+        "teacher_label_schema_version": quality_authority.QUALITY_ASSEMBLY_TEACHER_SCHEMA,
+        "selected_source_count": quality_count,
+        "reason_counts": quality_reason_counts,
+        "quality_manifest_sha256": _sha(quality_manifest),
+        "quality_source_list_sha256": quality_manifest_value["source_list_sha256"],
+        "input_sha256": {name: hashlib.sha256(name.encode()).hexdigest() for name in quality_authority.QUALITY_ASSEMBLY_INPUT_SHA_FIELDS},
+        "observed_code_sha256": quality_authority._quality_assembly_code_hashes(),
+        "scope": {
+            "teacher_subjective_quality_included": True,
+            "objective_queue_quality_included": False,
+            "objective_prepare_bundle_validated": True,
+            "subjective_quality_source_count": quality_count,
+            "objective_quality_source_count": 0,
+            "paths_or_private_ids_exported": False,
+            "trusted_policy_pinned": False,
+            "executed_code_cryptographically_attested": False,
+        },
+        "authority": {name: False for name in quality_authority.FALSE_AUTHORITY_FIELDS},
+    }
+    if quality_bundle is not None:
+        receipt_value = json.loads(quality_bundle[1].read_bytes())
+    quality_receipt.write_bytes(quality_authority._canonical_json(receipt_value))
+    quality_marker.write_bytes(quality_authority._quality_assembly_marker_bytes(
+        manifest_content=quality_manifest.read_bytes(), receipt_content=quality_receipt.read_bytes()
+    ))
+    assembly_metadata = {
+        "assembly_schema": receipt_value["assembly_schema"],
+        "assembly_mode": receipt_value["assembly_mode"],
+        "operational_capture_cutoff_kst": receipt_value["operational_capture_cutoff_kst"],
+        "objective_prepare_bundle_validated": receipt_value["scope"]["objective_prepare_bundle_validated"],
+        "assembly_receipt_path": quality_receipt.resolve().as_posix(),
+        "assembly_receipt_sha256": _sha(quality_receipt),
+        "assembly_marker_path": quality_marker.resolve().as_posix(),
+        "assembly_marker_sha256": _sha(quality_marker),
+        "assembly_validator_path": quality_validator.resolve().as_posix(),
+        "assembly_validator_sha256": _sha(quality_validator),
+    }
+    assembly_digest_bindings = {
+        "quality_exclusions_sha256": _sha(quality_manifest),
+        "quality_exclusion_manifest_sha256": _sha(quality_manifest),
+        "quality_exclusion_assembly_receipt_sha256": _sha(quality_receipt),
+        "quality_exclusion_assembly_marker_sha256": _sha(quality_marker),
+        "quality_assembly_validator_sha256": _sha(quality_validator),
+    }
+    assembly_path_bindings = {
+        "quality_exclusion_manifest_path": quality_manifest.resolve().as_posix(),
+        "quality_exclusion_assembly_receipt_path": quality_receipt.resolve().as_posix(),
+        "quality_exclusion_assembly_marker_path": quality_marker.resolve().as_posix(),
+        "quality_assembly_validator_path": quality_validator.resolve().as_posix(),
+    }
     quality_false_fields = {
         "selection_authority": False,
         "ground_truth_authority": False,
@@ -623,14 +697,15 @@ print(json.dumps(report,sort_keys=True))
         "excluded_source_count": quality_count,
         "max_excluded_sources": 100,
         "matched_resolved_sources": quality_count,
-        "reason_counts": {quality_reason: quality_count},
-        "source_list_sha256": hashlib.sha256(canonical_quality_bytes).hexdigest(),
+        "reason_counts": quality_reason_counts,
+        "source_list_sha256": quality_manifest_value["source_list_sha256"],
         **quality_false_fields,
+        **assembly_metadata,
     }
     ready_quality = {
         key: value
         for key, value in inventory_quality.items()
-        if key not in {"manifest_path", "matched_resolved_sources"}
+        if key not in {"manifest_path", "assembly_receipt_path", "assembly_marker_path", "assembly_validator_path", "matched_resolved_sources"}
     }
     old_manifest = tmp_path / "historical-manifest.csv"
     old_manifest.write_bytes(Path(cohort["old_manifest"]).read_bytes())
@@ -806,6 +881,8 @@ print(json.dumps(report,sort_keys=True))
                 },
                 "bindings": {
                     "data_path": source_data.resolve().as_posix(),
+                    **assembly_digest_bindings,
+                    **assembly_path_bindings,
                     "data_sha256": _sha(source_data),
                     "resolved_universe_sha256": universe,
                     "dataset_dir": Path(cohort["root"]).joinpath("sources").resolve().as_posix(),
@@ -885,6 +962,7 @@ print(json.dumps(report,sort_keys=True))
                 "quality_exclusion": ready_quality,
                 "bindings": {
                     "inputs_marker_sha256": _sha(pilot_inputs),
+                    **assembly_digest_bindings,
                     "artifacts": {name: _sha(path) for name, path in sorted(pilot_artifacts.items())},
                     "resolved_universe_sha256": universe,
                 },
@@ -1022,6 +1100,7 @@ print(json.dumps(report,sort_keys=True))
                 "quality_exclusion": ready_quality,
                 "bindings": {
                     "inputs_marker_sha256": _sha(recomputed_inputs),
+                    **assembly_digest_bindings,
                     "artifacts": {
                         name: _sha(path)
                         for name, path in sorted(recomputed_input_artifacts.items())
@@ -1116,6 +1195,8 @@ print(json.dumps(report,sort_keys=True))
                     "historical_manifest_sha256": _sha(old_manifest),
                     "drift_report_path": drift_report.resolve().as_posix(),
                     "drift_report_sha256": _sha(drift_report),
+                    **assembly_digest_bindings,
+                    **assembly_path_bindings,
                     "quality_exclusion_manifest_path": quality_manifest.resolve().as_posix(),
                     "quality_exclusion_manifest_sha256": _sha(quality_manifest),
                     "pilot_artifacts": {
@@ -1197,6 +1278,8 @@ print(json.dumps(report,sort_keys=True))
             "selection_audit_marker_sha256": _sha(selection_audit_marker),
             "selection_audit_evidence_sha256": _sha(selection_audit_evidence),
             "resolved_universe_sha256": universe,
+            **assembly_digest_bindings,
+            **assembly_path_bindings,
             "quality_exclusion_manifest_path": quality_manifest.resolve().as_posix(),
             "quality_exclusion_manifest_sha256": _sha(quality_manifest),
             "pilot_artifacts": {
@@ -1246,6 +1329,7 @@ print(json.dumps(report,sort_keys=True))
             "CODE_ROOT": code.as_posix(),
             "PILOT_INPUT_DIR": pilot.as_posix(),
             "QUALITY_EXCLUSION_MANIFEST": quality_manifest.as_posix(),
+            "QUALITY_EXCLUSION_ASSEMBLY_RECEIPT": quality_receipt.as_posix(),
             "PYTHON_BIN": Path(sys.executable).as_posix(),
             "FAKE_SELECTION_RECOMPUTE_REFERENCE": selection_reference.as_posix(),
             "FAKE_SELECTION_COUNTER": selection_counter.as_posix(),
@@ -1523,6 +1607,7 @@ exec "$REAL_PYTHON" "$@"
         "PILOT_INPUT_DIR": pilot.as_posix(),
         "SELECTION_AUDIT_DIR": selection_audit_for_validation.as_posix(),
         "QUALITY_EXCLUSION_MANIFEST": quality_manifest.as_posix(),
+        "QUALITY_EXCLUSION_ASSEMBLY_RECEIPT": quality_receipt.as_posix(),
         "DETECTOR_MODEL": detector.as_posix(),
         "INFERENCE_SPEC": spec.as_posix(),
         "PYTHON_BIN": python_bin,
@@ -1541,7 +1626,7 @@ def _run(
     bash = _integration_bash(tmp_path)
     env = _fixture(tmp_path, mode=mode, cohort=cohort)
     result = subprocess.run(
-        [bash, SCRIPT.as_posix()],
+        [bash, (Path(env["CODE_ROOT"]) / "scripts" / "nas" / SCRIPT.name).as_posix()],
         env=env,
         text=True,
         capture_output=True,
@@ -1563,6 +1648,7 @@ def test_wrapper_is_fail_closed_and_diagnostic_only() -> None:
         "VALIDATION_DIR", "CODE_ROOT", "GEN_DIR", "PILOT_INPUT_DIR",
         "SELECTION_AUDIT_DIR",
         "QUALITY_EXCLUSION_MANIFEST",
+        "QUALITY_EXCLUSION_ASSEMBLY_RECEIPT",
         "DETECTOR_MODEL", "INFERENCE_SPEC",
     ):
         assert name in text
@@ -1766,6 +1852,16 @@ def test_integration_success_seals_two_exact_runs(
     assert ready["bindings"]["quality_exclusion_manifest_sha256"] == _sha(
         Path(env["QUALITY_EXCLUSION_MANIFEST"])
     )
+    quality_fields = {
+        "quality_exclusions_sha256": _sha(Path(env["QUALITY_EXCLUSION_MANIFEST"])),
+        "quality_exclusion_manifest_sha256": _sha(Path(env["QUALITY_EXCLUSION_MANIFEST"])),
+        "quality_exclusion_assembly_receipt_sha256": _sha(Path(env["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"])),
+        "quality_exclusion_assembly_marker_sha256": _sha(Path(env["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"]).parent / "assembly.sha256"),
+        "quality_assembly_validator_sha256": _sha(Path(env["CODE_ROOT"]) / "scripts" / "operational_quality_assembly_contract.py"),
+    }
+    for name in ("cohort_binding.json", "reproducibility_comparison.json", "diagnostic_ready.json"):
+        payload = json.loads((control / name).read_bytes())
+        assert {key: payload["bindings"][key] for key in quality_fields} == quality_fields
     assert (root / "validator-a" / "manifest.csv").is_symlink()
     assert (root / "validator-b" / "validation").is_symlink()
     assert (root / "validator-a" / "manifest.v4.validated.csv").read_bytes() == (
@@ -1865,6 +1961,8 @@ def test_integration_accepts_archived_pilot_code_paths_with_exact_hashes(
         "quality_manifest_hash_binding_mismatch",
         "quality_audit_evidence_mismatch",
         "quality_audit_ready_mismatch",
+        "quality_receipt_stage_mutation",
+        "quality_validator_stage_mutation",
         "generation_inventory_mismatch",
         "foreign_manifest_source",
         "external_crop",
@@ -1886,6 +1984,8 @@ def test_integration_failure_modes_publish_failure_only(
     control = Path(env["VALIDATION_DIR"]) / "control"
     assert (control / "failed.txt").is_file()
     assert not (control / "diagnostic_ready.json").exists()
+    if mode in {"quality_receipt_stage_mutation", "quality_validator_stage_mutation"}:
+        assert (Path(env["VALIDATION_DIR"]) / "validator-a" / "manifest.v4.validation.json").is_file()
 
 
 def test_integration_failure_removes_racing_ready_marker(
@@ -1896,3 +1996,153 @@ def test_integration_failure_removes_racing_ready_marker(
     control = Path(env["VALIDATION_DIR"]) / "control"
     assert (control / "failed.txt").is_file()
     assert not (control / "diagnostic_ready.json").exists()
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_receipt_env", "naked_manifest", "legacy_mode", "later_cutoff",
+    "receipt_manifest_mismatch", "receipt_schema_bool", "receipt_scope_int",
+    "receipt_authority_int", "receipt_extra_key", "extra_file", "marker",
+    "validator_bytes", "pilot_receipt_hash", "pilot_quality_hash",
+    "audit_receipt_hash", "audit_quality_hash", "audit_schema_bool",
+    "receipt_symlink", "manifest_ancestor_symlink",
+])
+def test_quality_assembly_contract_rejects_tampered_chain(
+    tmp_path: Path, cohort_base: dict[str, object], mutation: str
+) -> None:
+    env = _fixture(tmp_path, mode="assembly_adversarial", cohort=cohort_base)
+    receipt = Path(env["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"])
+    manifest = Path(env["QUALITY_EXCLUSION_MANIFEST"])
+    marker = receipt.parent / "assembly.sha256"
+    if mutation == "missing_receipt_env":
+        del env["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"]
+    elif mutation == "naked_manifest":
+        naked = tmp_path / "generic-quality.json"
+        naked.write_bytes(manifest.read_bytes())
+        env["QUALITY_EXCLUSION_MANIFEST"] = naked.as_posix()
+    elif mutation in {"legacy_mode", "later_cutoff", "receipt_manifest_mismatch", "receipt_schema_bool", "receipt_scope_int", "receipt_authority_int", "receipt_extra_key"}:
+        value = json.loads(receipt.read_bytes())
+        if mutation == "legacy_mode":
+            value["assembly_mode"] = "legacy"
+        elif mutation == "later_cutoff":
+            value["operational_capture_cutoff_kst"] = "2026-08-02T00:00:00+09:00"
+        elif mutation == "receipt_manifest_mismatch":
+            value["quality_manifest_sha256"] = "a" * 64
+        elif mutation == "receipt_schema_bool":
+            value["schema_version"] = True
+        elif mutation == "receipt_scope_int":
+            value["scope"]["objective_prepare_bundle_validated"] = 1
+        elif mutation == "receipt_authority_int":
+            value["authority"]["selection"] = 0
+        else:
+            value["extra"] = False
+        receipt.write_bytes(quality_authority._canonical_json(value))
+        marker.write_bytes(quality_authority._quality_assembly_marker_bytes(
+            manifest_content=manifest.read_bytes(), receipt_content=receipt.read_bytes()
+        ))
+    elif mutation == "extra_file":
+        (receipt.parent / "unexpected.json").write_text("{}")
+    elif mutation == "marker":
+        marker.write_bytes(marker.read_bytes() + b"\n")
+    elif mutation == "validator_bytes":
+        path = Path(env["CODE_ROOT"]) / "scripts" / "operational_quality_assembly_contract.py"
+        path.write_bytes(path.read_bytes() + b"\n")
+    elif mutation.startswith("pilot_"):
+        path = Path(env["PILOT_INPUT_DIR"]) / "input_ready.json"
+        value = json.loads(path.read_bytes())
+        key = "quality_exclusion_assembly_receipt_sha256" if mutation == "pilot_receipt_hash" else "quality_exclusions_sha256"
+        value["bindings"][key] = "b" * 64
+        path.write_bytes(quality_authority._canonical_json(value))
+    elif mutation.startswith("audit_"):
+        path = Path(env["SELECTION_AUDIT_DIR"]) / "selection_audit_ready.json"
+        value = json.loads(path.read_bytes())
+        if mutation == "audit_schema_bool":
+            value["schema_version"] = True
+        else:
+            key = "quality_exclusion_assembly_receipt_sha256" if mutation == "audit_receipt_hash" else "quality_exclusions_sha256"
+            value["bindings"][key] = "b" * 64
+        path.write_bytes(quality_authority._canonical_json(value))
+    elif mutation == "receipt_symlink":
+        target = tmp_path / "external-quality" / "external-receipt.json"
+        target.parent.mkdir()
+        target.write_bytes(receipt.read_bytes())
+        receipt.unlink()
+        try:
+            receipt.symlink_to(target)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+    else:
+        linked = tmp_path / "quality-alias"
+        try:
+            linked.symlink_to(receipt.parent, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+        env["QUALITY_EXCLUSION_MANIFEST"] = (linked / manifest.name).as_posix()
+    result = subprocess.run(
+        [_integration_bash(tmp_path), (Path(env["CODE_ROOT"]) / "scripts" / "nas" / SCRIPT.name).as_posix()],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout
+    if mutation == "receipt_symlink":
+        assert "QUALITY_EXCLUSION_ASSEMBLY_RECEIPT must be an absolute regular file" in result.stderr
+    control = Path(env["VALIDATION_DIR"]) / "control"
+    assert not (control / "diagnostic_ready.json").exists()
+    if mutation != "missing_receipt_env":
+        assert (control / "failed.txt").is_file()
+
+
+@pytest.mark.parametrize("mutation", ["receipt", "marker", "validator", "extra_file"])
+def test_quality_assembly_terminal_toctou_removes_ready(
+    tmp_path: Path, cohort_base: dict[str, object], mutation: str
+) -> None:
+    env = _fixture(tmp_path, mode="assembly_terminal_toctou", cohort=cohort_base)
+    receipt = Path(env["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"])
+    target = {
+        "receipt": receipt,
+        "marker": receipt.parent / "assembly.sha256",
+        "validator": Path(env["CODE_ROOT"]) / "scripts" / "operational_quality_assembly_contract.py",
+        "extra_file": receipt.parent / "unexpected.json",
+    }[mutation]
+    launcher = tmp_path / "terminal-tamper.sh"
+    launcher.write_text(
+        '#!/usr/bin/env bash\nset -eu\n'
+        'if [ "${1-}" = "-" ] && [ "${2-}" = "$TERMINAL_READY" ]; then\n'
+        '  "$REAL_PYTHON" "$@"\n'
+        '  test -f "$TERMINAL_READY"\n'
+        '  printf "\\n" >> "$TERMINAL_TARGET"\n'
+        '  printf "mutated-after-ready\\n" > "$TERMINAL_SENTINEL"\n'
+        '  exit 0\n'
+        'fi\nexec "$REAL_PYTHON" "$@"\n',
+        encoding="utf-8", newline="\n",
+    )
+    launcher.chmod(0o755)
+    env.update({
+        "PYTHON_BIN": launcher.as_posix(),
+        "REAL_PYTHON": Path(sys.executable).as_posix(),
+        "TERMINAL_READY": (Path(env["VALIDATION_DIR"]) / "control" / "diagnostic_ready.json").as_posix(),
+        "TERMINAL_TARGET": target.as_posix(),
+        "TERMINAL_SENTINEL": (tmp_path / "terminal-mutation-reached.txt").as_posix(),
+    })
+    result = subprocess.run(
+        [_integration_bash(tmp_path), (Path(env["CODE_ROOT"]) / "scripts" / "nas" / SCRIPT.name).as_posix()],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout
+    assert Path(env["TERMINAL_SENTINEL"]).is_file(), result.stderr
+    control = Path(env["VALIDATION_DIR"]) / "control"
+    assert (control / "failed.txt").is_file()
+    assert not (control / "diagnostic_ready.json").exists()
+
+
+def test_validation_output_cannot_contaminate_quality_bundle(
+    tmp_path: Path, cohort_base: dict[str, object]
+) -> None:
+    env = _fixture(tmp_path, mode="assembly_nested_output", cohort=cohort_base)
+    root = Path(env["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"]).parent
+    before = {path.name: path.read_bytes() for path in root.iterdir()}
+    env["VALIDATION_DIR"] = (root / "nested-validation").as_posix()
+    result = subprocess.run(
+        [_integration_bash(tmp_path), (Path(env["CODE_ROOT"]) / "scripts" / "nas" / SCRIPT.name).as_posix()],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 64
+    assert {path.name: path.read_bytes() for path in root.iterdir()} == before

@@ -10,9 +10,9 @@ current non-empty YOLO ground truth remains unchanged.  Historical v4
 artifacts only select probes or prioritize bounded drift examples; they never
 provide labels, replay truth, or promotion authority.
 
-The output directory is exclusive.  ``input_ready.json`` is published last;
-any earlier failure publishes ``failed.txt`` and can never leave a ready
-marker behind.
+The output directory is exclusive. ``input_ready.json`` is published after
+the other artifacts and then quality evidence is rechecked. A failed check
+publishes ``failed.txt`` and revokes only the marker this process still owns.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -32,8 +33,10 @@ from typing import Iterable, Mapping
 
 try:
     from scripts import prepare_proposal_verifier_dataset as proposal_dataset
+    from scripts import operational_quality_assembly_contract as candidate_authority
 except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
     import prepare_proposal_verifier_dataset as proposal_dataset  # type: ignore[no-redef]
+    import operational_quality_assembly_contract as candidate_authority  # type: ignore[no-redef]
 
 
 CLASS_NAMES = proposal_dataset.CLASS_NAMES
@@ -148,7 +151,9 @@ def _reject_symlink_components(path: Path, *, description: str) -> None:
             raise ValueError(f"{description} path must not contain symlink components")
 
 
-def _publish_exclusive(path: Path, content: bytes) -> None:
+def _publish_exclusive(
+    path: Path, content: bytes, *, publication: dict[str, object] | None = None
+) -> None:
     if path.exists() or path.is_symlink():
         raise FileExistsError(f"refusing to overwrite output artifact: {path}")
     descriptor, raw = tempfile.mkstemp(
@@ -161,14 +166,62 @@ def _publish_exclusive(path: Path, content: bytes) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+            if publication is not None:
+                publication.update(
+                    temporary=temporary, destination=path, identity=os.fstat(handle.fileno())
+                )
         os.link(temporary, path)
         published = True
     finally:
+        # Retain the source link for the ready marker until post-publication
+        # validation finishes. It pins the original inode, so failure cleanup
+        # can distinguish our marker from a forged/replaced destination.
         try:
-            temporary.unlink(missing_ok=True)
+            if publication is None or "identity" not in publication:
+                temporary.unlink(missing_ok=True)
         except OSError:
             if not published:
                 raise
+
+
+def _publication_still_owned(publication: Mapping[str, object]) -> bool:
+    temporary = publication.get("temporary")
+    destination = publication.get("destination")
+    identity = publication.get("identity")
+    if not isinstance(temporary, Path) or not isinstance(destination, Path):
+        return False
+    if not isinstance(identity, os.stat_result):
+        return False
+    try:
+        for path in (temporary, destination):
+            _reject_symlink_components(path, description="ready publication")
+            observed = path.lstat()
+            if not stat.S_ISREG(observed.st_mode) or not os.path.samestat(identity, observed):
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _finish_owned_publication(
+    publication: Mapping[str, object], *, revoke: bool
+) -> None:
+    temporary = publication.get("temporary")
+    destination = publication.get("destination")
+    identity = publication.get("identity")
+    if not isinstance(temporary, Path) or not isinstance(identity, os.stat_result):
+        return
+    if revoke and _publication_still_owned(publication):
+        assert isinstance(destination, Path)
+        destination.unlink()
+    # Never remove a replacement file at the private temporary pathname.
+    _reject_symlink_components(temporary, description="ready publication temporary")
+    try:
+        observed = temporary.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(observed.st_mode) and os.path.samestat(identity, observed):
+        temporary.unlink()
 
 
 def _publish_failure(output_dir: Path, error: BaseException) -> None:
@@ -1004,6 +1057,7 @@ def build_pilot_inputs(
     dataset_dir: Path,
     output_dir: Path,
     quality_exclusion_manifest: Path,
+    quality_exclusion_assembly_receipt: Path,
     seed: int = 20260901,
     training_quota: int = 250,
     validation_quota: int = 100,
@@ -1031,12 +1085,31 @@ def build_pilot_inputs(
         quality_exclusion_manifest_arg, description="quality exclusion manifest"
     )
     quality_exclusion_manifest = quality_exclusion_manifest_arg.resolve(strict=True)
+    quality_exclusion_assembly_receipt_arg = quality_exclusion_assembly_receipt
+    if (
+        quality_exclusion_assembly_receipt_arg.is_symlink()
+        or not quality_exclusion_assembly_receipt_arg.is_file()
+    ):
+        raise ValueError(
+            "quality exclusion assembly receipt must be a regular non-symlink file"
+        )
+    _reject_symlink_components(
+        quality_exclusion_assembly_receipt_arg,
+        description="quality exclusion assembly receipt",
+    )
+    quality_exclusion_assembly_receipt = (
+        quality_exclusion_assembly_receipt_arg.resolve(strict=True)
+    )
+    _reject_symlink_components(output_dir, description="pilot output directory")
     output_dir = output_dir.resolve(strict=False)
+    if output_dir.is_relative_to(quality_exclusion_assembly_receipt.parent):
+        raise ValueError("output directory must not be inside quality assembly evidence")
     if not data_path.is_file():
         raise FileNotFoundError(f"missing YOLO data YAML: {data_path}")
     if not dataset_dir.is_dir():
         raise FileNotFoundError(f"missing dataset directory: {dataset_dir}")
     output_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+    ready_publication: dict[str, object] = {}
     try:
         split_images = proposal_dataset.resolve_split_images(data_path, dataset_dir)
         scanned = _scan_sources(split_images)
@@ -1044,8 +1117,71 @@ def build_pilot_inputs(
             raise RuntimeError("YOLO data YAML resolved no source images")
         _quarantine_duplicates(scanned)
 
-        exclusions, quality_exclusion_info = _read_quality_exclusion_manifest(
-            quality_exclusion_manifest
+        quality_value, quality_content = candidate_authority._load_json(
+            quality_exclusion_manifest, "quality exclusions"
+        )
+        exclusions = candidate_authority._validate_quality_manifest(quality_value)
+        quality_exclusion_info: dict[str, object] = {
+            "required": True,
+            "manifest_contract": QUALITY_EXCLUSION_CONTRACT,
+            "manifest_path": _absolute_posix(quality_exclusion_manifest),
+            "manifest_sha256": _sha256_bytes(quality_content),
+            "source_list_sha256": quality_value["source_list_sha256"],
+            "excluded_source_count": len(exclusions),
+            "max_excluded_sources": quality_value["max_excluded_sources"],
+            "reason_counts": quality_value["reason_counts"],
+            "selection_authority": False,
+            "ground_truth_authority": False,
+            "replay_authority": False,
+            "training_authority": False,
+            "calibration_authority": False,
+            "blind_test_authority": False,
+            "deployment_authority": False,
+        }
+        quality_assembly_bundle = (
+            candidate_authority._validate_operational_quality_assembly(
+                receipt_path=quality_exclusion_assembly_receipt,
+                quality_path=quality_exclusion_manifest,
+                quality_value=quality_value,
+                quality_content=quality_content,
+                output_dir=output_dir,
+            )
+        )
+        quality_receipt_value = json.loads(
+            quality_assembly_bundle.receipt_content.decode("utf-8")
+        )
+        quality_assembly_validator_path = Path(candidate_authority.__file__).resolve()
+        quality_assembly_validator_sha256 = _stable_sha256(
+            quality_assembly_validator_path,
+            description="quality assembly validator",
+        )
+        quality_exclusion_info.update(
+            {
+                "assembly_schema": quality_receipt_value["assembly_schema"],
+                "assembly_mode": quality_receipt_value["assembly_mode"],
+                "operational_capture_cutoff_kst": quality_receipt_value[
+                    "operational_capture_cutoff_kst"
+                ],
+                "objective_prepare_bundle_validated": quality_receipt_value[
+                    "scope"
+                ]["objective_prepare_bundle_validated"],
+                "assembly_receipt_path": _absolute_posix(
+                    quality_assembly_bundle.receipt_path
+                ),
+                "assembly_receipt_sha256": _sha256_bytes(
+                    quality_assembly_bundle.receipt_content
+                ),
+                "assembly_marker_path": _absolute_posix(
+                    quality_assembly_bundle.marker_path
+                ),
+                "assembly_marker_sha256": _sha256_bytes(
+                    quality_assembly_bundle.marker_content
+                ),
+                "assembly_validator_path": _absolute_posix(
+                    quality_assembly_validator_path
+                ),
+                "assembly_validator_sha256": quality_assembly_validator_sha256,
+            }
         )
         matched_excluded_sources = _apply_quality_exclusions(scanned, exclusions)
         quality_exclusion_info["matched_resolved_sources"] = matched_excluded_sources
@@ -1183,6 +1319,27 @@ def build_pilot_inputs(
                 "quality_exclusion_manifest_sha256": quality_exclusion_info[
                     "manifest_sha256"
                 ],
+                "quality_exclusions_sha256": quality_exclusion_info[
+                    "manifest_sha256"
+                ],
+                "quality_exclusion_assembly_receipt_path": (
+                    quality_exclusion_info["assembly_receipt_path"]
+                ),
+                "quality_exclusion_assembly_receipt_sha256": (
+                    quality_exclusion_info["assembly_receipt_sha256"]
+                ),
+                "quality_exclusion_assembly_marker_path": (
+                    quality_exclusion_info["assembly_marker_path"]
+                ),
+                "quality_exclusion_assembly_marker_sha256": (
+                    quality_exclusion_info["assembly_marker_sha256"]
+                ),
+                "quality_assembly_validator_path": quality_exclusion_info[
+                    "assembly_validator_path"
+                ],
+                "quality_assembly_validator_sha256": quality_exclusion_info[
+                    "assembly_validator_sha256"
+                ],
             },
             "quality_exclusion": quality_exclusion_info,
             "historical_selection_evidence": {
@@ -1266,11 +1423,14 @@ def build_pilot_inputs(
         _verify_selected_bindings(selected)
         if _stable_sha256(data_path, description="YOLO data YAML final rehash") != data_sha256:
             raise RuntimeError("YOLO data YAML changed during input build")
+        candidate_authority._rehash_operational_quality_assembly(
+            quality_assembly_bundle
+        )
         if _stable_sha256(
-            quality_exclusion_manifest,
-            description="quality exclusion manifest final rehash",
-        ) != quality_exclusion_info["manifest_sha256"]:
-            raise RuntimeError("quality exclusion manifest changed during input build")
+            quality_assembly_validator_path,
+            description="quality assembly validator final rehash",
+        ) != quality_assembly_validator_sha256:
+            raise RuntimeError("quality assembly validator changed during input build")
         if old_manifest is not None and historical_info is not None:
             if _stable_sha256(
                 old_manifest, description="historical manifest final rehash"
@@ -1303,11 +1463,33 @@ def build_pilot_inputs(
                     for name, content in sorted(artifact_contents.items())
                 },
                 "resolved_universe_sha256": universe_sha256,
+                "quality_exclusion_manifest_sha256": quality_exclusion_info[
+                    "manifest_sha256"
+                ],
+                "quality_exclusions_sha256": quality_exclusion_info[
+                    "manifest_sha256"
+                ],
+                "quality_exclusion_assembly_receipt_sha256": (
+                    quality_exclusion_info["assembly_receipt_sha256"]
+                ),
+                "quality_exclusion_assembly_marker_sha256": (
+                    quality_exclusion_info["assembly_marker_sha256"]
+                ),
+                "quality_assembly_validator_sha256": quality_exclusion_info[
+                    "assembly_validator_sha256"
+                ],
             },
             "quality_exclusion": {
                 key: value
                 for key, value in quality_exclusion_info.items()
-                if key != "manifest_path" and key != "matched_resolved_sources"
+                if key
+                not in {
+                    "manifest_path",
+                    "assembly_receipt_path",
+                    "assembly_marker_path",
+                    "assembly_validator_path",
+                    "matched_resolved_sources",
+                }
             },
             "historical_selection_only": bool(historical_info),
             "validator_authority": False,
@@ -1315,11 +1497,28 @@ def build_pilot_inputs(
             "blind_test_authorized": False,
             "production_deployment_authorized": False,
         }
-        # Terminal publication: no validation, writes, or reads may follow this call.
-        _publish_exclusive(ready_path, _json_bytes(ready))
+        ready_content = _json_bytes(ready)
+        _publish_exclusive(ready_path, ready_content, publication=ready_publication)
+        candidate_authority._rehash_operational_quality_assembly(quality_assembly_bundle)
+        if _stable_sha256(
+            quality_assembly_validator_path,
+            description="quality assembly validator post-publication rehash",
+        ) != quality_assembly_validator_sha256:
+            raise RuntimeError("quality assembly validator changed after ready publication")
+        if not _publication_still_owned(ready_publication):
+            raise RuntimeError("pilot ready publication ownership changed")
+        if _stable_bytes(ready_path, description="published pilot ready") != ready_content:
+            raise RuntimeError("pilot ready content changed after publication")
+        _finish_owned_publication(ready_publication, revoke=False)
         return ready
     except BaseException as error:
         _publish_failure(output_dir, error)
+        try:
+            _finish_owned_publication(ready_publication, revoke=True)
+        except (OSError, ValueError):
+            # The failure marker remains authoritative if ownership cannot
+            # safely be established or cleanup is blocked by the filesystem.
+            pass
         raise
 
 
@@ -1329,6 +1528,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--quality-exclusion-manifest", required=True, type=Path)
+    parser.add_argument(
+        "--quality-exclusion-assembly-receipt", required=True, type=Path
+    )
     parser.add_argument("--seed", type=int, default=20260901)
     parser.add_argument("--train-quota-per-stratum", type=int, default=250)
     parser.add_argument("--validation-quota-per-stratum", type=int, default=100)
@@ -1344,6 +1546,9 @@ def main() -> None:
         dataset_dir=args.dataset_dir,
         output_dir=args.output_dir,
         quality_exclusion_manifest=args.quality_exclusion_manifest,
+        quality_exclusion_assembly_receipt=(
+            args.quality_exclusion_assembly_receipt
+        ),
         seed=args.seed,
         training_quota=args.train_quota_per_stratum,
         validation_quota=args.validation_quota_per_stratum,

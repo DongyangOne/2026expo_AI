@@ -15,7 +15,7 @@ require_env() {
   fi
 }
 
-for name in AUDIT_DIR CODE_ROOT PILOT_INPUT_DIR QUALITY_EXCLUSION_MANIFEST
+for name in AUDIT_DIR CODE_ROOT PILOT_INPUT_DIR QUALITY_EXCLUSION_MANIFEST QUALITY_EXCLUSION_ASSEMBLY_RECEIPT
 do
   require_env "$name"
 done
@@ -25,15 +25,15 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 # Reject relative or newline-bearing roots before AUDIT_DIR is created or any
 # CODE_ROOT/PILOT_INPUT_DIR artifact path is derived from them.
 if ! "$PYTHON_BIN" - "$AUDIT_DIR" "$CODE_ROOT" "$PILOT_INPUT_DIR" \
-  "$QUALITY_EXCLUSION_MANIFEST" <<'PY'
+  "$QUALITY_EXCLUSION_MANIFEST" "$QUALITY_EXCLUSION_ASSEMBLY_RECEIPT" <<'PY'
 import json
 import os
 import sys
 from pathlib import Path
 
 raw_values = dict(zip(
-    ("AUDIT_DIR", "CODE_ROOT", "PILOT_INPUT_DIR", "QUALITY_EXCLUSION_MANIFEST"),
-    sys.argv[1:5],
+    ("AUDIT_DIR", "CODE_ROOT", "PILOT_INPUT_DIR", "QUALITY_EXCLUSION_MANIFEST", "QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"),
+    sys.argv[1:6],
     strict=True,
 ))
 def reject_symlink_components(path: Path, *, description: str) -> None:
@@ -51,6 +51,7 @@ audit = Path(raw_values["AUDIT_DIR"]).resolve(strict=False)
 code_arg = Path(raw_values["CODE_ROOT"])
 pilot_arg = Path(raw_values["PILOT_INPUT_DIR"])
 quality_arg = Path(raw_values["QUALITY_EXCLUSION_MANIFEST"])
+receipt_arg = Path(raw_values["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"])
 if (
     code_arg.is_symlink()
     or pilot_arg.is_symlink()
@@ -58,9 +59,12 @@ if (
     or not pilot_arg.is_dir()
     or quality_arg.is_symlink()
     or not quality_arg.is_file()
+    or receipt_arg.is_symlink()
+    or not receipt_arg.is_file()
 ):
     raise ValueError("code, pilot, and quality exclusion inputs must be regular")
 reject_symlink_components(quality_arg, description="QUALITY_EXCLUSION_MANIFEST")
+reject_symlink_components(receipt_arg, description="QUALITY_EXCLUSION_ASSEMBLY_RECEIPT")
 code = code_arg.resolve(strict=True)
 pilot = pilot_arg.resolve(strict=True)
 quality = quality_arg.resolve(strict=True)
@@ -79,6 +83,7 @@ for protected_name, protected in (
     ("CODE_ROOT", code),
     ("PILOT_INPUT_DIR", pilot),
     ("dataset directory", dataset),
+    ("quality assembly directory", receipt_arg.resolve(strict=True).parent),
 ):
     try:
         audit.relative_to(protected)
@@ -108,6 +113,7 @@ WRAPPER=$CODE_ROOT/scripts/nas/run_v4_repro_selection_audit.sh
 PILOT_BUILDER=$CODE_ROOT/scripts/build_v4_repro_pilot_inputs.py
 PROPOSAL_PREPARE=$CODE_ROOT/scripts/prepare_proposal_verifier_dataset.py
 QUALITY_MANIFEST=$QUALITY_EXCLUSION_MANIFEST
+QUALITY_RECEIPT=$QUALITY_EXCLUSION_ASSEMBLY_RECEIPT
 
 if [ -e "$AUDIT_DIR" ] || [ -L "$AUDIT_DIR" ]; then
   printf '%s\n' "refusing to reuse immutable AUDIT_DIR: $AUDIT_DIR" >&2
@@ -162,7 +168,7 @@ fail() {
   exit "$code"
 }
 
-for artifact in "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" "$QUALITY_MANIFEST"
+for artifact in "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" "$QUALITY_MANIFEST" "$QUALITY_RECEIPT"
 do
   if [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
     fail "missing or empty audit dependency: $artifact" 66
@@ -174,7 +180,7 @@ fi
 
 if ! "$PYTHON_BIN" - \
   "$AUDIT_DIR" "$RECOMPUTE" "$CODE_ROOT" "$PILOT_INPUT_DIR" \
-  "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" "$QUALITY_MANIFEST" <<'PY'
+  "$WRAPPER" "$PILOT_BUILDER" "$PROPOSAL_PREPARE" "$QUALITY_MANIFEST" "$QUALITY_RECEIPT" <<'PY'
 import hashlib
 import json
 import os
@@ -182,6 +188,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 (
@@ -193,7 +200,8 @@ from pathlib import Path
     builder_arg,
     proposal_arg,
     quality_arg,
-) = map(Path, sys.argv[1:9])
+    receipt_arg,
+) = map(Path, sys.argv[1:10])
 
 ROLE = (
     "v4_repro_selection_audit_cpu_only_diagnostic_"
@@ -601,6 +609,64 @@ excluded_source_shas, expected_quality, sanitized_quality = validate_quality_man
     quality_value, quality_content
 )
 quality_sha = sha_bytes(quality_content)
+validator_path = code / "scripts" / "operational_quality_assembly_contract.py"
+reject_symlink_components(validator_path, description="quality assembly validator")
+validator_content = stable_bytes(validator_path, description="quality assembly validator")
+validator_sha = sha_bytes(validator_content)
+sys.dont_write_bytecode = True
+candidate_authority = types.ModuleType("audit_quality_authority")
+candidate_authority.__file__ = str(validator_path)
+sys.modules[candidate_authority.__name__] = candidate_authority
+exec(compile(validator_content, str(validator_path), "exec"), candidate_authority.__dict__)
+candidate_authority._validate_quality_manifest(quality_value)
+quality_bundle = candidate_authority._validate_operational_quality_assembly(
+    receipt_path=receipt_arg, quality_path=quality,
+    quality_value=quality_value, quality_content=quality_content, output_dir=audit,
+)
+receipt_value = json.loads(quality_bundle.receipt_content.decode("utf-8"))
+receipt_sha = sha_bytes(quality_bundle.receipt_content)
+assembly_marker_sha = sha_bytes(quality_bundle.marker_content)
+expected_quality.update({
+    "assembly_schema": receipt_value["assembly_schema"],
+    "assembly_mode": receipt_value["assembly_mode"],
+    "operational_capture_cutoff_kst": receipt_value["operational_capture_cutoff_kst"],
+    "objective_prepare_bundle_validated": receipt_value["scope"]["objective_prepare_bundle_validated"],
+    "assembly_receipt_path": quality_bundle.receipt_path.as_posix(),
+    "assembly_receipt_sha256": receipt_sha,
+    "assembly_marker_path": quality_bundle.marker_path.as_posix(),
+    "assembly_marker_sha256": assembly_marker_sha,
+    "assembly_validator_path": validator_path.as_posix(),
+    "assembly_validator_sha256": validator_sha,
+})
+sanitized_quality = {key: value for key, value in expected_quality.items() if key not in {
+    "manifest_path", "assembly_receipt_path", "assembly_marker_path", "assembly_validator_path",
+}}
+quality_digest_bindings = {
+    "quality_exclusions_sha256": quality_sha,
+    "quality_exclusion_manifest_sha256": quality_sha,
+    "quality_exclusion_assembly_receipt_sha256": receipt_sha,
+    "quality_exclusion_assembly_marker_sha256": assembly_marker_sha,
+    "quality_assembly_validator_sha256": validator_sha,
+}
+quality_path_bindings = {
+    "quality_exclusion_manifest_path": quality.as_posix(),
+    "quality_exclusion_assembly_receipt_path": quality_bundle.receipt_path.as_posix(),
+    "quality_exclusion_assembly_marker_path": quality_bundle.marker_path.as_posix(),
+    "quality_assembly_validator_path": validator_path.as_posix(),
+}
+
+def validate_quality_bindings(value: object, *, description: str, paths: bool) -> None:
+    expected = {**quality_digest_bindings, **(quality_path_bindings if paths else {})}
+    if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
+        raise ValueError(f"{description} quality assembly binding mismatch")
+
+def rehash_quality_bundle() -> None:
+    candidate_authority._rehash_operational_quality_assembly(quality_bundle)
+    reject_symlink_components(validator_path, description="quality assembly validator rehash")
+    if stable_sha(validator_path, description="quality assembly validator rehash") != validator_sha:
+        raise RuntimeError("quality assembly validator changed")
+
+rehash_quality_bundle()
 artifact_hashes = {name: pilot_hashes[name] for name in ARTIFACT_NAMES}
 parse_inputs_marker(pilot_contents["inputs.sha256"], artifact_hashes)
 try:
@@ -621,7 +687,7 @@ for value, description, status in (
     (ready, "pilot ready", "pilot_inputs_ready"),
     (inventory, "pilot inventory", "selection_complete_not_replay_validated"),
 ):
-    if value.get("schema_version") != 1:
+    if type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
         raise ValueError(f"{description} schema mismatch")
     if value.get("artifact_role") != PILOT_ROLE:
         raise ValueError(f"{description} role mismatch")
@@ -651,12 +717,12 @@ if (
 if inventory.get("full_quota_met") is not True or ready.get("full_quota_met") is not True:
     raise ValueError("pilot does not attest full quota")
 selected_counts = inventory.get("selected_counts")
-if not isinstance(selected_counts, dict) or ready.get("selected_counts") != selected_counts:
+if not isinstance(selected_counts, dict) or not exact_json_equal(ready.get("selected_counts"), selected_counts):
     raise ValueError("pilot selected counts are missing or inconsistent")
 if not all(type(value) is int and value >= 0 for value in selected_counts.values()):
     raise ValueError("pilot selected counts must be exact non-negative integers")
 selected_sources = sum(selected_counts.values())
-if selected_sources < 1 or ready.get("selected_sources") != selected_sources:
+if selected_sources < 1 or type(ready.get("selected_sources")) is not int or ready.get("selected_sources") != selected_sources:
     raise ValueError("pilot selected source total is invalid or inconsistent")
 
 require_false_fields(
@@ -688,6 +754,8 @@ bindings = ready.get("bindings")
 inventory_bindings = inventory.get("bindings")
 if not isinstance(bindings, dict) or not isinstance(inventory_bindings, dict):
     raise ValueError("pilot bindings are missing")
+validate_quality_bindings(bindings, description="pilot ready", paths=False)
+validate_quality_bindings(inventory_bindings, description="pilot inventory", paths=True)
 if bindings.get("inputs_marker_sha256") != pilot_hashes["inputs.sha256"]:
     raise ValueError("pilot ready marker binding mismatch")
 if bindings.get("artifacts") != artifact_hashes:
@@ -806,6 +874,8 @@ command = [
     os.fspath(normalized_recompute),
     "--quality-exclusion-manifest",
     os.fspath(quality),
+    "--quality-exclusion-assembly-receipt",
+    os.fspath(quality_bundle.receipt_path),
     "--seed",
     str(seed),
     "--train-quota-per-stratum",
@@ -826,6 +896,7 @@ child_env.update(
     }
 )
 subprocess.run(command, cwd=code, env=child_env, check=True)
+rehash_quality_bundle()
 
 # The selector scans a large tree. Recheck every immutable authority input
 # after it exits so a concurrent same-run mutation cannot be sealed as valid.
@@ -898,7 +969,8 @@ for value, description, status in (
     (recomputed_inventory, "recomputed inventory", "selection_complete_not_replay_validated"),
 ):
     if (
-        value.get("schema_version") != 1
+        type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
         or value.get("artifact_role") != PILOT_ROLE
         or value.get("selection_contract") != SELECTION_CONTRACT
         or value.get("status") != status
@@ -941,6 +1013,8 @@ verify_selected_lists_exclude_quality_sources(
 recomputed_ready_bindings = recomputed_ready.get("bindings")
 if not isinstance(recomputed_ready_bindings, dict):
     raise ValueError("recomputed ready bindings are missing")
+validate_quality_bindings(recomputed_ready_bindings, description="recomputed ready", paths=False)
+validate_quality_bindings(recomputed_inventory.get("bindings"), description="recomputed inventory", paths=True)
 if recomputed_ready_bindings.get("inputs_marker_sha256") != recomputed_hashes["inputs.sha256"]:
     raise ValueError("recomputed ready marker binding mismatch")
 if recomputed_ready_bindings.get("artifacts") != recomputed_artifact_hashes:
@@ -1017,6 +1091,8 @@ evidence = {
         "resolved_universe_sha256": universe_sha,
         "quality_exclusion_manifest_path": quality.as_posix(),
         "quality_exclusion_manifest_sha256": quality_sha,
+        **quality_digest_bindings,
+        **quality_path_bindings,
         "historical_manifest_path": old_manifest.as_posix() if old_manifest else None,
         "historical_manifest_sha256": old_sha,
         "drift_report_path": drift_report.as_posix() if drift_report else None,
@@ -1071,6 +1147,7 @@ if stable_sha(
     quality, description="pre-ready quality exclusion manifest"
 ) != quality_sha:
     raise RuntimeError("quality exclusion manifest changed before ready")
+rehash_quality_bundle()
 
 ready_out = {
     "schema_version": 1,
@@ -1098,11 +1175,14 @@ ready_out = {
         "resolved_universe_sha256": universe_sha,
         "quality_exclusion_manifest_path": quality.as_posix(),
         "quality_exclusion_manifest_sha256": quality_sha,
+        **quality_digest_bindings,
+        **quality_path_bindings,
     },
     **authority_false,
 }
-# Terminal publication: no validation or artifact writes follow this call.
+# Validate again after publication; the shell failure trap removes ready on mutation.
 publish_exclusive(audit / "selection_audit_ready.json", json_bytes(ready_out))
+rehash_quality_bundle()
 PY
 then
   fail "v4 selection audit failed closed" 65
