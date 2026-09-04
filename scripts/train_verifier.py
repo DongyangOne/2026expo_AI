@@ -191,7 +191,19 @@ def _build_backbone(name: str, pretrained: bool):
     except ImportError as exc:
         raise RuntimeError("최신 백본 사용 시 `pip install timm`이 필요합니다.") from exc
     backbone = timm.create_model(name, pretrained=pretrained, num_classes=0, global_pool="avg")
-    return backbone, backbone.num_features
+    # timm의 num_features는 백본군에 따라 head 확장 전 채널을 보고하기도 한다
+    # (예: mobilenetv4_conv_small은 960을 보고하지만 실제 pooled 출력은 1280이다).
+    # 신고값을 믿지 않고 더미 forward로 실제 채널 수를 확인한다.
+    backbone.eval()
+    with torch.no_grad():
+        probe = backbone(torch.zeros(1, 3, 224, 224))
+    features = int(probe.shape[-1])
+    if features != backbone.num_features:
+        print(
+            f"[경고] {name}: timm num_features={backbone.num_features}이지만 "
+            f"실제 pooled 출력={features}. 실측값을 사용합니다.", flush=True,
+        )
+    return backbone, features
 
 
 class CropVerifier(nn.Module):
