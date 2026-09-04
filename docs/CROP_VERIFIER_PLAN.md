@@ -259,6 +259,34 @@ python /app/train_verifier.py \
 
 MobileNetV4/RepViT 채택은 validation macro-F1, 오분류 혼동행렬, ONNX 크기, Pi5 p50/p95 지연시간을 모두 비교한 뒤 결정한다.
 
+### 4.1 MobileNetV4-Conv-Small 비교 실측 (2026-09-05, 종결)
+
+위 계획을 8월 1일부터 방치하다 2026-09-05에 실제로 실행했다. NAS GPU가 유휴라
+`verifier_curated_v7_mnv3_20260803`과 동일 데이터·하이퍼파라미터로 세 후보를
+학습해 하드웨어 홀드아웃 35건(`hardware_capture_prep_20260803/dataset_v2/verifier/`,
+학습에 전혀 쓰이지 않은 validation split)으로 배포본과 비교했다.
+
+| 모델 | material(응답기준) | dent | label | McNemar p (vs 배포본) |
+|---|---:|---:|---:|---:|
+| 배포본(hard100, MobileNetV3-Small) | 74.3% | 92.3% | 100% | — |
+| MobileNetV3-Small + kiosk-augmentation | 62.9% | 92.3% | 94.7% | 0.219 |
+| MobileNetV4-Conv-Small + kiosk-augmentation | 71.4% | 100% | 94.7% | **1.000** |
+| MobileNetV4-Conv-Small (증강 없음, 순수 백본 비교) | 62.9% | 100% | 94.7% | 0.289 |
+
+**결론: 세 후보 모두 배포본을 통계적으로 이기지 못했다(전부 p>0.05).** 특히
+MobileNetV4 대 배포본은 p=1.0으로 완전한 동률이다. `--kiosk-augmentation`도
+material 정확도를 개선하지 못했고 MobileNetV3에서는 오히려 악화시켰다.
+n=35라는 검증셋 크기 자체가 이 정도 차이를 구분하지 못한다 — 백본이나 증강
+선택의 문제가 아니라 **검증셋 크기가 병목**이라는 뜻이다. arXiv:2607.01984의
+"MobileNetV3-Small은 심한 자원 제약 하에서 가장 강한 후보"라는 결론과 부합한다.
+
+**결정: MobileNetV3-Small(배포본)을 유지한다.** 백본 재탐색은 검증셋이 커지기
+전까지 우선순위가 아니다. 다운로드한 네 ONNX와 원본 로그는
+`weights/verifier_qwen35_mnv3_v1.onnx`(배포본)만 남기고 나머지는 저장소에
+커밋하지 않는다. 재현이 필요하면 이 절의 학습 커맨드와 NAS
+`runs/verifier_kiosk_aug_20260904/`, `runs/verifier_mnv4_kiosk_aug_20260904/`,
+`runs/verifier_mnv4_noaug_20260905/`를 참조한다.
+
 ## 5. 현재 체크포인트
 
 - 기존 NAS 학습은 epoch 41 진행 중 중지했고, **epoch 40 결과를 최종 기준선**으로 보존했다.
@@ -400,6 +428,57 @@ teacher 합의와 confidence 기준을 통과한 단일 객체만 다음 hard sa
 기존 9종의 새 모양·브랜드·조명 변화에는 대응하지만, 처음 보는 새 재질을 즉시 자동 학습해
 보장하는 구조는 아니다. 새 클래스와 저신뢰·미분류는 안전한 비허용 경로로 유지하고 충분한
 고유 표본과 독립 검증셋이 쌓인 뒤에만 학습 계약을 확장한다.
+
+### v3 저신뢰 proposal·엄격 lineage 개선 루프 (2026-08-27)
+
+v2 후보가 배포 게이트에서 거부된 뒤에도 개선을 중단하지 않고, 검출 recall과 crop
+검증을 서로 분리해 다시 진행한다. 고정 하드웨어 41장은 현재 진단용으로만 사용하며
+threshold 선택과 최종 배포 승인용 blind test로 간주하지 않는다.
+
+- 같은 PyTorch YOLO와 NMS IoU `0.70`에서 candidate confidence를 `0.25`에서
+  `0.10`으로 낮추면 진단 정확도가 `25/41 (60.98%)`에서 `28/41 (68.29%)`로
+  올랐다. negative specificity는 `3/6 (50%)`로 같았다. 이 수치는 v3 개발 근거일
+  뿐 독립 검증 결과가 아니다.
+- `configs/detector_inference_v3.json`에 입력 크기, 후보 confidence, NMS, bbox
+  선택 순서, crop padding·letterbox를 고정하고 파일 SHA-256을 calibration policy와
+  blind gate에 함께 묶는다.
+- 단일 객체 22만여 source를 YOLO로 다시 추론한다. 같은 바이트의 복제본은 SHA-256으로
+  한 번만 처리하고, 동일 SHA에 서로 다른 정답이 붙은 데이터는 어느 한쪽을 임의로
+  택하지 않고 전부 격리한다.
+- 학습 crop은 `runtime-top1`, `conf=0.10`, `NMS IoU=0.70`, padding `0.08`,
+  320px letterbox로 다시 만든다. GT가 있는 프레임의 low-IoU proposal은 background로
+  사용하지 않고, GT가 없는 source만 background 자동 정답으로 허용한다.
+- v3 검증기는 background를 10번째 material class로 넣지 않는다. 모든 proposal을
+  보는 binary `objectness(material/background)` head와, positive crop만 loss에
+  참여하는 9-class `material` head를 별도로 학습한다.
+- 기존 proposal manifest는 source와 crop 바이트를 다시 해시한 strict schema로
+  변환한다. `sample_id`, `source_sha256`, `image_sha256`, `object_group`,
+  `capture_session`, `role`, `fold`, `origin` 중 하나라도 train/model-validation을
+  가로지르면 학습을 차단한다.
+- 8월 운영 캡처 teacher queue 20건 중 19건이 다중 판정 합의에 도달했고, 보수적
+  기준으로 15건·12개 object group만 train 전용으로 수용했다. 구성은 plastic 14,
+  paper 1로 편향되어 있으므로 AI Hub 9종 replay를 대체하지 않고 hardware adaptation
+  표본으로만 사용한다. 실제 운영 bbox와 같은 방식으로 materialize한 15 crop은
+  rejection 없이 strict component audit를 통과했다.
+- manifest 행을 복제하지 않고 `origin` 기반 deterministic weighted sampler로 실제
+  하드웨어와 운영 crop의 기대 표본 비중을 합계 3~8%로 제한한다. validation은 가중하지
+  않는다.
+- calibration은 calibration role만 사용해 temperature와 임계값을 고정한다. blind
+  evaluator에는 threshold CLI가 없으며, calibration과 source/object group이 겹치면
+  즉시 실패한다. offline blind gate를 통과해도 production 교체 권한은 생기지 않는다.
+- 독립적인 신규 하드웨어 blind set과 end-to-end 응답/Spring callback/Pi 지연시간
+  게이트까지 통과하기 전에는 현재 Pi 모델과 production 파일을 교체하지 않는다.
+- calibration 또는 독립 blind 지표가 거부되면
+  `scripts/plan_verifier_next_iteration.py`가 sample 수가 아닌 `object_group` 단위로
+  검출 미탐·false positive·background 오판·품목 혼동·harmful correction을 집계한다.
+  입력 report와 학습 metadata SHA-256에 묶인 `next_offline_iteration_plan.json`에는
+  새롭고 서로 분리된 hard positive/negative 수집량, 전체 3~8% 범위의 adaptation
+  sampler 목표, 필요할 때만 1회의 stronger-backbone ablation을 기록한다.
+- 계획 생성은 재학습이나 배포가 아니다. 기존 파일을 덮어쓰지 않고 plan 하나당 base
+  candidate 1회와 선택적 backbone ablation 1회만 허용한다. 거부된 blind 표본은
+  postmortem 전용이며 다음 candidate의 학습·calibration·architecture 선택에 넣지 않는다.
+  threshold와 gate 기준은 blind 결과로 바꾸지 않고 새 calibration partition에서만 다시
+  고정하며, 다음 평가는 새로 수집한 독립 blind set을 요구한다.
 
 ## 6. 단계별 적용 기준
 
