@@ -1005,12 +1005,26 @@ full replay의 14개 `--code-pin` 경로가 일치한다. materializer가 실제
 crop 완료라고 바꾸지 않는다. `frames_without_eligible_proposal` 집계만으로는 개별
 무검출을 증명할 수 없으며 비유한 값/필터 탈락/실패를 구분해야 한다.
 
-17:05 이후 실제 metadata 재조회에서 QX3 외 raw 보호 136장은 known bbox 103,
+17:05 전후 실제 metadata 재조회에서 QX3 외 raw 보호 136장은 known bbox 103,
 deployed bbox만 25, 양쪽 bbox 미보유 8이었다. 이는 현재 모델 재생이나 crop 파일
 검사가 아니므로 이전의 crop 보유 추정 112/136 및 미보유 4건과 같은 의미로 쓰지 않는다.
 최소 진단은 미보유 raw 8장과 QX3 resized 2장만 고정 YOLO로 관측해 실제 crop 또는
 개별 성공적인 no-eligible 증거를 얻는 것이다. `crop_absent`는 objectness=0 정답이나
 새 학습행이 아니다. 관련 소형 producer는 구현 검토 중이며 아직 NAS 실행하지 않았다.
+
+10건 관측 입력 목록은 17:08:58 KST에 `build_protected_observation_inputs_v1_20260904`
+(ID `e26e515edba69a4a066cee6131ce6a305885e7948d802fb32fa38a447ec14e35`)에서
+exit0/OOMfalse로 생성했다. 입력은 기존 fingerprint/known/capture/reuse 네 자료의
+정확한 SHA이고 10개 고유 source/원래 roles/실제 경로를 확인했다. 산출물은
+`/share/Container/protected_observation_inputs_v1_20260904/inventory.json`, SHA
+`268dfd0895eff7cb760b61b29077a9aea21e40de9baa842ce8076e59358979f1`이며 읽기 전후 동일했다.
+builder `J/build_protected_observation_inventory_v1_20260904.py` SHA는
+`21207dfee8c4e981deb0bc58bbd3d09b121e17ac49e9fea358d802f9a5b87b0b`다.
+CPU1/RAM256MiB/network none/입력 RO/출력만 RW였으며 이 단계는 사진 추론이 아니다.
+
+17:10:29 KST 현재 기존 materializer v2는 verified **24,400/155,537**,
+materialized **23,326**까지 진행됐다. GPU0%/2MiB/41°C, 디스크 여유2.6TiB다.
+같은 원본 변환을 재실행하지 않고 유지했다.
 
 향후 필요하면 명시적인 research-only v2에서 **모든 source와 존재하는 실제 crop**의
 SHA/source/회전 pHash 거리4 보호를 유지하고 absence evidence를 별도로 표현한다.
