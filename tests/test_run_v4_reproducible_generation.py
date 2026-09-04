@@ -48,18 +48,57 @@ def _generation_fixture(
     generator = scripts / "prepare_proposal_verifier_dataset.py"
     generator.write_text(
         """
-import argparse,csv,hashlib,json
+import argparse,csv,hashlib,json,os,weakref
 from pathlib import Path
+_guard_ref=lambda: None
+def _trace(event, **fields):
+    with open(Path(os.environ['GEN_DIR'])/'control'/'mock_runtime.jsonl','a',encoding='utf-8') as f:
+        f.write(json.dumps({'event':event,'pid':os.getpid(),'guard_alive':_guard_ref() is not None,**fields})+'\\n')
+
+class _MockCudaAllocation:
+    pass
+
+def eager_initialize_cuda_context(device):
+    global _guard_ref
+    _trace('cuda_start',device=device)
+    if os.environ.get('FAKE_CUDA_FAILURE') == 'raise':
+        raise RuntimeError('mock CUDA initialization failure')
+    if os.environ.get('FAKE_CUDA_FAILURE') == 'none':
+        return None
+    guard=_MockCudaAllocation()
+    _guard_ref=weakref.ref(guard)  # The fixture itself does NOT keep it alive.
+    _trace('cuda_ready')
+    return guard
+
+_original_open=Path.open
+def _tracked_open(path,*args,**kwargs):
+    mode=args[0] if args else kwargs.get('mode','r')
+    if mode == 'rb' and (path.name == 'model.pt' or path.name == 'sample.jpg'):
+        _trace('read_model' if path.name == 'model.pt' else 'read_source')
+    if mode == 'rb' and path.name == 'audited_report.json':
+        _trace('read_audited_report')
+    return _original_open(path,*args,**kwargs)
+Path.open=_tracked_open
+
+def _mutate_code(phase):
+    if os.environ.get('FAKE_CODE_MUTATION') == phase:
+        name=os.environ.get('FAKE_MUTATION_FILE','verifier_preprocessing_contract.py')
+        (Path(__file__).parent/name).write_text('CONTRACT=2\\n',encoding='utf-8')
+
 def _label_path(source):
     parts=list(Path(source).parts); index=parts.index('images'); parts[index]='labels'
     return Path(*parts).with_suffix('.txt')
 def resolve_split_images(data_path, dataset_dir):
+    _trace('inventory')
+    _mutate_code('inventory')
     root=Path(dataset_dir)
     return {
         'training': sorted((root/'images'/'train').glob('*.jpg')),
         'validation': sorted((root/'images'/'val').glob('*.jpg')),
     }
 def main():
+    _trace('main',marker_exists=(Path(os.environ['GEN_DIR'])/'control'/'inputs.sha256').is_file())
+    assert _guard_ref() is not None, 'outer CUDA allocation was released before main'
     %s
     p=argparse.ArgumentParser()
     for n in ('model','data','dataset_dir','output_dir','device','batch','imgsz','conf','nms_iou','positive_iou','negative_iou','crop_size','padding','jpeg_quality','proposal_selection','background_policy','background_gt_margin','max_per_class','val_max_per_class','max_background','val_max_background','seed','min_free_gb','max_output_gb'):
@@ -99,6 +138,9 @@ def main():
     elif fault == 'unexpected':
         info['audited_aihub_snapshot']={'unexpected':True}
     (out/'dataset_info.json').write_text(json.dumps(info)+'\\n',encoding='utf-8')
+    _mutate_code('main')
+    _trace('main_return')
+_mutate_code('import')
 if __name__ == '__main__':
     main()
 """ % ("raise SystemExit(29)" if fail else "pass", binding_fault)
@@ -185,9 +227,9 @@ def test_generation_directory_and_markers_are_exclusive_and_hash_bound() -> None
     assert "refusing to reuse immutable GEN_DIR" in text
     assert "trap on_exit 0" in text
     assert 'mktemp "$CONTROL/.failed.XXXXXX"' in text
-    assert 'mktemp "$CONTROL/.inputs.XXXXXX"' in text
+    assert 'with staging.open("xb")' in text
     assert 'mktemp "$CONTROL/.outputs.XXXXXX"' in text
-    assert 'ln "$temporary" "$INPUT_MARKER"' in text
+    assert 'os.link(staging, input_marker)' in text
     assert 'ln "$temporary" "$OUTPUT_MARKER"' in text
     assert '"$WRAPPER"' in text
     assert "sha256sum -c" in text
@@ -207,6 +249,20 @@ def test_input_inventory_covers_resolved_external_splits_and_label_sidecars() ->
     assert '"contract": "resolved_yolo_train_val_sources_and_label_sidecars_sha256.v1"' in inventory
     assert '"kind": "unresolved_label_path"' in inventory
     assert "before.st_mtime_ns" in inventory
+
+
+def test_initial_inventory_and_main_share_cuda_context_in_one_python_process() -> None:
+    text = _text()
+    driver = text[text.index("inventory_generation_sources()") : text.index("DATASET_INPUT_INVENTORY=")]
+    assert driver.index("code_pins =") < driver.index("from scripts import prepare")
+    assert driver.index("cuda_guard = prepare.eager_initialize_cuda_context(device)") < driver.index(
+        "split_images = resolve_split_images(data_path, dataset_dir)"
+    ) < driver.index("input_pins =") < driver.index("prepare.main()")
+    assert "sys.argv = [str(generator), *generator_arguments]" in driver
+    assert 'if ! inventory_generation_sources "$DATASET_INPUT_INVENTORY" --generate' in text
+    assert '"$PYTHON_BIN" "$GENERATOR"' not in text
+    assert "del cuda_guard" not in driver
+    assert 'sha256sum "$AUDITED_AIHUB_REPORT"' not in text
 
 
 def test_dataset_info_is_independently_checked_before_ready() -> None:
@@ -290,6 +346,20 @@ def test_integration_fake_generation_publishes_raw_ready(tmp_path: Path) -> None
     assert received["audited_aihub_cohort"] is None
     assert received["aihub_origin"] is None
     assert received["audited_aihub_diagnostic"] is False
+    assert len((control / "inputs.sha256").read_text().splitlines()) == 6
+    events = [json.loads(line) for line in (control / "mock_runtime.jsonl").read_text().splitlines()]
+    initial_pid = events[0]["pid"]
+    initial = [event for event in events if event["pid"] == initial_pid]
+    names = [event["event"] for event in initial]
+    assert names[:3] == ["cuda_start", "cuda_ready", "inventory"]
+    assert names.index("inventory") < names.index("read_source") < names.index("read_model") < names.index("main")
+    assert names[-1] == "main_return"
+    assert all(event["guard_alive"] for event in initial[1:])
+    assert next(event for event in initial if event["event"] == "main")["marker_exists"] is True
+    # The final CPU-only re-inventory remains separate; it does not need CUDA.
+    final = [event for event in events if event["pid"] != initial_pid]
+    assert final and final[0]["event"] == "inventory"
+    assert all(event["guard_alive"] is False for event in final)
     for marker in ("inputs.sha256", "outputs.sha256"):
         checked = subprocess.run(
             [bash, "-c", 'sha256sum -c "$1" >/dev/null', "bash", (control / marker).as_posix()],
@@ -330,6 +400,9 @@ def test_mock_audited_generation_pins_five_extra_inputs_and_passes_canonical_ori
     assert (control / "raw_generation_ready.json").is_file()
     assert not (control / "failed.txt").exists()
     received = json.loads((root / "raw" / "generator_args.json").read_text())
+    events = [json.loads(line) for line in (control / "mock_runtime.jsonl").read_text().splitlines()]
+    names = [event["event"] for event in events if event["pid"] == events[0]["pid"]]
+    assert names[:4] == ["cuda_start", "cuda_ready", "read_audited_report", "inventory"]
     assert received["aihub_origin"] == "aihub_original_annotation_v1"
     assert received["audited_aihub_diagnostic"] is diagnostic
     assert received["audited_aihub_report"] == env["AUDITED_AIHUB_REPORT"]
@@ -391,7 +464,10 @@ def test_mock_wrong_audited_report_sha_fails_before_generation(tmp_path: Path) -
     )
     assert result.returncode != 0
     control = Path(env["GEN_DIR"]) / "control"
-    assert "report SHA mismatch" in (control / "failed.txt").read_text()
+    assert (control / "failed.txt").is_file()
+    assert "report SHA mismatch" in result.stderr
+    events = [json.loads(line) for line in (control / "mock_runtime.jsonl").read_text().splitlines()]
+    assert [event["event"] for event in events] == ["cuda_start", "cuda_ready", "read_audited_report"]
     assert not (control / "raw_generation_ready.json").exists()
     assert not (control.parent / "raw").exists()
 
@@ -434,3 +510,50 @@ def test_mock_unrequested_audited_binding_is_rejected(tmp_path: Path) -> None:
     control = Path(env["GEN_DIR"]) / "control"
     assert "generated dataset contract verification failed" in (control / "failed.txt").read_text()
     assert not (control / "raw_generation_ready.json").exists()
+
+
+@pytest.mark.parametrize("failure", ["raise", "none"])
+def test_mock_cuda_failure_cannot_read_sources_or_model_or_publish_inputs(
+    tmp_path: Path, failure: str,
+) -> None:
+    bash = _integration_bash(tmp_path)
+    env = _generation_fixture(tmp_path)
+    env["FAKE_CUDA_FAILURE"] = failure
+    result = subprocess.run([bash, SCRIPT.as_posix()], env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    control = Path(env["GEN_DIR"]) / "control"
+    events = [json.loads(line) for line in (control / "mock_runtime.jsonl").read_text().splitlines()]
+    assert [event["event"] for event in events] == ["cuda_start"]
+    assert (control / "failed.txt").is_file()
+    for name in ("dataset_input_inventory.json", "inputs.sha256", "raw_generation_ready.json"):
+        assert not (control / name).exists()
+    assert not (control.parent / "raw").exists()
+
+
+@pytest.mark.parametrize("phase", ["import", "inventory", "main"])
+def test_mock_loaded_code_drift_cannot_be_rebound_into_ready(tmp_path: Path, phase: str) -> None:
+    bash = _integration_bash(tmp_path)
+    env = _generation_fixture(tmp_path)
+    env["FAKE_CODE_MUTATION"] = phase
+    result = subprocess.run([bash, SCRIPT.as_posix()], env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "generation code changed" in result.stderr
+    control = Path(env["GEN_DIR"]) / "control"
+    assert (control / "failed.txt").is_file()
+    assert not (control / "raw_generation_ready.json").exists()
+    if phase != "main":
+        assert not (control / "inputs.sha256").exists()
+        assert not (control.parent / "raw").exists()
+
+
+def test_mock_audited_import_helper_drift_is_not_rebound(tmp_path: Path) -> None:
+    bash = _integration_bash(tmp_path)
+    env = _generation_fixture(tmp_path, audited=True)
+    env.update(FAKE_CODE_MUTATION="inventory", FAKE_MUTATION_FILE="audited_aihub_snapshot.py")
+    result = subprocess.run([bash, SCRIPT.as_posix()], env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert "generation code changed" in result.stderr
+    control = Path(env["GEN_DIR"]) / "control"
+    assert not (control / "inputs.sha256").exists()
+    assert not (control / "raw_generation_ready.json").exists()
+    assert (control / "failed.txt").is_file()

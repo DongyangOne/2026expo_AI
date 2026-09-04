@@ -1146,3 +1146,68 @@ host fault-buffer 부족 재발 위험을 줄이기 위해 **같은 process에�
 확보하고 inventory→기존 generator.main을 이어 실행**하는 최소 수정/회귀를 진행한다.
 아직 full generation에서 같은 오류가 발생했다고 주장하지 않으며, 기존 NAS frozen
 release는 수정하지 않는다. 변경 시 새 release와 실제 code pins를 사용해야 한다.
+
+## 17. 연구용 보호 참조 조립 완료와 full generation 실행 순서 수정
+
+`assemble_research_protected_references_v1_20260904`, ID
+`f744edcbb223d6ce3167625d438a007d9c9c79f54d1719cadc2b4d0a4098a0cb`는
+17:50:24~17:52:22 KST **exit0/OOMfalse**로 완료됐다. CPU2/RAM1GiB/network none,
+입력 RO/새 출력만 RW/no GPU다. protected ROI에 이어 별도로 생성한 결과다.
+
+- CODE: `J/research_reference_code_v1_20260904`.
+  assembler SHA `07f3f023c40b1bd6831cf9e21f517c22191207012e7c55a0f0b4339432ab2ddb`,
+  shared near SHA `4318b51f41d0fc3a8804055b100abacbe97e2a6c6a1ce32f4058a53c1dbee2fb`.
+  launch `J/launch_research_protected_assembly_v1_20260904.sh` SHA
+  `202323a3fb7652ea57f6a3878842958cf9707e420d34ed40e4350e0c06955944`.
+- OUT: `/share/Container/research_protected_references_v1_20260904/result`.
+  `report.json` SHA `3ae41fef673e55f74b22c168cb1d59cf6b0982017d94fdfb0abcfc68fe25b6d5`;
+  `reference_inventory.json` SHA `02d0a38da03c9081034a4473df89fdec04e907bc659a3898a1cc4063871178e6`.
+- 실제 source/crop bytes를 읽어 rot4 pHash를 계산하고 종료 시 다시 확인했다.
+  원본/unique **3,636**, crop **3,630**, 실제 관측 no-eligible **6**이며
+  모든 원본과 존재하는 crop을 보존했다. 별도 metadata 재검사에서 report→inventory
+  SHA 연결, 집계, 파일 전후 동일 SHA와 failed.json 없음을 확인했다.
+- `research_only=true`, `formal_protected_coverage=false`, `full_source_crop_coverage=false`다.
+  학습/blind/배포/라벨 권한과 `candidate_leakage_passed`도 false다.
+  이는 보호 참조 준비 완료이지 아직 생성 전인 전체 학습 후보와의 누수 감사 통과가 아니다.
+
+새 `audit_research_reference_leakage.py`는 실제 strict replay→lineage→role CSV 연결,
+참고 inventory reader, 기존 exact/source/rot4 pHash 거리4 그래프를 사용한다.
+보호 집합 내부 중복은 원 memberships와 함께 기록하고, candidate↔protected 및
+train↔model_validation의 연결은 전이적 cluster까지 차단한다. 그래프용 입력 검증 후
+큰 CSV 버퍼는 해제한다. assembler **38 passed**, 기존 near **40 passed/4 skipped**다.
+메인의 combined 회귀에서 Windows/POSIX 기대값 오류 1건을 수정한 뒤 해당 테스트도
+통과했다. 이는 CPU 회귀 결과이며 실제 전체 candidate 누수 감사는 아직 실행하지 않았다.
+
+**연구 auditor는 아직 사용 전 보완 중이다.** 최초 36개 회귀 후 독립 검토에서
+lineage/partition이 서로 일치하더라도 replay의 confidence를 동시에 바꾼 두 목록이
+통과할 수 있음을 재현했다. 기존 초안 SHA `4da5c74235c0c180d1383f1f0c2a69c3f2b778a646c4e53df43854043374d617`
+를 준비 완료로 취급하지 않는다. retained 행의 source/crop·class/confidence·bbox·GT/상태가
+실제 replay 행과 일치하는지를 추가한 뒤 변조 회귀/최종 SHA를 새로 고정해야 한다.
+참고 assembler 결과와 shared helper는 이 결함의 영향을 받지 않는다.
+
+shared near의 유일한 접점 변경은 candidate CSV loader의 명시적 선택 인자다.
+기존 기본 64MiB/상대 crop 경로·검사 정책은 유지하며, 연구 소비자는 최대512MiB와
+실제 lineage의 absolute crop 경로를 명시한다. 같은 SHA/file 검증과 parser를 사용한다.
+Windows의 기존 드라이브 경로 처리와 NAS POSIX 절대경로 처리를 혼동한 테스트는
+실제 플랫폼 동작에 맞게 수정했으며 v1 기준을 조용히 바꾸지 않았다.
+
+### 다음 full GPU 실행에는 v2 CODE_ROOT 사용
+
+`run_v4_reproducible_generation.sh`는 같은 process에서 CUDA guard를 확보한 뒤
+audited report SHA→전체 image/sidecar inventory→기존 6/11개 input pins→
+import한 `prepare.main()`을 직접 실행하도록 수정했다. marker/추론 인자/출력검사/
+ready·failed 계약은 유지한다. 작은 code pin을 import 전후 및 생성 후 확인한다.
+CUDA 초기화 실패 시 큰 파일 scan/main은 실행하지 않는다. **29개 회귀**로 같은 PID와
+guard 생존, 호출 순서, 코드 변조 실패, 실제 `sha256sum -c` 호환을 검사했다.
+메인의 wrapper+full replay runner 통합 회귀도 **75 passed/305.55초**로 완료됐다.
+이 테스트의 CUDA/YOLO는 mock이며 이번 full GPU 성능 검증으로 표현하지 않는다.
+
+새 CODE_ROOT는 **`J/full_replay_release_v2_20260904`**다. 기존 v1의 15개 파일을
+새 경로에 복사하되 wrapper만 새 버전으로 대체했고 각 복사 파일 SHA를 대조했다.
+wrapper SHA는 `d333908e836406941f1ee8a83d728cd12ca177bd1749b53fb74e5945be69ed8d`,
+나머지13개 code/config 및 runner SHA는 §13/15와 같다. NAS `sh -n`도 exit0이다.
+v1 release/실행 산출물은 수정하지 않았다. full generation과 strict replay 모두
+**v2 CODE_ROOT**를 사용해야 marker 경로와 실제 코드가 일치한다.
+
+17:53:42 KST materializer v2는 계속 실행 중이며 verified **41,800/155,537**,
+materialized **39,955**다. 실제 full generation·replay·연구 학습은 아직 시작 전이다.

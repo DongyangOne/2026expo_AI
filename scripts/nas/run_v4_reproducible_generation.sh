@@ -96,7 +96,6 @@ if [ -n "$AUDITED_AIHUB_REPORT$AUDITED_AIHUB_REPORT_SHA256$AUDITED_AIHUB_COHORT"
   case "$AUDITED_AIHUB_REPORT_SHA256" in *[!0-9a-f]*) fail "invalid audited AIHub report SHA" 64;; esac
   require_file "$AUDITED_AIHUB_REPORT"
   require_file "$AUDITED_AIHUB_COHORT"
-  [ "$(sha256sum "$AUDITED_AIHUB_REPORT" | awk '{print $1}')" = "$AUDITED_AIHUB_REPORT_SHA256" ] || fail "audited AIHub report SHA mismatch"
   for helper in audited_aihub_snapshot.py audit_aihub_original_annotations.py materialize_audited_aihub_sources.py; do
     require_file "$CODE_ROOT/scripts/$helper"
   done
@@ -197,7 +196,8 @@ PY
 
 inventory_generation_sources() {
   output=$1
-  "$PYTHON_BIN" - "$CODE_ROOT" "$DATA_PATH" "$DATASET_DIR" "$output" <<'PY'
+  shift
+  "$PYTHON_BIN" - "$CODE_ROOT" "$DATA_PATH" "$DATASET_DIR" "$output" "$@" <<'PY'
 import hashlib
 import json
 import os
@@ -208,13 +208,59 @@ code_root = Path(sys.argv[1]).resolve()
 data_path = Path(sys.argv[2]).resolve()
 dataset_dir = Path(sys.argv[3]).resolve()
 output = Path(sys.argv[4])
+generate = len(sys.argv) > 5 and sys.argv[5] == "--generate"
+generator_arguments = sys.argv[6:] if generate else []
 if output.exists() or output.is_symlink():
     raise FileExistsError(output)
+
+def stable_sha256(path: Path) -> str:
+    before = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        opened = os.fstat(handle.fileno())
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        finished = os.fstat(handle.fileno())
+    after = path.stat()
+    identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    if not identity(before) == identity(opened) == identity(finished) == identity(after):
+        raise RuntimeError(f"input changed while hashing: {path}")
+    return digest.hexdigest()
+
+generator = code_root / "scripts/prepare_proposal_verifier_dataset.py"
+preprocessing = code_root / "scripts/verifier_preprocessing_contract.py"
+wrapper = code_root / "scripts/nas/run_v4_reproducible_generation.sh"
+code_paths = [generator, preprocessing, wrapper]
+audited_report = os.environ.get("AUDITED_AIHUB_REPORT", "")
+if audited_report:
+    code_paths.extend(code_root / "scripts" / name for name in (
+        "audited_aihub_snapshot.py", "audit_aihub_original_annotations.py",
+        "materialize_audited_aihub_sources.py",
+    ))
+# Only small code is read before CUDA; model and source inventories follow it.
+code_pins = {path: stable_sha256(path) for path in code_paths}
+
+def verify_code() -> None:
+    for path, expected in code_pins.items():
+        if stable_sha256(path) != expected:
+            raise RuntimeError(f"generation code changed: {path}")
+
 sys.path.insert(0, str(code_root))
-from scripts.prepare_proposal_verifier_dataset import (  # noqa: E402
-    _label_path,
-    resolve_split_images,
-)
+from scripts import prepare_proposal_verifier_dataset as prepare  # noqa: E402
+if Path(prepare.__file__).resolve() != generator:
+    raise RuntimeError("generator import path mismatch")
+verify_code()
+_label_path = prepare._label_path
+resolve_split_images = prepare.resolve_split_images
+# Retain the allocation in this frame through inventory, marker and main().
+cuda_guard = None
+if generate:
+    device = os.environ.get("DEVICE", "0")
+    cuda_guard = prepare.eager_initialize_cuda_context(device)
+    if device.strip().lower() in {"0", "cuda", "cuda:0"} and cuda_guard is None:
+        raise RuntimeError("CUDA initialization did not retain a context guard")
+    if audited_report and stable_sha256(Path(audited_report)) != os.environ["AUDITED_AIHUB_REPORT_SHA256"]:
+        raise RuntimeError("audited AIHub report SHA mismatch")
 
 def artifact(path: Path, *, kind: str, split: str) -> dict[str, object]:
     resolved = path.resolve(strict=False)
@@ -280,30 +326,45 @@ with temporary.open("x", encoding="utf-8", newline="\n") as handle:
     handle.write("\n")
 os.link(temporary, output)
 temporary.unlink()
+verify_code()
+
+if generate:
+    input_marker = output.parent / "inputs.sha256"
+    # Preserve the six base pins and the five optional audited-input pins.
+    input_paths = [Path(os.environ["MODEL_PATH"]), data_path, generator,
+                   preprocessing, wrapper, output]
+    if audited_report:
+        input_paths.extend([Path(audited_report), Path(os.environ["AUDITED_AIHUB_COHORT"]),
+                            *code_paths[3:]])
+    input_pins = [(path, stable_sha256(path)) for path in input_paths]
+    if audited_report and input_pins[6][1] != os.environ["AUDITED_AIHUB_REPORT_SHA256"]:
+        raise RuntimeError("audited AIHub report changed before input marker")
+    verify_code()
+    marker_bytes = bytearray()
+    for path, digest in input_pins:
+        filename = os.fsencode(path.as_posix())
+        escaped = any(char in filename for char in (b"\\", b"\n", b"\r"))
+        filename = filename.replace(b"\\", b"\\\\").replace(b"\n", b"\\n").replace(b"\r", b"\\r")
+        marker_bytes.extend((b"\\" if escaped else b"") + digest.encode("ascii") + b"  " + filename + b"\n")
+    staging = input_marker.with_name(f".{input_marker.name}.{os.getpid()}.tmp")
+    with staging.open("xb") as handle:
+        handle.write(marker_bytes)
+    os.link(staging, input_marker)
+    staging.unlink()
+    for path, digest in input_pins:
+        if stable_sha256(path) != digest:
+            raise RuntimeError(f"generation input changed before main: {path}")
+    # Release large CPU bookkeeping, not the live CUDA allocation.
+    del rows, seen, payload, split_images
+    sys.argv = [str(generator), *generator_arguments]
+    prepare.main()
+    verify_code()
 PY
 }
 
 DATASET_INPUT_INVENTORY=$CONTROL/dataset_input_inventory.json
-inventory_generation_sources "$DATASET_INPUT_INVENTORY" || fail "failed to inventory resolved dataset inputs"
-
 INPUT_MARKER=$CONTROL/inputs.sha256
-temporary=$(mktemp "$CONTROL/.inputs.XXXXXX") || fail "failed to create input marker staging file"
-sha256sum "$MODEL_PATH" "$DATA_PATH" "$GENERATOR" "$PREPROCESSING" "$WRAPPER" \
-  "$DATASET_INPUT_INVENTORY" > "$temporary" || fail "failed to hash generation inputs"
-if [ -n "$AUDITED_AIHUB_REPORT" ]; then
-  sha256sum "$AUDITED_AIHUB_REPORT" "$AUDITED_AIHUB_COHORT" \
-    "$CODE_ROOT/scripts/audited_aihub_snapshot.py" \
-    "$CODE_ROOT/scripts/audit_aihub_original_annotations.py" \
-    "$CODE_ROOT/scripts/materialize_audited_aihub_sources.py" >> "$temporary" || fail "failed to hash audited AIHub inputs"
-fi
-if ! ln "$temporary" "$INPUT_MARKER" 2>/dev/null; then
-  rm -f "$temporary"
-  fail "refusing to overwrite input marker" 73
-fi
-rm -f "$temporary"
-sha256sum -c "$INPUT_MARKER" >/dev/null 2>&1 || fail "input marker verification failed"
-
-if ! "$PYTHON_BIN" "$GENERATOR" \
+if ! inventory_generation_sources "$DATASET_INPUT_INVENTORY" --generate \
   --model "$MODEL_PATH" \
   --data "$DATA_PATH" \
   --dataset-dir "$DATASET_DIR" \

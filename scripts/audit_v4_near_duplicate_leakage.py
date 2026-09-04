@@ -1231,10 +1231,15 @@ def _decode_source_path(value: str) -> str:
         raise AuditError("candidate source_path_b64 is invalid") from error
 
 
-def _load_candidate_manifest(role: str, path: Path) -> tuple[list[AuditAsset], str]:
+def _load_candidate_manifest(
+    role: str, path: Path, *, max_bytes: int = MAX_ENCODED_BYTES,
+    allow_absolute_crop_paths: bool = False,
+) -> tuple[list[AuditAsset], str]:
     if role not in CANDIDATE_ROLES:
         raise AuditError(f"unsupported candidate role: {role}")
-    payload, manifest_sha, _ = _read_regular_file(path, expected_sha256=None)
+    if type(allow_absolute_crop_paths) is not bool:
+        raise AuditError("allow_absolute_crop_paths must be boolean")
+    payload, manifest_sha, _ = _read_regular_file(path, expected_sha256=None, max_bytes=max_bytes)
     try:
         text = payload.decode("utf-8-sig")
         reader = csv.DictReader(io.StringIO(text, newline=""))
@@ -1248,6 +1253,7 @@ def _load_candidate_manifest(role: str, path: Path) -> tuple[list[AuditAsset], s
     if not required.issubset(fields) or not rows:
         raise AuditError("candidate manifest is empty or missing required fields")
     root = path.parent
+    crop_path = _candidate_source_path if allow_absolute_crop_paths else _manifest_relative_path
     assets: list[AuditAsset] = []
     source_seen: set[tuple[str, str]] = set()
     explicit_views = "view_kind" in fields
@@ -1264,7 +1270,7 @@ def _load_candidate_manifest(role: str, path: Path) -> tuple[list[AuditAsset], s
             view_kind = (row.get("view_kind") or "").strip()
             assets.append(
                 AuditAsset(
-                    path=_manifest_relative_path(root, row["filepath"], f"line {line} filepath"),
+                    path=crop_path(root, row["filepath"], f"line {line} filepath"),
                     role=role,
                     cohort="candidate",
                     view_kind=view_kind,
@@ -1277,7 +1283,7 @@ def _load_candidate_manifest(role: str, path: Path) -> tuple[list[AuditAsset], s
 
         assets.append(
             AuditAsset(
-                path=_manifest_relative_path(root, row["filepath"], f"line {line} filepath"),
+                path=crop_path(root, row["filepath"], f"line {line} filepath"),
                 role=role,
                 cohort="candidate",
                 view_kind="crop",
