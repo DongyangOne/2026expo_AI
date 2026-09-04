@@ -1120,7 +1120,22 @@ def build_pilot_inputs(
         quality_value, quality_content = candidate_authority._load_json(
             quality_exclusion_manifest, "quality exclusions"
         )
-        exclusions = candidate_authority._validate_quality_manifest(quality_value)
+        # Preserve existing nonempty validation diagnostics; an empty list never
+        # bypasses the full assembly check below.
+        if quality_value.get("entries"):
+            candidate_authority._validate_quality_manifest(quality_value)
+        quality_assembly_bundle = (
+            candidate_authority._validate_operational_quality_assembly(
+                receipt_path=quality_exclusion_assembly_receipt,
+                quality_path=quality_exclusion_manifest,
+                quality_value=quality_value,
+                quality_content=quality_content,
+                output_dir=output_dir,
+            )
+        )
+        exclusions = candidate_authority._validate_quality_manifest(
+            quality_value, assembly_bundle=quality_assembly_bundle
+        )
         quality_exclusion_info: dict[str, object] = {
             "required": True,
             "manifest_contract": QUALITY_EXCLUSION_CONTRACT,
@@ -1138,15 +1153,6 @@ def build_pilot_inputs(
             "blind_test_authority": False,
             "deployment_authority": False,
         }
-        quality_assembly_bundle = (
-            candidate_authority._validate_operational_quality_assembly(
-                receipt_path=quality_exclusion_assembly_receipt,
-                quality_path=quality_exclusion_manifest,
-                quality_value=quality_value,
-                quality_content=quality_content,
-                output_dir=output_dir,
-            )
-        )
         quality_receipt_value = json.loads(
             quality_assembly_bundle.receipt_content.decode("utf-8")
         )

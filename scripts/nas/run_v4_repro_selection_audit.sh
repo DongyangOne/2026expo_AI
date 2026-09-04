@@ -428,8 +428,13 @@ def canonical_quality_entries_bytes(entries: list[dict[str, str]]) -> bytes:
 
 
 def validate_quality_manifest(
-    value: dict[str, object], content: bytes
+    value: dict[str, object], content: bytes, *, assembly_bundle: object | None = None
 ) -> tuple[set[str], dict[str, object], dict[str, object]]:
+    # Empty selections are legitimate only after the full assembly is validated.
+    # A naked zero-entry manifest must never grant this exception by itself.
+    candidate_authority._validate_quality_manifest(
+        value, assembly_bundle=assembly_bundle
+    )
     expected_keys = {
         "schema_version", "artifact_role", "quality_exclusion_contract",
         "status", "excluded_source_count", "reason_counts",
@@ -450,8 +455,8 @@ def validate_quality_manifest(
     ):
         raise ValueError("quality exclusion manifest contract or authority mismatch")
     entries = value.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("quality exclusion entries must be a non-empty list")
+    if not isinstance(entries, list):
+        raise ValueError("quality exclusion entries must be a list")
     if len(entries) > QUALITY_MAX_SOURCES:
         raise ValueError("quality exclusion entries exceed bounded maximum")
     normalized: list[dict[str, str]] = []
@@ -605,9 +610,6 @@ pilot_hashes = {name: sha_bytes(content) for name, content in pilot_contents.ite
 quality_value, quality_content = load_object(
     quality, description="quality exclusion manifest"
 )
-excluded_source_shas, expected_quality, sanitized_quality = validate_quality_manifest(
-    quality_value, quality_content
-)
 quality_sha = sha_bytes(quality_content)
 validator_path = code / "scripts" / "operational_quality_assembly_contract.py"
 reject_symlink_components(validator_path, description="quality assembly validator")
@@ -618,10 +620,12 @@ candidate_authority = types.ModuleType("audit_quality_authority")
 candidate_authority.__file__ = str(validator_path)
 sys.modules[candidate_authority.__name__] = candidate_authority
 exec(compile(validator_content, str(validator_path), "exec"), candidate_authority.__dict__)
-candidate_authority._validate_quality_manifest(quality_value)
 quality_bundle = candidate_authority._validate_operational_quality_assembly(
     receipt_path=receipt_arg, quality_path=quality,
     quality_value=quality_value, quality_content=quality_content, output_dir=audit,
+)
+excluded_source_shas, expected_quality, sanitized_quality = validate_quality_manifest(
+    quality_value, quality_content, assembly_bundle=quality_bundle
 )
 receipt_value = json.loads(quality_bundle.receipt_content.decode("utf-8"))
 receipt_sha = sha_bytes(quality_bundle.receipt_content)

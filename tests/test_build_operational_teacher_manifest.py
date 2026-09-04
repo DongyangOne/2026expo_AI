@@ -1173,7 +1173,7 @@ def _write_operational_capture_metadata(
 
 
 def _objective_quality_assembly_fixture(
-    tmp_path: Path,
+    tmp_path: Path, *, no_quality_exclusions: bool = False,
 ) -> tuple[dict, Path, Path]:
     """Build the real prepare -> teacher -> assembler input chain."""
 
@@ -1181,7 +1181,8 @@ def _objective_quality_assembly_fixture(
     captures = tmp_path / "captures"
     captures.mkdir()
     objective_path, objective_sha = _image(
-        captures, "objective-tiny", 100, size=(60, 80)
+        captures, "objective-tiny", 100,
+        size=(240, 320) if no_quality_exclusions else (60, 80),
     )
     subjective_path, subjective_sha = _image(
         captures, "subjective-boundary", 120
@@ -1226,14 +1227,14 @@ def _objective_quality_assembly_fixture(
         for line in queue_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert {row["sha256"] for row in queue_rows} == {
-        subjective_sha,
-        usable_sha,
-    }
+    expected_queue = {subjective_sha, usable_sha}
+    if no_quality_exclusions:
+        expected_queue.add(objective_sha)
+    assert {row["sha256"] for row in queue_rows} == expected_queue
     labels = []
     for row in queue_rows:
         path = captures / row["image_ref"]
-        if row["sha256"] == subjective_sha:
+        if row["sha256"] == subjective_sha and not no_quality_exclusions:
             labels.append(
                 _teacher_row(
                     path,
@@ -2076,7 +2077,7 @@ def test_operational_quality_assembler_refuses_empty_quality_selection(
 ) -> None:
     args, _ = _quality_assembly_fixture(tmp_path, ())
 
-    with pytest.raises(ValueError, match="no eligible post-cutoff"):
+    with pytest.raises(ValueError, match="zero exclusions require full objective and subjective evidence"):
         assemble_operational_quality_exclusions(**args)
     assert not args["output_dir"].exists()
 

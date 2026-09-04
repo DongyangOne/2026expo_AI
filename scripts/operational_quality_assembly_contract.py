@@ -232,7 +232,9 @@ def _canonical_quality_entries(entries: Sequence[Mapping[str, str]]) -> bytes:
     ).encode("utf-8")
 
 
-def _validate_quality_manifest(value: Mapping[str, object]) -> dict[str, str]:
+def _validate_quality_manifest(
+    value: Mapping[str, object], *, assembly_bundle: _QualityAssemblyBundle | None = None,
+) -> dict[str, str]:
     expected_fields = {
         "schema_version", "artifact_role", "quality_exclusion_contract", "status",
         "excluded_source_count", "max_excluded_sources", "reason_counts",
@@ -254,8 +256,14 @@ def _validate_quality_manifest(value: Mapping[str, object]) -> dict[str, str]:
     for field in FALSE_AUTHORITY_FIELDS:
         _require_bool(authority.get(field), False, f"quality authority.{field}")
     entries = value.get("entries")
-    if type(entries) is not list or not entries:
-        raise ValueError("quality exclusions must contain at least one entry")
+    if type(entries) is not list:
+        raise ValueError("quality exclusions entries must be a list")
+    if not entries:
+        if not isinstance(assembly_bundle, _QualityAssemblyBundle):
+            raise ValueError("empty quality exclusions require a validated full assembly bundle")
+        if assembly_bundle.manifest_content != _canonical_json(value):
+            raise ValueError("empty quality exclusions differ from the validated assembly manifest")
+        _rehash_operational_quality_assembly(assembly_bundle)
     if len(entries) > 100:
         raise ValueError("quality exclusions may contain at most 100 entries")
     parsed: dict[str, str] = {}
@@ -410,7 +418,7 @@ def _validate_operational_quality_assembly(
             raise ValueError(f"quality exclusion assembly {field} mismatch")
 
     selected_count = receipt.get("selected_source_count")
-    if type(selected_count) is not int or selected_count <= 0:
+    if type(selected_count) is not int or selected_count < 0:
         raise ValueError("quality exclusion assembly selected_source_count mismatch")
     if selected_count != quality_value.get("excluded_source_count"):
         raise ValueError("quality exclusion assembly selected count mismatch")
@@ -499,7 +507,7 @@ def _validate_operational_quality_assembly(
         raise ValueError("quality exclusion assembly marker mismatch")
     if _stable_bytes(validator_path, "quality assembly validator rehash") != validator_content:
         raise RuntimeError("quality assembly validator changed during validation")
-    return _QualityAssemblyBundle(
+    bundle = _QualityAssemblyBundle(
         root=root,
         manifest_path=resolved_manifest,
         receipt_path=resolved_receipt,
@@ -511,6 +519,10 @@ def _validate_operational_quality_assembly(
         validator_path=validator_path,
         validator_content=validator_content,
     )
+    # Zero is a real result only within this complete, revalidated receipt and
+    # marker. A naked empty manifest remains invalid at the standalone parser.
+    _validate_quality_manifest(quality_value, assembly_bundle=bundle)
+    return bundle
 
 
 def _rehash_operational_quality_assembly(bundle: _QualityAssemblyBundle) -> None:

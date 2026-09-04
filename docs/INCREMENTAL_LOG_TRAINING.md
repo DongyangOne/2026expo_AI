@@ -46,6 +46,19 @@ API 응답과 Spring 계약은 바꾸지 않는다. 검증에 실패하면 기�
 이 옵션을 생략하면 기존 출력 파일별 checkpoint 방식이 유지된다. 공유 캐시 모드의
 출력은 덮어쓰지 않으며, symlink와 출력/캐시 경로 충돌을 거부한다.
 
+## 확정 품질 제외가 0건인 배치
+
+`assemble_operational_quality_exclusions.py`는 전체 objective prepare 증거와
+완료된 teacher 결과·수용/거부 분할을 재검증한 경우에만 빈 제외 목록을 봉인한다.
+빈 CSV만 producer에 전달하거나, 미완료/누락 결과를 빈 성공으로 바꾸는 것은 허용하지
+않는다. 정상 완료된 재질 비합의는 거부 기록에 남는다. **제외 0건은 전체 사진 수용이나
+정확도 100%를 뜻하지 않는다.** 학습 후보에 못 들어간 사진을 재포함하지 않는다.
+
+QX3와 후보 준비 도구는 같은 full assembly receipt·SHA marker를 먼저 검증한 뒤
+0건을 수용한다. 단독 빈 manifest는 거부하며, cutoff·품질 사유·최대 제외 수·기존
+학습/배포 승인은 바뀌지 않는다. 모델 파일은 처음과 마지막에 나눠 읽어 SHA를 검증해
+큰 GGUF 두 개를 RAM에 한꺼번에 보관하지 않는다.
+
 ## 현재 범위
 
 - 원본 이미지·무게·응답 저장 기능은 기존 `request_capture.py`에 구현되어 있다.
@@ -81,10 +94,17 @@ API 응답과 Spring 계약은 바꾸지 않는다. 검증에 실패하면 기�
   원시 응답, 추론 spec을 결박한다. 모델 간 합의는 독립 정답 정확도가 아니다.
   첫 실제 실행은 `localize_qwen_v4_8edcda3_20260904`이며 출력은
   `work/ctx8192/localizer_a`다. teacher 종료 및 모델 unload 후 순차 시작했고,
-  20장의 유효 bbox 응답을 확인했다. 이어서
-  `localize_ministral_v4_8edcda3_20260904`를 별도로 실행한다. provider B와
-  A/B 합의 검증 결과는 별도로 확인해야 한다.
-- 다음 단계는 A/B 위치 검증, 현재 계약의 teacher manifest/quality assembly,
+  20장의 유효 bbox 응답을 확인했다. B(Ministral3:3b)도 20장을 처리했지만
+  고정 IoU 0.75 기준 A/B 합의는 1장이었다. 기준을 낮추지 않고 더 강한
+  C(Qwen3.5:9b)를 한 번 비교했으며, GPU 복구 후 별도 retry01에서 완료했다.
+  C는 19장의 bbox를 생성하고 1장은 저신뢰 제외했다.
+- `manifest_operational_ac_v4_8edcda3_20260904`가 종료 코드 0으로 완료했다.
+  A/C IoU 0.75 위치 합의와 teacher manifest에 최종 포함된 학습 후보는 **9장**,
+  거부 기록은 11장이다. `work/ctx8192/teacher_manifest_ac`의 후보는 train-only다.
+  C는 재질 teacher와 같은 모델이므로 독립 재질 정답이나 blind 검증이 아니다.
+  품질 제외 0건도 모든 사진의 학습 적합성을 뜻하지 않는다. 위치 불일치 등
+  다른 사유로 거부된 사진은 그대로 제외한다.
+- 다음 단계는 현재 계약의 quality assembly,
   AIHub와의 라벨·누수 감사 및 후보학습이다. V4의 운영 pseudo-label provenance
   연결과 실제 frozen config/policy는 아직 완성되지 않았다. 승인 SHA를 임의로
   채워 학습을 강행하거나 고정 41장을 독립 blind로 사용하지 않는다.

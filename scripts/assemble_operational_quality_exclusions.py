@@ -31,6 +31,7 @@ try:
     import scripts.prepare_operational_capture_queue as capture_queue
     from scripts.build_operational_teacher_manifest import (
         ARTIFACT_NAMES,
+        CLASS_NAMES,
         EMPTY_SCENE_INVENTORY_FIELDS,
         EXTREME_EXPOSURE_FRACTION,
         MANIFEST_FIELDS,
@@ -41,13 +42,19 @@ try:
         OVEREXPOSED_LUMA_MIN,
         QUALITY_REASONS as TEACHER_DECISION_QUALITY_REASONS,
         TEACHER_LABEL_SCHEMA_VERSION,
+        TEACHER_LABEL_BASE_FIELDS,
         UNDEREXPOSED_LUMA_MAX,
         _teacher_consensus,
+        _teacher_contract_reasons,
+        _decision_tuple,
+        _confidence,
+        build_teacher_contract,
     )
     from scripts.build_v4_quality_exclusion_manifest import (
         QUALITY_EXCLUSION_CONTRACT,
         QUALITY_EXCLUSION_REASON_ALIASES,
         QUALITY_EXCLUSION_REASONS,
+        _manifest_value,
         _reject_symlink_components,
         _resolve_source,
         _stable_bytes,
@@ -57,6 +64,7 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
     import prepare_operational_capture_queue as capture_queue  # type: ignore[no-redef]
     from build_operational_teacher_manifest import (  # type: ignore[no-redef]
         ARTIFACT_NAMES,
+        CLASS_NAMES,
         EMPTY_SCENE_INVENTORY_FIELDS,
         EXTREME_EXPOSURE_FRACTION,
         MANIFEST_FIELDS,
@@ -67,13 +75,19 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
         OVEREXPOSED_LUMA_MIN,
         QUALITY_REASONS as TEACHER_DECISION_QUALITY_REASONS,
         TEACHER_LABEL_SCHEMA_VERSION,
+        TEACHER_LABEL_BASE_FIELDS,
         UNDEREXPOSED_LUMA_MAX,
         _teacher_consensus,
+        _teacher_contract_reasons,
+        _decision_tuple,
+        _confidence,
+        build_teacher_contract,
     )
     from build_v4_quality_exclusion_manifest import (  # type: ignore[no-redef]
         QUALITY_EXCLUSION_CONTRACT,
         QUALITY_EXCLUSION_REASON_ALIASES,
         QUALITY_EXCLUSION_REASONS,
+        _manifest_value,
         _reject_symlink_components,
         _resolve_source,
         _stable_bytes,
@@ -384,6 +398,29 @@ def _stable_regular_file(path: Path, *, description: str) -> tuple[Path, bytes]:
     return resolved, _stable_bytes(resolved, description=description)
 
 
+def _stable_file_sha256(path: Path, *, description: str) -> tuple[Path, str]:
+    """Hash large provider weights without retaining their bytes in RAM."""
+    _reject_symlink_components(path, description=description)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{description} must be a regular non-symlink file")
+    resolved = path.resolve(strict=True)
+    before = resolved.stat()
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        opened_before = os.fstat(handle.fileno())
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+        opened_after = os.fstat(handle.fileno())
+    _reject_symlink_components(path, description=description)
+    if path.resolve(strict=True) != resolved:
+        raise RuntimeError(f"{description} path changed while hashing")
+    after = resolved.stat()
+    identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+    if not (identity(before) == identity(opened_before) == identity(opened_after) == identity(after)):
+        raise RuntimeError(f"{description} changed while hashing")
+    return resolved, digest.hexdigest()
+
+
 def _stable_directory(path: Path, *, description: str) -> Path:
     if path.is_symlink() or not path.is_dir():
         raise ValueError(f"{description} must be a regular non-symlink directory")
@@ -472,7 +509,7 @@ def _validate_rejection_report(
 def _validate_lineage(
     value: object,
     *,
-    input_contents: Mapping[str, bytes],
+    input_sha256: Mapping[str, str],
     teacher_output_contents: Mapping[str, bytes],
     rejection_report: Mapping[str, object],
 ) -> float:
@@ -544,12 +581,12 @@ def _validate_lineage(
     inputs = value.get("inputs")
     if type(inputs) is not dict or set(inputs) != LINEAGE_INPUT_FIELDS:
         raise ValueError("teacher lineage inputs schema is not exact")
-    for name, content in input_contents.items():
+    for name, digest in input_sha256.items():
         field = f"{name}_sha256"
         expected = _require_sha(
             inputs.get(field), description=f"teacher lineage inputs.{field}"
         )
-        if expected != _sha256_bytes(content):
+        if expected != digest:
             raise ValueError(f"teacher lineage input binding mismatch: {name}")
     for field in ("provider_a_name", "provider_b_name"):
         if type(inputs.get(field)) is not str or not inputs[field].strip():
@@ -914,6 +951,67 @@ def _quality_rows(
 
     selected.sort(key=lambda row: row["path"])
     return selected, source_bindings
+
+
+def _validate_zero_exclusion_coverage(
+    *, queue_rows: Sequence[dict[str, object]], label_rows: Sequence[dict[str, object]],
+    rejections: Sequence[dict[str, object]], objective_prepare_output_dir: Path | None,
+) -> None:
+    """Zero means no confirmed exclusion, not that every image was accepted.
+
+    Valid completed nonconsensus remains rejected by the existing partition;
+    missing, errored, or unfinished teacher work cannot become empty success.
+    """
+    if objective_prepare_output_dir is None:
+        raise ValueError("zero exclusions require full objective and subjective evidence")
+    queue_by_sha, _ = _index_unique_rows(queue_rows, description="zero-exclusion teacher queue")
+    labels_by_sha, _ = _index_unique_rows(label_rows, description="zero-exclusion teacher labels")
+    if not queue_by_sha or set(queue_by_sha) != set(labels_by_sha):
+        raise ValueError("zero exclusions require a nonempty fully labeled teacher queue")
+    rejected_by_sha = {row["sha256"]: row for row in rejections}
+    for sha, queue in queue_by_sha.items():
+        label = labels_by_sha[sha]
+        if label.get("input_image_sha256") != sha or label.get("image_ref") != queue.get("image_ref"):
+            raise ValueError("zero-exclusion teacher source binding mismatch")
+        passes = label.get("passes")
+        expected_fields = set(TEACHER_LABEL_BASE_FIELDS)
+        raw_fields = set(label) - {"_input_line"}
+        if (
+            raw_fields not in (expected_fields, expected_fields | {"independent_localization"})
+            or _teacher_contract_reasons(label)
+            or label.get("schema_version") != TEACHER_LABEL_SCHEMA_VERSION
+            or type(label.get("errors")) is not list or label["errors"]
+            or type(passes) is not list or len(passes) not in (2, 3)
+        ):
+            raise ValueError("zero exclusions require completed subjective quality decisions")
+        expected_contract, _ = build_teacher_contract(label["model"], label["model_digest"])
+        if not _exact_typed_value(label["teacher_contract"], expected_contract):
+            raise ValueError("zero exclusions require the exact typed teacher contract")
+        tuples = []
+        for item in passes:
+            if (
+                type(item) is not dict
+                or set(item) != {"material", "confidence", "single_object", "foreign_material", "training_usable", "quality_reason"}
+                or item.get("material") not in (*CLASS_NAMES, "negative", "exclude")
+                or _confidence(item.get("confidence")) is None
+                or _decision_tuple(item) is None
+            ):
+                raise ValueError("zero exclusions require completed valid teacher passes")
+            tuples.append(_decision_tuple(item))
+        decision, reasons = _teacher_consensus(label)
+        if label.get("consensus") is False:
+            if (
+                label.get("consensus_decision") is not None
+                or _confidence(label.get("minimum_confidence")) != 0.0
+                or len(passes) != 3
+            ):
+                raise ValueError("zero exclusions require completed subjective quality decisions")
+            rejection = rejected_by_sha.get(sha)
+            if (len(set(tuples)) != 3 or rejection is None
+                    or "no_exact_tuple_consensus" not in rejection["reasons"]):
+                raise ValueError("completed nonconsensus must remain an exact teacher rejection")
+        elif decision is None or reasons:
+            raise ValueError("zero exclusions require completed subjective quality decisions")
 
 
 def _objective_quality_rows(
@@ -1508,10 +1606,17 @@ def assemble_operational_quality_exclusions(
     }
     resolved_inputs: dict[str, Path] = {}
     input_contents: dict[str, bytes] = {}
+    input_sha256: dict[str, str] = {}
+    streaming_inputs = {"provider_a_model", "provider_b_model"}
     for name, path in input_paths.items():
-        resolved, content = _stable_regular_file(path, description=name)
+        if name in streaming_inputs:
+            resolved, digest = _stable_file_sha256(path, description=name)
+        else:
+            resolved, content = _stable_regular_file(path, description=name)
+            input_contents[name] = content
+            digest = _sha256_bytes(content)
         resolved_inputs[name] = resolved
-        input_contents[name] = content
+        input_sha256[name] = digest
 
     teacher_output_dir = _stable_directory(
         teacher_output_dir, description="teacher output directory"
@@ -1579,7 +1684,7 @@ def assemble_operational_quality_exclusions(
     )
     minimum_confidence = _validate_lineage(
         lineage_value,
-        input_contents=input_contents,
+        input_sha256=input_sha256,
         teacher_output_contents=teacher_output_contents,
         rejection_report=rejection_value,
     )
@@ -1637,8 +1742,6 @@ def assemble_operational_quality_exclusions(
         )
     quality_rows = [*subjective_quality_rows, *objective_quality_rows]
     source_bindings = [*subjective_source_bindings, *objective_source_bindings]
-    if not quality_rows:
-        raise ValueError("no eligible post-cutoff quality exclusions")
     if len({row["path"] for row in quality_rows}) != len(quality_rows):
         raise ValueError("quality evidence overlaps by source path")
     quality_rows.sort(key=lambda row: row["path"])
@@ -1651,6 +1754,13 @@ def assemble_operational_quality_exclusions(
         minimum_confidence=minimum_confidence,
         selected_shas={sha for _, _, sha, _ in source_bindings},
     )
+    if not quality_rows:
+        _validate_zero_exclusion_coverage(
+            queue_rows=queue_rows,
+            label_rows=label_rows,
+            rejections=rejections,
+            objective_prepare_output_dir=objective_prepare_output_dir,
+        )
 
     repo_root = Path(__file__).resolve().parents[1]
     code_paths = {
@@ -1673,15 +1783,21 @@ def assemble_operational_quality_exclusions(
         tempfile.mkdtemp(prefix=f".{normalized_output.name}.", dir=output_parent)
     )
     try:
-        source_csv = staging / "source-list.csv"
-        source_csv.write_bytes(_source_csv_bytes(quality_rows))
         manifest_path = staging / ASSEMBLY_FILES["manifest"]
-        manifest = build_quality_exclusion_manifest(
-            source_list=source_csv,
-            image_root=image_root,
-            output_path=manifest_path,
-        )
-        source_csv.unlink()
+        if quality_rows:
+            source_csv = staging / "source-list.csv"
+            source_csv.write_bytes(_source_csv_bytes(quality_rows))
+            manifest = build_quality_exclusion_manifest(
+                source_list=source_csv,
+                image_root=image_root,
+                output_path=manifest_path,
+            )
+            source_csv.unlink()
+        else:
+            # Only this full validated path may stage an empty manifest. The
+            # standalone CSV producer has no allow-empty switch or authority.
+            manifest = _manifest_value([])
+            manifest_path.write_bytes(_json_bytes(manifest))
         manifest_content = _stable_bytes(
             manifest_path, description="assembled quality manifest"
         )
@@ -1722,8 +1838,8 @@ def assemble_operational_quality_exclusions(
             "quality_source_list_sha256": manifest["source_list_sha256"],
             "input_sha256": {
                 **{
-                    name: _sha256_bytes(content)
-                    for name, content in sorted(input_contents.items())
+                    name: digest
+                    for name, digest in sorted(input_sha256.items())
                 },
                 **{
                     f"teacher_output_{name}": _sha256_bytes(content)
@@ -1771,9 +1887,12 @@ def assemble_operational_quality_exclusions(
         marker_path.write_bytes(marker_content)
 
         for name, path in resolved_inputs.items():
-            if _stable_bytes(path, description=f"final input rehash {name}") != input_contents[
-                name
-            ]:
+            if name in streaming_inputs:
+                _, current_digest = _stable_file_sha256(path, description=f"final input rehash {name}")
+                unchanged = current_digest == input_sha256[name]
+            else:
+                unchanged = _stable_bytes(path, description=f"final input rehash {name}") == input_contents[name]
+            if not unchanged:
                 raise RuntimeError(f"assembler input changed before publish: {name}")
         for name, path in resolved_teacher_outputs.items():
             if _stable_bytes(

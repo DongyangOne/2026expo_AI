@@ -220,7 +220,7 @@ def _write_assembly_receipt(manifest: Path) -> None:
         "observed_code_sha256": authority_builder._quality_assembly_code_hashes(),
         "scope": {
             "teacher_subjective_quality_included": False,
-            "objective_queue_quality_included": True,
+            "objective_queue_quality_included": count > 0,
             "objective_prepare_bundle_validated": True,
             "subjective_quality_source_count": 0,
             "objective_quality_source_count": count,
@@ -349,6 +349,64 @@ def test_deterministic_selection_and_invalid_source_quarantine(tmp_path: Path) -
     assert counts["malformed_label/invalid_column_count"] == 1
     assert counts["missing_label_file"] == 1
     assert counts["unreadable_image"] == 1
+
+
+def test_empty_quality_exclusions_require_full_assembly_and_preserve_bindings(tmp_path: Path) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path, [])
+    value = json.loads(manifest.read_bytes())
+    with pytest.raises(ValueError):
+        authority_builder._validate_quality_manifest(value)
+    output = tmp_path / "empty-quality-pilot"
+    build_pilot_inputs(
+        data_path=data, dataset_dir=dataset_dir, output_dir=output,
+        quality_exclusion_manifest=manifest,
+        quality_exclusion_assembly_receipt=_receipt(tmp_path),
+        training_quota=1, validation_quota=1,
+    )
+    info = _inventory(output)["quality_exclusion"]
+    assert info["required"] is True
+    assert info["excluded_source_count"] == info["matched_resolved_sources"] == 0
+    assert info["reason_counts"] == {}
+    assert info["source_list_sha256"] == hashlib.sha256(b"[]\n").hexdigest()
+    assert info["assembly_receipt_sha256"] == _sha(_receipt(tmp_path))
+    ready = json.loads((output / "input_ready.json").read_bytes())
+    assert ready["quality_exclusion"]["excluded_source_count"] == 0
+    assert ready["quality_exclusion"]["training_authority"] is False
+
+
+@pytest.mark.parametrize("mutation", ["missing_receipt", "null_entries", "false_count", "float_count", "fake_reason", "legacy_mode"])
+def test_empty_quality_selector_does_not_mean_missing_or_unvalidated(tmp_path: Path, mutation: str) -> None:
+    data, dataset_dir, _ = _fixture(tmp_path)
+    manifest = _quality_manifest(tmp_path, [])
+    receipt = _receipt(tmp_path)
+    if mutation == "missing_receipt":
+        receipt.unlink()
+    elif mutation == "legacy_mode":
+        value = json.loads(receipt.read_bytes())
+        value["assembly_mode"] = "legacy_subjective_only"
+        _seal_receipt(manifest, value)
+    else:
+        value = json.loads(manifest.read_bytes())
+        if mutation == "null_entries":
+            value["entries"] = None
+        elif mutation == "false_count":
+            value["excluded_source_count"] = False
+        elif mutation == "float_count":
+            value["excluded_source_count"] = 0.0
+        else:
+            value["reason_counts"] = {"severe_frame_crop": 1}
+        manifest.write_bytes(authority_builder._canonical_json(value))
+        _write_assembly_receipt(manifest)
+    output = tmp_path / "invalid-empty-quality"
+    with pytest.raises((ValueError, FileNotFoundError)):
+        build_pilot_inputs(
+            data_path=data, dataset_dir=dataset_dir, output_dir=output,
+            quality_exclusion_manifest=manifest,
+            quality_exclusion_assembly_receipt=receipt,
+            training_quota=1, validation_quota=1,
+        )
+    assert not (output / "input_ready.json").exists()
 
 
 def test_historical_drift_anchor_is_selection_only_and_has_priority(tmp_path: Path) -> None:

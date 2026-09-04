@@ -167,3 +167,68 @@ def test_real_prepare_assembler_qx3_wrappers_and_candidate_share_quality_evidenc
     }
     assert authority["production_deployment_authorized"] is False
     assert (fixture["global_root"] / "authority" / "training_authority.sha256").is_file()
+
+
+def test_real_zero_exclusion_assembly_reaches_selector_wrappers_and_preaudit(
+    tmp_path: Path, tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Real empty assembly is evidence, not an empty-file skip or model accuracy."""
+    from scripts.build_v4_repro_pilot_inputs import build_pilot_inputs
+    from scripts.operational_quality_assembly_contract import _validate_quality_manifest
+
+    operational = _helpers("test_build_operational_teacher_manifest")
+    qx3 = _helpers("test_run_v4_repro_pilot_validation")
+    selector = _helpers("test_build_v4_repro_pilot_inputs")
+    candidate = _helpers("test_build_v4_candidate_training_authority")
+    args, _, _ = operational._objective_quality_assembly_fixture(
+        tmp_path / "operational-empty", no_quality_exclusions=True,
+    )
+    assembled = operational.assemble_operational_quality_exclusions(**args)
+    assert assembled["selected_source_count"] == 0
+    assert assembled["scope"]["objective_prepare_bundle_validated"] is True
+    assert not any(assembled["authority"].values())
+    manifest = args["output_dir"] / operational.ASSEMBLY_FILES["manifest"]
+    receipt = args["output_dir"] / operational.ASSEMBLY_FILES["receipt"]
+    empty_value = json.loads(manifest.read_text(encoding="utf-8"))
+    assert empty_value["entries"] == []
+    with pytest.raises(ValueError, match="validated full assembly"):
+        _validate_quality_manifest(empty_value)
+
+    data, dataset, _ = selector._fixture(tmp_path / "selector-sources")
+    ready = build_pilot_inputs(
+        data_path=data, dataset_dir=dataset, output_dir=tmp_path / "actual-selector",
+        quality_exclusion_manifest=manifest,
+        quality_exclusion_assembly_receipt=receipt,
+        seed=20260901, training_quota=1, validation_quota=1,
+    )
+    assert ready["full_quota_met"] is True
+    assert ready["bindings"]["quality_exclusions_sha256"] == _sha(manifest)
+    assert ready["bindings"]["quality_exclusion_assembly_receipt_sha256"] == _sha(receipt)
+    inventory = json.loads(
+        (tmp_path / "actual-selector" / "selection_inventory.json").read_text(encoding="utf-8")
+    )
+    assert inventory["quality_exclusion"]["matched_resolved_sources"] == 0
+
+    # Wrappers use explicit replay/selector doubles; the quality bundle is real.
+    cohort = qx3.cohort_base.__wrapped__(tmp_path_factory)
+    env = qx3._fixture(tmp_path / "qx3-empty", cohort=cohort, quality_bundle=(manifest, receipt))
+    result = subprocess.run(
+        [qx3._integration_bash(tmp_path), qx3.SCRIPT.as_posix()],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    diagnostic = json.loads(
+        (Path(env["VALIDATION_DIR"]) / "control" / "diagnostic_ready.json").read_text(encoding="utf-8")
+    )
+    assert diagnostic["bindings"]["quality_exclusions_sha256"] == _sha(manifest)
+    assert diagnostic["training_authority"] is False
+
+    fixture = candidate._fixture(tmp_path_factory.mktemp("candidate-empty-quality"))
+    fixture["quality"] = manifest
+    fixture["quality_assembly_receipt"] = receipt
+    candidate._refresh(fixture)
+    proposal = candidate._build_preaudit_proposal(fixture)
+    assert proposal["bindings"]["quality_exclusions_sha256"] == _sha(manifest)
+    assert proposal["bindings"]["quality_exclusion_assembly_receipt_sha256"] == _sha(receipt)
+    assert proposal["counts"]["excluded"] == {"operational/before_2026_08_01_kst": 1}
+    assert not (fixture["global_root"] / "authority" / "training_authority.sha256").exists()

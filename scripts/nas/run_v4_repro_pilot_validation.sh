@@ -431,7 +431,6 @@ exec(compile(quality_validator_content, str(quality_validator_path), "exec"), qu
 quality_value, quality_content = quality_validator._load_json(
     quality_manifest_path, "QX3 quality manifest"
 )
-quality_validator._validate_quality_manifest(quality_value)
 quality_bundle = quality_validator._validate_operational_quality_assembly(
     receipt_path=quality_receipt_path,
     quality_path=quality_manifest_path,
@@ -439,6 +438,7 @@ quality_bundle = quality_validator._validate_operational_quality_assembly(
     quality_content=quality_content,
     output_dir=validation_dir,
 )
+quality_validator._validate_quality_manifest(quality_value, assembly_bundle=quality_bundle)
 quality_receipt = json.loads(quality_bundle.receipt_content)
 quality_assembly_metadata = {
     "assembly_schema": quality_receipt["assembly_schema"],
@@ -542,8 +542,8 @@ expected_manifest_authority = {
 if not exact_json_equal(quality_authority, expected_manifest_authority):
     raise ValueError("quality exclusion manifest grants authority or has invalid authority fields")
 quality_entries = quality_manifest.get("entries")
-if not isinstance(quality_entries, list) or not 1 <= len(quality_entries) <= 100:
-    raise ValueError("quality exclusion manifest entries must contain 1..100 rows")
+if not isinstance(quality_entries, list) or not 0 <= len(quality_entries) <= 100:
+    raise ValueError("quality exclusion manifest entries must contain 0..100 rows")
 excluded_source_ids = set()
 actual_quality_reason_counts = Counter()
 for index, entry in enumerate(quality_entries):
@@ -1500,7 +1500,7 @@ ready = json.loads(ready_path.read_text(encoding="utf-8"))
 selection = json.loads(selection_path.read_text(encoding="utf-8"))
 quality_manifest = json.loads(quality_manifest_path.read_text(encoding="utf-8"))
 quality_entries = quality_manifest.get("entries")
-if not isinstance(quality_entries, list) or not quality_entries:
+if not isinstance(quality_entries, list):
     raise ValueError("quality exclusion manifest entries are missing")
 excluded_source_ids = {
     str(entry.get("source_sha256", ""))
@@ -2413,7 +2413,7 @@ if (
     or cohort.get("quality_exclusion_absent_from_selection_and_raw") is not True
     or not isinstance(cohort.get("quality_excluded_sources"), int)
     or isinstance(cohort.get("quality_excluded_sources"), bool)
-    or cohort.get("quality_excluded_sources") <= 0
+    or cohort.get("quality_excluded_sources") < 0
 ):
     raise ValueError("pilot cohort quality exclusion evidence is invalid")
 payload = {

@@ -124,11 +124,15 @@ def _reject_symlink_components(path: Path, *, description: str) -> None:
 
 
 def _manifest_value(entries: list[dict[str, str]]) -> dict[str, object]:
+    """Serialize the contract; this helper does not validate or publish evidence.
+
+    Empty values are used only inside the full operational assembler after its
+    objective and subjective coverage checks. The standalone producer still
+    requires a nonempty adjudication source list.
+    """
     if any(entry.get("reason") not in QUALITY_EXCLUSION_REASONS for entry in entries):
         raise ValueError("quality exclusion manifest entries must use canonical reasons")
     entries = sorted(entries, key=lambda item: item["source_sha256"])
-    if not entries:
-        raise ValueError("quality exclusion manifest must contain at least one source")
     if len(entries) > QUALITY_EXCLUSION_MAX_SOURCES:
         raise ValueError(
             "quality exclusion manifest exceeds max_excluded_sources="
@@ -254,6 +258,11 @@ def build_quality_exclusion_manifest(
         source_bindings.append((source, source_sha256))
         entries.append({"source_sha256": source_sha256, "reason": reason})
 
+    if not entries:
+        raise ValueError(
+            "quality exclusion manifest must contain at least one source; "
+            "zero exclusions require the full operational quality assembler"
+        )
     manifest = _manifest_value(entries)
 
     # Rehash all authority inputs immediately before the immutable publication.

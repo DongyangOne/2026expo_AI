@@ -157,7 +157,7 @@ def _write_quality_assembly_bundle(
     assert isinstance(selected_count, int)
     scope: dict[str, object] = {
         "teacher_subjective_quality_included": False,
-        "objective_queue_quality_included": True,
+        "objective_queue_quality_included": selected_count > 0,
         "objective_prepare_bundle_validated": True,
         "subjective_quality_source_count": 0,
         "objective_quality_source_count": selected_count,
@@ -1681,6 +1681,47 @@ def test_happy_path_filters_old_and_bad_but_keeps_dented(tmp_path: Path) -> None
     assert authority["bindings"]["dataset_snapshot_publish_receipt_sha256"] == _sha(  # type: ignore[index]
         authority_builder._canonical_json(receipt)
     )
+
+
+def test_empty_quality_full_assembly_reaches_preaudit_and_final_authority(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _write_quality_assembly_bundle(fixture["quality"].parent, _quality_value([]))
+    _refresh(fixture)
+    with pytest.raises(ValueError):
+        authority_builder._validate_quality_manifest(_quality_value([]))
+    proposal = _build_preaudit_proposal(fixture)
+    assert proposal["training_authority"] is False
+    assert not any(key.startswith("quality/") for key in proposal["counts"]["excluded"])
+    assert proposal["bindings"]["quality_exclusion_assembly_receipt_sha256"] == _sha(
+        fixture["quality_assembly_receipt"].read_bytes()
+    )
+    final = _run(fixture, output_name="empty-quality-authority")
+    assert final["bindings"]["quality_exclusions_sha256"] == _sha(fixture["quality"].read_bytes())
+    assert final["bindings"]["quality_exclusion_assembly_receipt_sha256"] == _sha(
+        fixture["quality_assembly_receipt"].read_bytes()
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing_receipt", "legacy", "false_count", "fake_positive_scope"])
+def test_empty_quality_candidate_still_requires_complete_evidence(tmp_path: Path, mutation: str) -> None:
+    fixture = _fixture(tmp_path)
+    _write_quality_assembly_bundle(fixture["quality"].parent, _quality_value([]))
+    _refresh(fixture)
+    if mutation == "missing_receipt":
+        fixture["quality_assembly_receipt"].unlink()
+    else:
+        def mutate(receipt):
+            if mutation == "legacy":
+                receipt["assembly_mode"] = "legacy_subjective_only"
+            elif mutation == "false_count":
+                receipt["selected_source_count"] = False
+            else:
+                receipt["scope"]["objective_quality_source_count"] = 1
+                receipt["scope"]["objective_queue_quality_included"] = True
+        _rewrite_quality_assembly_receipt(fixture, mutate)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        _build_preaudit_proposal(fixture)
+    assert not (fixture["global_root"] / "preaudit-proposal" / "preaudit_proposal.sha256").exists()
 
 
 def test_preaudit_proposal_is_non_authoritative_and_final_bytes_match(

@@ -288,6 +288,11 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
             "reason": "excessive_background_or_multi_object",
         }
     ]
+    if mode.startswith("empty_quality"):
+        quality_entries = []
+    quality_reason_counts = (
+        {"excessive_background_or_multi_object": 1} if quality_entries else {}
+    )
     quality_dir = tmp_path / "quality-assembly"
     quality_dir.mkdir()
     quality_manifest = quality_dir / "operational_quality_exclusions.json"
@@ -301,9 +306,9 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
                 ),
                 "quality_exclusion_contract": QUALITY_CONTRACT,
                 "status": "quality_exclusions_ready",
-                "excluded_source_count": 1,
+                "excluded_source_count": len(quality_entries),
                 "max_excluded_sources": 100,
-                "reason_counts": {"excessive_background_or_multi_object": 1},
+                "reason_counts": quality_reason_counts,
                 "source_list_sha256": _entries_sha(quality_entries),
                 "entries": quality_entries,
                 "authority": {
@@ -319,6 +324,13 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
         )
     )
     quality_value = json.loads(quality_manifest.read_bytes())
+    if mode == "empty_quality_manifest_count_bool":
+        quality_value["excluded_source_count"] = False
+    elif mode == "empty_quality_manifest_count_float":
+        quality_value["excluded_source_count"] = 0.0
+    elif mode == "empty_quality_fake_reason":
+        quality_value["reason_counts"] = {"severe_frame_crop": 0}
+    quality_manifest.write_bytes(authority_builder._canonical_json(quality_value))
     quality_receipt = quality_dir / "operational_quality_exclusion_assembly.json"
     quality_marker = quality_dir / "assembly.sha256"
     receipt_value = {
@@ -330,7 +342,7 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
         "quality_exclusion_contract": QUALITY_CONTRACT,
         "operational_capture_cutoff_kst": "2026-08-01T00:00:00+09:00",
         "teacher_label_schema_version": authority_builder.QUALITY_ASSEMBLY_TEACHER_SCHEMA,
-        "selected_source_count": 1,
+        "selected_source_count": len(quality_entries),
         "reason_counts": quality_value["reason_counts"],
         "quality_manifest_sha256": _sha(quality_manifest),
         "quality_source_list_sha256": quality_value["source_list_sha256"],
@@ -338,10 +350,10 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
         "observed_code_sha256": authority_builder._quality_assembly_code_hashes(),
         "scope": {
             "teacher_subjective_quality_included": False,
-            "objective_queue_quality_included": True,
+            "objective_queue_quality_included": bool(quality_entries),
             "objective_prepare_bundle_validated": True,
             "subjective_quality_source_count": 0,
-            "objective_quality_source_count": 1,
+            "objective_quality_source_count": len(quality_entries),
             "paths_or_private_ids_exported": False,
             "trusted_policy_pinned": False,
             "executed_code_cryptographically_attested": False,
@@ -360,6 +372,16 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
         receipt_value["quality_manifest_sha256"] = "f" * 64
     elif mode == "assembly_observed_code_mismatch":
         receipt_value["observed_code_sha256"]["assembler"] = "e" * 64
+    elif mode == "empty_quality_receipt_count_bool":
+        receipt_value["selected_source_count"] = False
+    elif mode == "empty_quality_scope_count_bool":
+        receipt_value["scope"]["objective_quality_source_count"] = False
+    elif mode == "empty_quality_fake_positive":
+        receipt_value["selected_source_count"] = 1
+        receipt_value["scope"]["objective_quality_source_count"] = 1
+        receipt_value["scope"]["objective_queue_quality_included"] = True
+    elif mode == "empty_quality_prepare_unvalidated":
+        receipt_value["scope"]["objective_prepare_bundle_validated"] = False
     quality_receipt.write_bytes(authority_builder._canonical_json(receipt_value))
     quality_marker.write_bytes(authority_builder._quality_assembly_marker_bytes(
         manifest_content=quality_manifest.read_bytes(), receipt_content=quality_receipt.read_bytes(),
@@ -487,10 +509,10 @@ def _fixture(tmp_path: Path, *, mode: str = "success") -> dict[str, str]:
             "assembly_validator_path": validator.resolve().as_posix(),
             "assembly_validator_sha256": _sha(validator),
             "source_list_sha256": _entries_sha(quality_entries),
-            "excluded_source_count": 1,
+            "excluded_source_count": len(quality_entries),
             "max_excluded_sources": 100,
-            "matched_resolved_sources": 1,
-            "reason_counts": {"excessive_background_or_multi_object": 1},
+            "matched_resolved_sources": len(quality_entries),
+            "reason_counts": quality_reason_counts,
             "selection_authority": False,
             "ground_truth_authority": False,
             "replay_authority": False,
@@ -723,6 +745,75 @@ def test_wrapper_contract_is_cpu_only_immutable_and_fail_closed() -> None:
         "token=",
     ):
         assert token not in lowered
+
+
+def test_empty_quality_full_assembly_seals_zero_exclusions(tmp_path: Path) -> None:
+    result, env = _run(tmp_path, mode="empty_quality")
+    assert result.returncode == 0, result.stderr
+    audit = Path(env["AUDIT_DIR"])
+    ready = json.loads((audit / "selection_audit_ready.json").read_bytes())
+    evidence = json.loads((audit / "selection_audit_evidence.json").read_bytes())
+    for artifact in (ready, evidence):
+        quality = artifact["quality_exclusion"]
+        assert type(quality["excluded_source_count"]) is int
+        assert quality["excluded_source_count"] == 0
+        assert quality["reason_counts"] == {}
+        assert quality["source_list_sha256"] == _entries_sha([])
+        assert quality["objective_prepare_bundle_validated"] is True
+        assert artifact["bindings"]["quality_exclusion_assembly_receipt_sha256"] == _sha(
+            Path(env["QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"])
+        )
+        assert artifact["bindings"]["quality_exclusions_sha256"] == _sha(
+            Path(env["QUALITY_EXCLUSION_MANIFEST"])
+        )
+    assert evidence["quality_exclusion"]["matched_resolved_sources"] == 0
+    assert ready["training_authority"] is False
+    assert ready["production_deployment_authorized"] is False
+    assert not (audit / "failed.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "empty_quality_manifest_count_bool",
+        "empty_quality_manifest_count_float",
+        "empty_quality_receipt_count_bool",
+        "empty_quality_scope_count_bool",
+        "empty_quality_fake_positive",
+        "empty_quality_fake_reason",
+        "empty_quality_prepare_unvalidated",
+    ),
+)
+def test_empty_quality_malformed_evidence_cannot_publish_ready(
+    tmp_path: Path, mode: str
+) -> None:
+    result, env = _run(tmp_path, mode=mode)
+    assert result.returncode != 0
+    audit = Path(env["AUDIT_DIR"])
+    assert (audit / "failed.txt").is_file()
+    assert not (audit / "selection_audit_ready.json").exists()
+
+
+@pytest.mark.parametrize("receipt_present", (False, True))
+def test_empty_quality_requires_receipt_and_rehashes_it(
+    tmp_path: Path, receipt_present: bool
+) -> None:
+    env = _fixture(tmp_path, mode="empty_quality")
+    if receipt_present:
+        env["FAKE_MUTATE_AFTER_SELECTOR_TARGET"] = env[
+            "QUALITY_EXCLUSION_ASSEMBLY_RECEIPT"
+        ]
+    else:
+        env.pop("QUALITY_EXCLUSION_ASSEMBLY_RECEIPT")
+    result = subprocess.run(
+        [_integration_bash(tmp_path), SCRIPT.as_posix()],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    audit = Path(env["AUDIT_DIR"])
+    assert not (audit / "selection_audit_ready.json").exists()
+    if receipt_present:
+        assert (audit / "failed.txt").is_file()
 
 
 def test_integration_success_seals_exact_external_contract(tmp_path: Path) -> None:

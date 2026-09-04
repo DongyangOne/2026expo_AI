@@ -2981,13 +2981,17 @@ def _build_candidate_bundle(
     config_value, config_content = _load_json(training_config, "training config")
 
     origins = _validate_license_allowlist(license_value)
-    excluded_sources = _validate_quality_manifest(quality_value)
+    if quality_value.get("entries"):
+        _validate_quality_manifest(quality_value)
     quality_assembly_bundle = _validate_operational_quality_assembly(
         receipt_path=quality_exclusion_assembly_receipt,
         quality_path=quality_exclusions,
         quality_value=quality_value,
         quality_content=quality_content,
         output_dir=final,
+    )
+    excluded_sources = _validate_quality_manifest(
+        quality_value, assembly_bundle=quality_assembly_bundle
     )
     protected = _validate_protected_sources(protected_value)
     _validate_training_config(config_value)

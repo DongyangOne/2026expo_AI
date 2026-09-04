@@ -573,6 +573,9 @@ print(json.dumps(report,sort_keys=True))
         else [{"source_sha256": quality_source_sha, "reason": quality_reason}]
     )
     quality_count = len(quality_entries)
+    if mode == "quality_empty":
+        quality_entries = []
+        quality_count = 0
     canonical_quality_bytes = (
         json.dumps(
             quality_entries,
@@ -600,7 +603,7 @@ print(json.dumps(report,sort_keys=True))
         "status": "quality_exclusions_ready",
         "excluded_source_count": quality_count,
         "max_excluded_sources": 100,
-        "reason_counts": {quality_reason: quality_count},
+        "reason_counts": {quality_reason: quality_count} if quality_count else {},
         "source_list_sha256": hashlib.sha256(canonical_quality_bytes).hexdigest(),
         "entries": quality_entries,
         "authority": {
@@ -638,7 +641,7 @@ print(json.dumps(report,sort_keys=True))
         "input_sha256": {name: hashlib.sha256(name.encode()).hexdigest() for name in quality_authority.QUALITY_ASSEMBLY_INPUT_SHA_FIELDS},
         "observed_code_sha256": quality_authority._quality_assembly_code_hashes(),
         "scope": {
-            "teacher_subjective_quality_included": True,
+            "teacher_subjective_quality_included": quality_count > 0,
             "objective_queue_quality_included": False,
             "objective_prepare_bundle_validated": True,
             "subjective_quality_source_count": quality_count,
@@ -1321,7 +1324,7 @@ print(json.dumps(report,sort_keys=True))
 
     selection_counter = tmp_path / "selection-selector-count.txt"
     selection_audit_for_validation = selection_audit
-    if mode == "success":
+    if mode in {"success", "quality_empty"}:
         real_selection_audit = tmp_path / "real-selection-audit"
         audit_env = {
             **os.environ,
@@ -1790,10 +1793,11 @@ def test_rejects_quality_manifest_ancestor_symlink(
     assert not (control / "diagnostic_ready.json").exists()
 
 
+@pytest.mark.parametrize("mode", ["success", "quality_empty"])
 def test_integration_success_seals_two_exact_runs(
-    tmp_path: Path, cohort_base: dict[str, object]
+    tmp_path: Path, cohort_base: dict[str, object], mode: str
 ) -> None:
-    result, env = _run(tmp_path, cohort_base)
+    result, env = _run(tmp_path, cohort_base, mode=mode)
     assert result.returncode == 0, result.stderr
     assert Path(env["FAKE_SELECTION_COUNTER"]).read_text(encoding="ascii") == "1"
     root = Path(env["VALIDATION_DIR"])
@@ -1809,7 +1813,7 @@ def test_integration_success_seals_two_exact_runs(
     assert ready["selected_drift_anchors"] > 0
     assert ready["emitted_drift_anchors"] == ready["selected_drift_anchors"]
     assert ready["quality_exclusion_required"] is True
-    assert ready["quality_excluded_sources"] == 1
+    assert ready["quality_excluded_sources"] == (0 if mode == "quality_empty" else 1)
     assert ready["quality_exclusion_dataset_membership_verified"] is True
     assert ready[
         "quality_exclusion_membership_attested_by_cpu_selector_audit"

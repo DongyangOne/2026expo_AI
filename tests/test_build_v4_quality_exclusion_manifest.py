@@ -16,6 +16,7 @@ from scripts.build_v4_candidate_training_authority import (
 from scripts.build_v4_quality_exclusion_manifest import (
     QUALITY_EXCLUSION_REASON_ALIASES,
     QUALITY_EXCLUSION_REASONS,
+    _manifest_value,
     build_quality_exclusion_manifest,
     build_single_quality_exclusion_manifest,
 )
@@ -367,6 +368,18 @@ def test_builder_rejects_empty_adjudication(tmp_path: Path) -> None:
             image_root=root,
             output_path=tmp_path / "manifest.json",
         )
+
+
+def test_empty_serialization_is_not_standalone_evidence() -> None:
+    value = _manifest_value([])
+    assert value["entries"] == []
+    assert value["excluded_source_count"] == 0
+    assert value["reason_counts"] == {}
+    assert value["source_list_sha256"] == _entries_sha([])
+    with pytest.raises(ValueError, match="validated full assembly bundle"):
+        _validate_quality_manifest(value)
+    with pytest.raises(ValueError, match="validated full assembly bundle"):
+        _validate_quality_manifest(value, assembly_bundle=True)
 
 
 def test_builder_rejects_more_than_100_exclusions(tmp_path: Path) -> None:

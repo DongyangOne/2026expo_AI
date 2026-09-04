@@ -12,19 +12,25 @@ NAS 클래스/상태별 표본 수와 모델 정확도는 아직 미확인이다
 - 실제 training config·license/protected evidence·host inspect를 결박한 승인 policy.
   `configs/v4_candidate_training_trusted_policy.json`은 아직 없고 builder/launcher의
   `APPROVED_TRUSTED_POLICY_SHA256`은 `UNCONFIGURED`다. 테스트 fixture는 승인 자료가 아니다.
-- 추가 blocker: 새 20장에 확정 품질실패가 0건이어도 현재 producer(`build_v4_quality_exclusion_manifest.py:130`)와 shared contract(`operational_quality_assembly_contract.py:257`)는 빈 entries를 거부한다. 정상 empty 경로를 명시적으로 구현·검증해야 하며 가짜 실패를 만들면 안 된다.
+- 확정 품질실패 0건 처리: 전체 objective+subjective assembly 및 QX3/candidate
+  소비자의 전용 경로를 구현했다. 단독 빈 manifest는 계속 거부하며, 완료된 비합의
+  사진은 거부 기록에 남긴다. 실제 NAS 조립 성공 여부는 아래 실행 기록으로 확인한다.
 
 ## 다음 작업: 한 번에 한 단계씩
 
 1. **실제 입력 목록을 고정한다.** 현재 운영 배치 식별자는
    `operational_refresh_80bf78a_20260904_101000`이다. 다음 실행에서 NAS의 실제
-   queue/known-audit/capture-inventory, 새 8192-context teacher 결과, A/B provider
+   queue/known-audit/capture-inventory, 새 8192-context teacher 결과, A/C provider
    manifest·실제 GGUF·spec, full quality assembly의 경로와 SHA를 확인해 기록한다.
    원본 상대경로·오류 출력을 보존한다. 아래는 **과거 watcher의 탐색 시작점이며 현재 미확인**이다.
    `/share/Container/runs/trash_v2_full-2/weights/best.pt`,
    `/share/Container/yolo_mixed_replay_v2_20260819/dataset_mixed.yaml`,
    `/share/Container/hardware_capture_prep_20260803/dataset_v2/yolo/images/val`.
    마지막 경로의 고정 41장은 진단/calibration 전용이다.
+   A/C 단계는 실제 완료했다. 출력 `work/ctx8192/teacher_manifest_ac`에는 train-only
+   후보 9장이 있으며 11장은 거부되었다. provider B 인자에는 성공한
+   `work/ctx8192/localizer_c_qwen35_retry01`의 증거를 사용한다. 실패한 C의 기존
+   출력과 A/B 결과를 덮어쓰거나 다시 실행하지 않는다.
 
 2. **source 단위 증거를 먼저 만든다.** 변경 위치는
    `scripts/build_operational_teacher_manifest.py`의 `MANIFEST_FIELDS`와 accepted-row/
