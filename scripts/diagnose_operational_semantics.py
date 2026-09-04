@@ -107,7 +107,8 @@ AUTHORITY = {name: False for name in (
     "semantic_hold_release", "automatic_relabeling", "majority_vote",
 )}
 FILES = {"contract": "diagnostic_contract.json", "requests": "diagnostic_requests.jsonl",
-         "summary": "diagnostic_summary.json", "failure": "failed.json"}
+         "summary": "diagnostic_summary.json", "failure": "failed.json",
+         "warmups": "diagnostic_gpu_warmups.jsonl"}
 
 
 def _json_bytes(value: object) -> bytes:
@@ -236,6 +237,34 @@ def _safe_response_diagnostics(response: object) -> dict:
     return result
 
 
+def _validate_preload_response(response: object, model: str) -> None:
+    if (type(response) is not dict or response.get("model") != model
+            or response.get("done") is not True or response.get("done_reason") not in ("load", "stop")
+            or response.get("response", "") != ""):
+        raise ValueError("invalid empty-prompt model preload response")
+
+
+def _runtime_diagnostics(response: object, model: str, digest: str) -> dict:
+    matches = []
+    if type(response) is dict and type(response.get("models")) is list:
+        matches = [row for row in response["models"] if type(row) is dict and row.get("name") == model]
+    row = matches[0] if len(matches) == 1 else {}
+    return {
+        "response_sha256": _sha(_json_bytes(response)),
+        "exact_model_match_count": len(matches),
+        "digest_matches": row.get("digest") == digest,
+        "context_length": row.get("context_length") if type(row.get("context_length")) is int else None,
+        "size_vram": row.get("size_vram") if type(row.get("size_vram")) is int else None,
+    }
+
+
+def _require_gpu_runtime(runtime: dict) -> None:
+    if (runtime["exact_model_match_count"] != 1 or runtime["digest_matches"] is not True
+            or runtime["context_length"] != OPTIONS["num_ctx"]
+            or type(runtime["size_vram"]) is not int or runtime["size_vram"] <= 0):
+        raise ValueError("GPU model runtime not verified before image inference")
+
+
 def _overlap(first: list | None, second: list | None) -> float | None:
     if first is None or second is None:
         return None
@@ -309,9 +338,16 @@ def diagnose_semantics(
     hold_sha = None
     if semantic_hold_file is not None:
         _, hold_sha = adapter.assembler._stable_file_sha256(semantic_hold_file, description="existing semantic hold")
-    contract = {"schema_version": "operational_semantics_diagnostic.v1", "prompt": PROMPT,
+    contract = {"schema_version": "operational_semantics_diagnostic.v2", "prompt": PROMPT,
                 "response_schema": SCHEMA, "options": OPTIONS, "endpoint": "/api/chat",
-                "stream": False, "think": False, "keep_alive": "0s",
+                "stream": False, "think": False, "keep_alive": "5m",
+                "runtime_requirement": {
+                    "warmup_endpoint": "/api/generate", "prompt": "", "stream": False,
+                    "options": OPTIONS, "keep_alive": "5m", "group_order": list(MODELS),
+                    "verification_endpoint": "/api/ps", "exact_name_and_digest": True,
+                    "context_length": OPTIONS["num_ctx"], "size_vram_greater_than": 0,
+                    "verified_before_each_model_group": True,
+                },
                 "image_transform": "original_bytes_no_crop_or_resize",
                 "bbox_coordinates": "xyxy_normalized_0_to_1000_full_original_image",
                 "authority": AUTHORITY, "runner_sha256": runner_sha}
@@ -321,12 +357,34 @@ def diagnose_semantics(
     identity = (owned_stat.st_dev, owned_stat.st_ino)
     stage, completed = "preflight", []
     last_chat_response = None
+    last_preload_response, last_runtime_check = None, None
+    warmups = []
     preserved = {}
     try:
         preserved[FILES["contract"]] = _write_exclusive(output_dir / FILES["contract"], contract)
         before_models = _check_models(url, expected_models, timeout)
-        with (output_dir / FILES["requests"]).open("xb") as stream:
+        with (output_dir / FILES["requests"]).open("xb") as stream, (output_dir / FILES["warmups"]).open("xb") as warmup_stream:
             for model in MODELS:
+                stage = "gpu_warmup"
+                last_preload_response, last_runtime_check = None, None
+                started = time.monotonic()
+                preload = _request_json(url, "/api/generate", {
+                    "model": model, "prompt": "", "stream": False,
+                    "keep_alive": "5m", "options": OPTIONS,
+                }, timeout=timeout)
+                last_preload_response = _safe_response_diagnostics(preload)
+                _validate_preload_response(preload, model)
+                running = _request_json(url, "/api/ps", timeout=timeout)
+                last_runtime_check = _runtime_diagnostics(running, model, expected_models[model])
+                _require_gpu_runtime(last_runtime_check)
+                warmup = {"model": model, "model_digest": expected_models[model],
+                          "prompt_contract_sha256": contract_sha, "response": last_preload_response,
+                          "runtime": last_runtime_check, "gpu_runtime_verified": True,
+                          "wall_seconds": time.monotonic() - started, "authority": AUTHORITY}
+                warmup_stream.write(_json_bytes(warmup))
+                warmup_stream.flush()
+                warmups.append(warmup)
+                print(f"semantic diagnostic GPU warmup verified ({model})", flush=True)
                 for sha in selected:
                     stage = "inference"
                     path = Path(by_sha[sha]["source_filepath"])
@@ -336,7 +394,7 @@ def diagnose_semantics(
                     payload = {"model": model, "messages": [{"role": "user", "content": PROMPT,
                                 "images": [base64.b64encode(image).decode("ascii")]}],
                                "format": SCHEMA, "stream": False, "think": False,
-                               "keep_alive": "0s", "options": OPTIONS}
+                               "keep_alive": "5m", "options": OPTIONS}
                     started = time.monotonic()
                     response = _request_json(url, "/api/chat", payload, timeout=timeout)
                     last_chat_response = _safe_response_diagnostics(response)
@@ -347,6 +405,7 @@ def diagnose_semantics(
                     entry = {"source_sha256": sha, "request_image_sha256": sha,
                              "prompt_contract_sha256": contract_sha, "model": model,
                              "model_digest": expected_models[model], "decision": decision,
+                             "gpu_warmup_sha256": _sha(_json_bytes(warmup)),
                              "response": metrics, "wall_seconds": time.monotonic() - started,
                              "authority": AUTHORITY}
                     stream.write(_json_bytes(entry))
@@ -354,6 +413,7 @@ def diagnose_semantics(
                     completed.append(entry)
                     print(f"semantic diagnostic {len(completed)}/6 complete ({model})", flush=True)
         preserved[FILES["requests"]] = b"".join(_json_bytes(row) for row in completed)
+        preserved[FILES["warmups"]] = b"".join(_json_bytes(row) for row in warmups)
         stage = "postflight"
         after_models = _check_models(url, expected_models, timeout)
         if before_models != after_models:
@@ -377,10 +437,11 @@ def diagnose_semantics(
                 "target_bbox_iou": _overlap(first["target_bbox_xyxy"], second["target_bbox_xyxy"]),
                 "target_comparison": "overlap_only_no_acceptance_threshold",
                 "authority": AUTHORITY})
-        summary = {"schema_version": "operational_semantics_diagnostic_summary.v1",
+        summary = {"schema_version": "operational_semantics_diagnostic_summary.v2",
                    "status": "diagnostic_complete", "requests_completed": len(completed),
                    "source_index_sha256": index_sha, "prompt_contract_sha256": contract_sha,
                    "models": before_models, "agreements": agreements, "authority": AUTHORITY,
+                   "gpu_runtime_verified_model_groups": len(warmups),
                    "semantic_hold_action": "unchanged", "visual_cues_are_unverified_model_claims": True,
                    "semantic_hold_sha256": hold_sha,
                    "automatic_decision": None, "output_sha256": {name: _sha(content) for name, content in preserved.items()}}
@@ -421,6 +482,8 @@ def diagnose_semantics(
                                        else "OSError" if isinstance(error, OSError) else "unexpected_error"),
                     "http_status": error.code if isinstance(error, urllib.error.HTTPError) and type(error.code) is int else None,
                     "last_chat_response": last_chat_response,
+                    "last_preload_response": last_preload_response,
+                    "last_runtime_check": last_runtime_check,
                 })
         except (OSError, ValueError):
             pass

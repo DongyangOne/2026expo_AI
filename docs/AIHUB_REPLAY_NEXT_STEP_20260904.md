@@ -1,0 +1,112 @@
+# AIHub 재현성 진단과 다음 단계 — 2026-09-04
+
+## 1. 실제 확인한 기존 증거
+
+이 문서는 **8/31 생성 V4 데이터에 대한 기존 drift 측정 보고서를 9/4에 회수해 읽은 결과**다.
+오늘 AIHub 91,938장을 새로 추론하거나 학습한 결과가 아니다. 보고서 자체에는 측정 시각
+필드가 없으며, 보관 run은 `proposal_verifier_multitask_v4_bgfix_20260831_drift_audit_0504f05`다.
+
+- 원본 보고서: `/share/Container/runs/proposal_verifier_multitask_v4_bgfix_20260831_drift_audit_0504f05/historical_manifest_replay_drift.json`
+- 회수본: `/share/Container/operational_refresh_80bf78a_20260904_101000/historical_replay_drift_snapshot_20260904.json`
+- 회수본 크기: 157,273 bytes
+- 직접 확인한 SHA-256: `c71b8d54289f416609231df8af7c497e7174b08e73f854516b8ef8d44b81ec9c`
+
+보고서는 `diagnostic_only=true`이고 lineage/training/blind/deployment 권한이 모두
+`false`다. 숫자 오차를 측정했을 뿐 허용 임계값 판정을 적용한 통과 보고서가 아니다.
+
+| 결박 대상 | SHA-256 |
+|---|---|
+| 원본 `manifest.csv` | `5c9e0e933e75cd7318a5ca9b3f5baf4460fee02466eb0a572cdd1aec5dda2dbb` |
+| `dataset_info.json` | `8e10c64d43e02d46c008deec0b7dc0c7567901196286af216516f9276717f550` |
+| YOLO detector | `7b849c25c3983a54b4b6c922e425798f89326b2da21e862b90d2ee0c6a181f69` |
+| inference spec | `c6ddaa1f7bc6dc58114a2dab52e9f2382bd2f4acaba4bd398c1c3b91cfc0e5de` |
+| source/label/crop 결박 집합 | `91e86995d230d6dfb1c8af13317a230b7c3c127a19eef522d458033ab1d86b92` |
+
+`bindings.loaded_code_sha256`에는 당시 auditor·prepare·validator·preprocessing 네 파일의
+SHA도 들어 있다. 재현 시 현재 HEAD가 당시 코드와 같다고 가정하지 않고 이 값을 대조한다.
+
+## 2. 측정 환경과 핵심 결과
+
+측정 환경은 RTX 2000 Ada, logical CUDA device `0`, **batch=12**, Python 3.12.3,
+PyTorch 2.11.0+cu128, Ultralytics 8.4.60, CUDA 12.8, cuDNN 91900이다.
+`cudnn_benchmark=false`, `deterministic_algorithms_enabled=false`였다.
+detector confidence 0.10/NMS IoU 0.70, crop 320/padding 0.08/fill 114를 사용했다.
+보고서는 원본 source/label/crop 및 detector/loaded code의 종료 시 재해시도 기록한다.
+
+- 입력·관측 source: 각각 **91,938**. 누락·중복·예상 밖 source는 0.
+- 모든 source replay는 끝났지만 5개는 proposal이 없어 수치 비교는 **91,933개**만 존재한다.
+- `contract_impacting_drift=true`; 단순한 저장 소수점 차이만 있는 결과가 아니다.
+
+| 측정값 | p50 | p90 | p95 | p99 | 최대 |
+|---|---:|---:|---:|---:|---:|
+| confidence 절대 차이 | 4.8729e-9 | 0.0012853 | 0.0070480 | 0.0705875 | 0.8770116 |
+| bbox 좌표 최대 절대 차이(px) | 0 | 0.057144 | 0.119659 | 0.482758 | 540.846039 |
+
+`hard_semantic_mismatch_sources=4,070`은 아래 계약 변화가 하나 이상 있는 source의 합집합이다.
+항목별 개수는 겹치므로 더하면 안 된다.
+
+| 계약 변화 | 개수 |
+|---|---:|
+| crop 정수 경계 변경 | 4,048 |
+| detector class 변경 | 65 |
+| assignment material/reason 변경 | 각각 58 |
+| strict-zero-intersection 결정 변경 | 58 |
+| proposal 없음 | 5 |
+
+이 지표의 `semantic`은 **기존 저장 예측과 replay 사이의 계약 변화**를 뜻한다.
+4,070개가 실제 정답 오분류라는 의미가 아니며, 나머지가 정답이라는 의미도 아니다.
+이 보고서로 기존 confidence mismatch가 해결됐다고 할 수 없다.
+
+## 3. 원인 가설과 최소 진단
+
+현재 및 기존 `841b703` prepare는 confidence를 소수점 8자리로 저장한다. 정상 0~1 값의
+반올림 오차 상한은 5e-9이므로 이것만으로 고정 허용오차 1e-6 초과를 설명하지 못한다.
+prepare는 source 순서로 batch 예측한 후 CSV를 split/material/hash 순서로 다시 정렬하고,
+validator는 CSV 순서로 batch를 구성한다. **동반 이미지와 shape가 바뀌어 detector의
+rectangular padding/배치 연산이 달라졌을 가능성**이 있다. 이는 코드상 가설이며
+보고서도 한 번의 batch-N replay만으로 batch 인과관계를 분리하지 못한다고 명시한다.
+
+과거 실패 로그의 `source-00000012-5f3737d5431d7792.jpg`는 당시 코드의 명명법상
+원본 CSV 13행(데이터 12번째)이다. 현재 원본 CSV 전체 SHA와 그 source SHA 접두사부터
+재확인한다. 임시 snapshot 폴더를 재사용하거나 원본 행의 confidence를 수정하지 않는다.
+동일 모델·코드·컨테이너 image·GPU 환경에서 새 불변 진단 경로로 다음을 비교한다.
+
+1. 실패행이 포함된 **기존 validator 순서의 완전한 batch**. 당시 설정이 12인지 원본
+   `dataset_info.json`과 container inspect로 확인하고, 맞으면 첫 12개 데이터 행을 사용한다.
+2. 같은 이미지가 포함된 **기존 generation source 순서의 완전한 batch**. 당시 YAML과
+   source 목록을 확인해 재구성하고, 원래 목록/순서를 복원할 수 없으면 동일 조건 재현이라고 하지 않는다.
+3. 같은 실패 이미지의 **batch=1 독립 반복 두 번**. 각 결과와 원래 저장 top1을 비교한다.
+
+각 조건에서 source/model/code SHA, 이미지 순서·원본 크기, 실제 detector 입력 tensor
+shape/dtype, `half/fp16`, `rect`, TF32/determinism 설정, class/confidence/bbox를 기록한다.
+현재 `iter_yolo_predictions`는 `half/rect`를 명시하지 않으며 기존 보고서도 실제 dtype과
+tensor shape를 기록하지 않았다. spec의 **crop 320 float32**를 detector 입력 dtype이나
+640 letterbox 동작의 증거로 혼동하지 않는다. 원본 GT 및 허용오차는 변경하지 않는다.
+
+`audit_v4_detector_replay_drift.py`에는 `--limit`이 없어 원본 CSV를 주면 전량을 읽는다.
+소수행은 원본 SHA·행 번호·배치 구성에 결박한 별도 진단 입력/좁은 probe가 먼저 필요하다.
+`run_v4_reproducible_generation.sh`는 신규 batch=1 생성용이고, QX3 validation wrapper는
+봉인된 cohort 전체를 두 번 검증하는 용도다. 둘을 실패행 몇 개의 가벼운 진단으로 오인하지 않는다.
+단기 목표는 원인 분리이며, 91k 재생성이나 임계값 완화부터 하지 않는다.
+
+## 4. AIHub-only 연구 학습의 조건
+
+trainer의 `--no-condition-heads`로 objectness 2분류+재질 9종 연구 학습은 가능하다.
+기존 V4 CSV는 train/validation 모두 9종+background가 있지만 세 상태는 전부 `-1`이다.
+따라서 이 경로는 상태 성능을 개선하는 최종 V4 후보가 아니며, 기존 상태 정답을 억지로
+복사하거나 `-1`을 `0`으로 바꾸지 않는다.
+
+연구용 학습 전에도 실제 pinned runtime replay·crop 검증, report에 결박한 strict lineage
+upgrade, 최종 CSV 재검증, license/origin 및 source/crop/group/session/근접중복 감사가 필요하다.
+운영 hold 9장·보호 hardware 41장·QX3 3,500장은 분리하고, 양쪽 role의 9종+background
+coverage를 유지한다. 고정 입력·기존 pretrained 모델·독립 run으로
+`--dry-run --no-condition-heads`를 먼저 확인한다.
+
+현재 정식 candidate builder는 세 상태 head 및 각 role의 0/1 지원을 요구하며,
+builder/launcher의 승인 policy pin은 `UNCONFIGURED`다. 별도 non-authoritative 연구
+launcher는 별도 검토 대상이지 기존 candidate gate나 v3 watcher를 우회할 명분이 아니다.
+학습 후에도 고정 validation/calibration과 신규 독립 하드웨어 end-to-end gate 없이
+production/Pi 모델·Spring 계약을 바꾸지 않는다.
+
+이 작업은 운영 9B teacher의 오라벨/전경 혼동과 독립된 **AIHub YOLO replay 재현성 문제**다.
+운영 hold는 계속 유지한다. 이 문서 작성 자체로 새 학습·추론·NAS 변경을 실행하지 않았다.
