@@ -4,6 +4,12 @@
 **새 사진 선별 → 자동 라벨 검증 → 후보 재학습 → 기존 모델과 비교**로 진행한다.
 API 응답과 Spring 계약은 바꾸지 않는다. 검증에 실패하면 기존 모델을 유지한다.
 
+현재 2026-09-04 배치 9장은 **의미 검증 보류**다. 원본/라벨/위치 SHA가 모두
+연결되어도 정답이 보장되지는 않는다. 실제 사진 진단에서 비닐·캔의 plastic 오라벨과
+전경 대신 배경 병 선택을 확인했다. `material_semantics_hold.json`이 있는 source bundle은
+prepare/validator가 소비를 거부한다. 원본 증거·hold를 보존한 새 독립 검증 단계가 필요하며,
+자세한 내용은 `OPERATIONAL_V4_HANDOFF_PLAN.md` 및 `OPERATIONAL_SEMANTIC_HOLD_20260904.md`에 있다.
+
 ## 간단하게 유지할 운영 방식
 
 1. 원본 이미지와 JSON이 모두 저장된 로그를 고정된 스냅샷으로 확보한다.

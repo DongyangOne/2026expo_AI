@@ -31,6 +31,7 @@ import os
 import tempfile
 from collections import Counter
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -41,10 +42,12 @@ try:
     from scripts.prepare_proposal_verifier_dataset import (
         BACKGROUND_CLASS_ID,
         CLASS_NAMES,
+        GroundTruth,
         PredictedFrame,
         Proposal,
         SourceRecord,
         _label_path,
+        _reject_operational_material_hold,
         assign_proposal,
         bbox_iou,
         boxes_intersect,
@@ -63,10 +66,12 @@ except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
     from prepare_proposal_verifier_dataset import (  # type: ignore[no-redef]
         BACKGROUND_CLASS_ID,
         CLASS_NAMES,
+        GroundTruth,
         PredictedFrame,
         Proposal,
         SourceRecord,
         _label_path,
+        _reject_operational_material_hold,
         assign_proposal,
         bbox_iou,
         boxes_intersect,
@@ -106,6 +111,9 @@ EXPECTED_POSITIVE_IOU = 0.50
 EXPECTED_NEGATIVE_IOU = 0.10
 REPLAY_CONFIDENCE_ABS_TOLERANCE = 1e-6
 REPLAY_BBOX_ABS_TOLERANCE = 1e-4
+OPERATIONAL_ANNOTATION_AUTHORITY = "vlm_teacher_pseudo_label_train_only"
+AIHUB_ANNOTATION_AUTHORITY = "aihub_annotation_geometry_development_only"
+OPERATIONAL_ORIGIN = "operational_capture_vlm_teacher"
 ADDED_FIELDS = (
     "manifest_schema_version",
     "crop_object_count",
@@ -182,6 +190,202 @@ def _write_snapshot(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as file:
         file.write(content)
+
+
+@dataclass(frozen=True)
+class _OperationalEvidence:
+    root: Path
+    records: dict[str, dict]
+    files: dict[str, bytes]
+    reader_source: Path
+    reader_source_bytes: bytes
+    output_paths: tuple[Path, ...]
+    protected_roots: tuple[Path, ...]
+
+
+def _operational_adapter():
+    # Keep the existing AIHub-only path independent of this optional adapter.
+    try:
+        from scripts import build_operational_source_evidence as adapter
+    except ModuleNotFoundError:
+        import build_operational_source_evidence as adapter
+    return adapter
+
+
+def _no_symlink_components(path: Path, description: str) -> None:
+    if any(item.is_symlink() for item in (path, *path.parents)):
+        raise ValueError(f"{description} must not contain symlinks")
+
+
+def _operational_tree(root: Path) -> dict[str, bytes]:
+    _no_symlink_components(root, "operational evidence directory")
+    if not root.is_dir():
+        raise ValueError("operational evidence directory is missing")
+    files = {}
+    for path in sorted(root.rglob("*")):
+        _no_symlink_components(path, "operational evidence file")
+        if path.is_dir():
+            files[path.relative_to(root).as_posix() + "/"] = b""
+            continue
+        if not path.is_file():
+            raise ValueError("operational evidence must contain only regular files")
+        files[path.relative_to(root).as_posix()] = _stable_read_bytes(
+            path, description="operational evidence file"
+        )
+    return files
+
+
+def _load_operational_evidence(
+    root: Path, info: Mapping[str, object], manifest_dir: Path,
+    output_paths: Sequence[Path] = (),
+) -> _OperationalEvidence:
+    _reject_operational_material_hold(root)
+    _no_symlink_components(root, "operational evidence directory")
+    root = root.resolve(strict=True)
+    if manifest_dir.resolve().is_relative_to(root):
+        raise ValueError("validator output must not be inside operational evidence")
+    _check_operational_output_paths(output_paths, (root,))
+    adapter = _operational_adapter()
+    reader_source = Path(adapter.__file__).resolve(strict=True)
+    reader_source_bytes = _stable_read_bytes(reader_source, description="operational reader")
+    files = _operational_tree(root)
+    records = adapter.validate_source_evidence_bundle(root)
+    if files != _operational_tree(root):
+        raise ValueError("operational evidence changed during initial validation")
+    if _stable_read_bytes(reader_source, description="operational reader") != reader_source_bytes:
+        raise ValueError("operational evidence reader changed during validation")
+    # The generation event must already have bound the same complete bundle.
+    expected_binding = {
+        "bundle_dir": root.as_posix(),
+        "receipt_sha256": _sha256_bytes(files[adapter.FILES["receipt"]]),
+        "index_sha256": _sha256_bytes(files[adapter.FILES["index"]]),
+        "marker_sha256": _sha256_bytes(files[adapter.FILES["marker"]]),
+    }
+    if info.get("operational_source_evidence") != expected_binding:
+        raise ValueError("dataset_info operational source evidence binding mismatch")
+    receipt = json.loads(files[adapter.FILES["receipt"]])
+    protected_roots = (root, *sorted({
+        Path(item["path"]).parent.resolve()
+        for name, item in receipt["inputs"].items()
+        if name.startswith(("teacher_output_", "quality_"))
+    }))
+    _check_operational_output_paths(output_paths, protected_roots)
+    indexed: dict[str, dict] = {}
+    for record in records:
+        sha = record["source_sha256"]
+        if sha in indexed:
+            raise ValueError("duplicate operational source evidence SHA")
+        indexed[sha] = json.loads(_json_bytes(record))
+    if not indexed:
+        raise ValueError("operational source evidence contains no accepted sources")
+    _reject_operational_material_hold(root)
+    return _OperationalEvidence(root, indexed, files, reader_source, reader_source_bytes,
+                                tuple(output_paths), protected_roots)
+
+
+def _check_operational_output_paths(paths: Sequence[Path], roots: Sequence[Path]) -> None:
+    for path in paths:
+        _no_symlink_components(path, "operational validator output")
+        if any(path.resolve(strict=False).is_relative_to(root) for root in roots):
+            raise ValueError("validator output must not be inside operational evidence")
+
+
+def _verify_operational_evidence(evidence: _OperationalEvidence) -> None:
+    _reject_operational_material_hold(evidence.root)
+    _check_operational_output_paths(evidence.output_paths, evidence.protected_roots)
+    if _operational_tree(evidence.root) != evidence.files:
+        raise ValueError("operational evidence changed after validation")
+    if _stable_read_bytes(evidence.reader_source, description="operational reader") != evidence.reader_source_bytes:
+        raise ValueError("operational evidence reader changed after validation")
+    records = _operational_adapter().validate_source_evidence_bundle(evidence.root)
+    current = {record["source_sha256"]: record for record in records}
+    if len(current) != len(records) or current != evidence.records:
+        raise ValueError("operational source evidence records changed after validation")
+    for record in evidence.records.values():
+        path = Path(record["source_filepath"])
+        _no_symlink_components(path, "operational source image")
+        if _sha256_bytes(_stable_read_bytes(path, description="operational source image")) != record["source_sha256"]:
+            raise ValueError("operational source image changed after validation")
+    if _operational_tree(evidence.root) != evidence.files:
+        raise ValueError("operational evidence changed during revalidation")
+    if _stable_read_bytes(evidence.reader_source, description="operational reader") != evidence.reader_source_bytes:
+        raise ValueError("operational evidence reader changed during revalidation")
+    _reject_operational_material_hold(evidence.root)
+
+
+def _row_annotation(
+    row: Mapping[str, str], source_path: Path, *, location: str,
+    operational_evidence: _OperationalEvidence | None,
+) -> tuple[GroundTruth | None, bytes, str]:
+    record = None
+    if operational_evidence is not None:
+        record = operational_evidence.records.get(row["source_id"].strip())
+        if record is None:
+            record = next((item for item in operational_evidence.records.values()
+                           if Path(item["source_filepath"]).resolve() == source_path), None)
+    declared_operational = (
+        row.get("origin", "").strip() == OPERATIONAL_ORIGIN
+        or row.get("annotation_authority", "").strip() == OPERATIONAL_ANNOTATION_AUTHORITY
+        or any(row.get(field, "").strip() for field in (
+            "auditor_sha256", "teacher_output_sha256", "localizer_output_sha256", "source_evidence_ref",
+        ))
+    )
+    if record is None:
+        if declared_operational:
+            raise ValueError(f"{location}: verified operational source evidence is required")
+        if row.get("annotation_authority", "").strip() not in {"", AIHUB_ANNOTATION_AUTHORITY}:
+            raise ValueError(f"{location}: unsupported annotation authority")
+        label_path = _label_path(source_path)
+        if not label_path.is_file():
+            raise ValueError(f"{location}: explicit YOLO label file is required; missing annotation is not an empty-scene ground truth")
+        try:
+            annotation_bytes = label_path.read_bytes()
+            label_text = annotation_bytes.decode("utf-8")
+        except (OSError, UnicodeError) as error:
+            raise ValueError(f"{location}: YOLO label file is unreadable") from error
+        ground_truth, reason = parse_yolo_label_text(label_text)
+        if reason is not None:
+            raise ValueError(f"{location}: unsupported YOLO annotation: {reason}")
+        return ground_truth, annotation_bytes, AIHUB_ANNOTATION_AUTHORITY
+
+    if row.get("split") != "training" or row.get("role") != "train" or row.get("fold") != "train":
+        raise ValueError(f"{location}: operational pseudoannotations are train-only")
+    if row.get("annotation_authority") != OPERATIONAL_ANNOTATION_AUTHORITY:
+        raise ValueError(f"{location}: operational pseudoannotation cannot claim AIHub authority")
+    for field in (
+        "source_id", "source_sha256", "origin", "captured_at", "object_group", "capture_session",
+        "teacher_output_sha256", "localizer_output_sha256", "auditor_sha256", "source_evidence_ref",
+    ):
+        if row.get(field) != str(record[field]):
+            raise ValueError(f"{location}: operational {field} evidence mismatch")
+    expected_path = Path(record["source_filepath"])
+    _no_symlink_components(expected_path, "operational source image")
+    if source_path != expected_path.resolve() or row.get("source_filepath") != expected_path.as_posix():
+        raise ValueError(f"{location}: operational source path evidence mismatch")
+    raw_source_path = Path(os.fsdecode(base64.urlsafe_b64decode(row["source_path_b64"].encode("ascii"))))
+    if not raw_source_path.is_absolute():
+        raise ValueError(f"{location}: operational source path must be absolute")
+    _no_symlink_components(raw_source_path, "operational manifest source image")
+    for field in ("material", "source_width", "source_height", "source_object_count"):
+        if _integer(row.get(field), field=f"{location} {field}") != record[field]:
+            raise ValueError(f"{location}: operational {field} evidence mismatch")
+    if row.get("category") != record["category"] or record["material"] not in range(len(CLASS_NAMES)):
+        raise ValueError(f"{location}: operational evidence permits material positives only")
+    if any(row.get(field) != "-1" for field in ("dent", "label", "foreign_material")):
+        raise ValueError(f"{location}: operational crop state targets must remain -1")
+    if _integer(row.get("source_foreign_material"), field=f"{location} source_foreign_material") != record["foreign_material"]:
+        raise ValueError(f"{location}: source foreign-material provenance mismatch")
+    width, height = record["source_width"], record["source_height"]
+    left, top, right, bottom = record["source_bbox_xyxy"]
+    ground_truth = GroundTruth(record["material"], (
+        (left + right) / (2 * width), (top + bottom) / (2 * height),
+        (right - left) / width, (bottom - top) / height,
+    ))
+    assert operational_evidence is not None
+    annotation_bytes = operational_evidence.files[record["source_evidence_ref"]]
+    if _sha256_bytes(annotation_bytes) != record["auditor_sha256"]:
+        raise ValueError(f"{location}: operational annotation bytes mismatch")
+    return ground_truth, annotation_bytes, OPERATIONAL_ANNOTATION_AUTHORITY
 
 
 def _finite(value: object, *, field: str) -> float:
@@ -355,6 +559,7 @@ def _resolve_crop(manifest: Path, value: str, *, location: str) -> Path:
 def _replay_source_records(
     manifest_path: Path,
     rows: Sequence[Mapping[str, str]],
+    operational_evidence: _OperationalEvidence | None = None,
 ) -> list[SourceRecord]:
     records: list[SourceRecord] = []
     seen_paths: set[Path] = set()
@@ -370,18 +575,10 @@ def _replay_source_records(
             raise FileNotFoundError(
                 f"{location}: source image does not exist: {source_path}"
             )
-        label_path = _label_path(source_path)
-        if not label_path.is_file():
-            raise ValueError(
-                f"{location}: explicit YOLO label file is required for detector replay"
-            )
-        try:
-            label_text = label_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise ValueError(f"{location}: YOLO label file is unreadable") from error
-        ground_truth, reason = parse_yolo_label_text(label_text)
-        if reason is not None:
-            raise ValueError(f"{location}: unsupported YOLO annotation: {reason}")
+        ground_truth, _, _ = _row_annotation(
+            row, source_path, location=location,
+            operational_evidence=operational_evidence,
+        )
         split = row["split"].strip()
         if split not in {"training", "validation"}:
             raise ValueError(f"{location}: split must be training or validation")
@@ -404,11 +601,12 @@ def validate_detector_replay(
     records: Sequence[SourceRecord] | None = None,
     provider_kind: str,
     runtime_detector_executed: bool,
+    operational_evidence: _OperationalEvidence | None = None,
 ) -> dict[str, object]:
     """Replay frozen detector top1 and require every emitted proposal to match."""
 
     if records is None:
-        records = _replay_source_records(manifest_path, rows)
+        records = _replay_source_records(manifest_path, rows, operational_evidence)
     elif len(records) != len(rows):
         raise ValueError("detector replay snapshot count differs from manifest rows")
     expected = {record.path.resolve(): row for record, row in zip(records, rows, strict=True)}
@@ -502,6 +700,7 @@ def validate_rows(
     detector_sha256: str,
     spec_sha256: str,
     replay_snapshot_dir: Path | None = None,
+    operational_evidence: _OperationalEvidence | None = None,
 ) -> tuple[list[dict[str, str]], Counter, list[SourceRecord] | None]:
     validated: list[dict[str, str]] = []
     counts: Counter = Counter()
@@ -521,20 +720,10 @@ def validate_rows(
         source_path = _decode_source_path(row["source_path_b64"], location=location)
         if not source_path.is_file():
             raise FileNotFoundError(f"{location}: source image does not exist: {source_path}")
-        label_path = _label_path(source_path)
-        if not label_path.is_file():
-            raise ValueError(
-                f"{location}: explicit YOLO label file is required; missing annotation "
-                "is not an empty-scene ground truth"
-            )
-        try:
-            annotation_bytes = label_path.read_bytes()
-            label_text = annotation_bytes.decode("utf-8")
-        except (OSError, UnicodeError) as error:
-            raise ValueError(f"{location}: YOLO label file is unreadable") from error
-        ground_truth, reason = parse_yolo_label_text(label_text)
-        if reason is not None:
-            raise ValueError(f"{location}: unsupported YOLO annotation: {reason}")
+        ground_truth, annotation_bytes, annotation_authority = _row_annotation(
+            row, source_path, location=location,
+            operational_evidence=operational_evidence,
+        )
         source_object_count = 1 if ground_truth is not None else 0
         if _integer(row["source_object_count"], field=f"{location} source_object_count") != source_object_count:
             raise ValueError(f"{location}: source_object_count disagrees with explicit annotation")
@@ -695,7 +884,7 @@ def validate_rows(
             "source_sha256": source_sha,
             "image_sha256": image_sha,
             "blind_test_eligible": "false",
-            "ground_truth_authority": "aihub_annotation_geometry_development_only",
+            "ground_truth_authority": annotation_authority,
         }
         for field, value in additions.items():
             existing = row.get(field, "").strip()
@@ -817,6 +1006,7 @@ def validate_manifest(
     output_report: Path,
     prediction_provider: PredictionProvider | None = None,
     diagnostic_only: bool = False,
+    operational_source_evidence_dir: Path | None = None,
 ) -> dict:
     paths = [input_manifest, dataset_info, detector_model, inference_spec]
     for path in paths:
@@ -830,6 +1020,13 @@ def validate_manifest(
     info, info_bytes = _read_json(dataset_info, description="dataset info")
     spec, spec_bytes = _read_json(inference_spec, description="inference spec")
     _validate_dataset_contract(info, spec)
+    operational_evidence = None
+    if operational_source_evidence_dir is not None:
+        _reject_operational_material_hold(operational_source_evidence_dir)
+        if (dataset_info.parent / "failed.json").exists():
+            raise ValueError("operational dataset generation has a failure marker")
+    elif "operational_source_evidence" in info:
+        raise ValueError("dataset_info requires an operational source evidence directory")
     declared_model = str(info.get("model", "")).strip()
     if not declared_model:
         raise ValueError("dataset_info must declare the detector model path")
@@ -864,6 +1061,13 @@ def validate_manifest(
         accelerator_guard = (
             eager_initialize_cuda_context(device) if authoritative else None
         )
+        if operational_source_evidence_dir is not None:
+            # The adapter rehashes large model inputs and scans source images;
+            # reserve the same-process QNAP CUDA context before that work too.
+            operational_evidence = _load_operational_evidence(
+                operational_source_evidence_dir, info, input_manifest.parent,
+                (output_manifest, output_report),
+            )
         detector_snapshot: Path | None = None
         replay_snapshot_dir: Path | None = None
         if authoritative:
@@ -903,6 +1107,7 @@ def validate_manifest(
             detector_sha256=detector_sha,
             spec_sha256=spec_sha,
             replay_snapshot_dir=replay_snapshot_dir,
+            **({"operational_evidence": operational_evidence} if operational_evidence is not None else {}),
         )
         if authoritative:
             assert detector_snapshot is not None
@@ -937,6 +1142,7 @@ def validate_manifest(
             records=replay_records,
             provider_kind=provider_kind,
             runtime_detector_executed=authoritative,
+            **({"operational_evidence": operational_evidence} if operational_evidence is not None else {}),
         )
         if authoritative:
             assert replay_records is not None
@@ -1012,7 +1218,26 @@ def validate_manifest(
             },
         }
         report_bytes = _json_bytes(report)
+        def recheck_operational_inputs() -> None:
+            if operational_evidence is None:
+                return
+            if (dataset_info.parent / "failed.json").exists():
+                raise ValueError("operational dataset generation has a failure marker")
+            _verify_operational_evidence(operational_evidence)
+            for path, expected in ((input_manifest, manifest_bytes), (dataset_info, info_bytes), (inference_spec, spec_bytes)):
+                if _stable_read_bytes(path, description="operational validation input") != expected:
+                    raise ValueError("operational validation input changed during replay")
+
+        recheck_operational_inputs()
         _publish_pair(output_manifest, output_bytes, output_report, report_bytes)
+        try:
+            recheck_operational_inputs()
+        except BaseException:
+            # Only remove our exact newly published bytes, never unrelated data.
+            for path, expected in ((output_manifest, output_bytes), (output_report, report_bytes)):
+                if path.is_file() and not path.is_symlink() and path.read_bytes() == expected:
+                    path.unlink()
+            raise
     return report
 
 
@@ -1024,6 +1249,7 @@ def main() -> None:
     parser.add_argument("--inference-spec", required=True, type=Path)
     parser.add_argument("--output-manifest", required=True, type=Path)
     parser.add_argument("--output-report", required=True, type=Path)
+    parser.add_argument("--operational-source-evidence-dir", type=Path)
     parser.add_argument(
         "--diagnostic-only",
         action="store_true",
@@ -1041,6 +1267,7 @@ def main() -> None:
         output_manifest=args.output_manifest,
         output_report=args.output_report,
         diagnostic_only=args.diagnostic_only,
+        operational_source_evidence_dir=args.operational_source_evidence_dir,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
 

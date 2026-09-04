@@ -2,13 +2,40 @@
 
 2026-09-04 기준 **구현 계획이며 실행·학습 승인 문서가 아니다.** 저장소는
 `D:\git\2026expo_AI`다. 기존 도구를 연결하며 신규 플랫폼·프레임워크는 추가하지 않는다.
-NAS 클래스/상태별 표본 수와 모델 정확도는 아직 미확인이다.
+NAS 클래스/상태별 행 수는 아래 2026-09-04 실측과 별도 상태 감사에 기록했다.
+후보 모델 정확도와 독립 하드웨어 통과는 아직 미확인이다.
 
-## 아직 남은 세 가지
+## 현재 최우선: 운영 9장 의미 검증 보류
+
+**source evidence 검증 성공은 자동 라벨 정답 확인이 아니었다. 이 9장은 학습 투입 금지다.**
+2026-09-04 실제 YOLO 관측과 원본 3장 시각 진단에서 자동 라벨 오류와 위치 오류를
+발견했다. 얇은 비닐봉투·찌그러진 금속 캔을 teacher가 각각 `plastic`으로 적었고,
+다른 한 장은 전경 PET병 대신 오른쪽 배경 병을 두 localizer가 함께 지정했다.
+기존 teacher/quality/source bundle을 수정하지 않고 부모 디렉터리에
+`work/ctx8192/source_evidence_v1_20260904/material_semantics_hold.json`을 추가했다.
+hold SHA256: `4ea0caa70cdb784371ddb8e872eba10171a43f2aa2e583f94d5ebc539ef1e984`.
+hold는 새 정답·blind evidence가 아니며, **전체 9장 배치를 독립 의미 재검증 전 보류**한다.
+prepare/validator는 이 marker가 있으면 거부한다. 삭제·라벨/기존 SHA 수정으로
+통과시키지 말고 새로운 계약·불변 출력에서 teacher 시각적 근거와 전경 대상부터 재검증한다.
+
+- 실제 관측: `observe_operational_yolo_20260904_retry01`, 동일한 고정 `best.pt`,
+  CPU batch=1/imgsz=640/conf=0.10/NMS=0.70. 모델 SHA256은
+  `7b849c25c3983a54b4b6c922e425798f89326b2da21e862b90d2ee0c6a181f69`다.
+- 9/9 검출, 독립 reference IoU≥0.50는 5/9, 내부 9종 teacher 일치는 2/9였다.
+  PET→plastic 외부 alias를 적용하면 일치는 7/9이지만 이것도 **정확도가 아니다.**
+  원본 진단에서는 불일치한 비닐·캔의 YOLO 결과가 오히려 타당했다.
+- 관측 보고서: `work/ctx8192/yolo_observation_20260904_retry01/observations.json`,
+  SHA256 `0e007baa29d16f42f9def94bc6283b7fdf3bfd8e157b6ab1ffb3276843263f60`.
+  처음 실행은 Python script 경로와 editable Ultralytics package 경로 문제로
+  import에서 중단됐다. 실패 출력은 보존하고 `PYTHONPATH=/ultralytics`를 명시한
+  별도 retry01에서 실제 YOLO를 실행했다. NAS 재부팅/GPU 복구/새 다운로드는 하지 않았다.
+
+## 진행 상태와 남은 연결
 
 - 운영 teacher/localizer 출력과 V4 source CSV·실제 replay report 사이의 provenance 연결.
 - train/model_validation 각각 9종 + background 및 세 상태 head의 0/1 지원 여부.
-  NAS 집계 전에는 충족한다고 가정하지 않는다. 모르는 dent/label은 계속 `-1`이다.
+  기존 v4 91,938행은 상태값이 모두 `-1`이다. v7 상태 라벨은 별도 근거·crop 검증이
+  필요하다. 모르는 dent/label은 계속 `-1`이다.
 - 실제 training config·license/protected evidence·host inspect를 결박한 승인 policy.
   `configs/v4_candidate_training_trusted_policy.json`은 아직 없고 builder/launcher의
   `APPROVED_TRUSTED_POLICY_SHA256`은 `UNCONFIGURED`다. 테스트 fixture는 승인 자료가 아니다.
@@ -17,6 +44,29 @@ NAS 클래스/상태별 표본 수와 모델 정확도는 아직 미확인이다
   사진은 거부 기록에 남긴다. 실제 NAS 조립 성공 여부는 아래 실행 기록으로 확인한다.
 
 ## 다음 작업: 한 번에 한 단계씩
+
+### 2026-09-04 11:34 KST source evidence 실제 완료
+
+- source commit `1ca19333efff26c5a4c4cf0504e5441dbf3b3aa5`.
+  기존 봉인 teacher/quality 생성 코드는 수정하지 않고 standalone
+  `scripts/build_operational_source_evidence.py`를 추가했다.
+  Git archive SHA256: `7858a86d2ee8d2c8737d29d225a317ba31eb6878355b738a6be29dc16f0c9f3b`.
+- NAS `build_source_evidence_v1_20260904`은 11:32:00~11:34:06 KST, 약 126초,
+  exit 0/OOM false로 완료했다. 입력 모델 파일 SHA를 스트리밍 재확인하는 CPU 단계로,
+  새 teacher 추론이나 학습은 실행하지 않았다.
+- 작업 루트 `operational_refresh_80bf78a_20260904_101000` 아래
+  `work/ctx8192/source_evidence_v1_20260904/bundle`에 source별 JSON 9개,
+  `sources.jsonl`, receipt, marker를 생성하고 reader로 다시 검증했다.
+  기존 후보 9/거부 11/확정 품질 제외 0을 유지했다.
+- index SHA256: `0722c1835df7beea5a2ec79f044e260337a22f455236c63c3867fc34553761c8`.
+  receipt SHA256: `0fb2190a708d17b7893fe99549647da272a65e94d88732b823b7501308ce4735`.
+  marker SHA256: `afdb15691fe08d9b012091fe60122f2ea337562a5a05ad8416e9ada6336ba5c8`.
+- **이 bundle은 원본 pseudo-annotation 증거이지 YOLO crop/학습 승인/정답률이 아니다.**
+  `training_started=false`, production 변경/배포 승인 false.
+  다음 소비자는 기존 입력 절대경로 `/job`, `/captures`, `/models`를 같은 자료로
+  mount해야 한다. 임의로 경로·해시를 재봉인하지 않는다.
+- 데이터 지원 집계와 teacher 추적 결과는 `V7_STATE_SUPPORT_AUDIT_20260904.md` 참고.
+  관련 NAS 생성 보고서: `label_support_20260904.json`, `trace_v7_foreign_20260904.json`.
 
 ### 2026-09-04 11:09 KST 실제 완료 기록
 
@@ -57,9 +107,9 @@ NAS 클래스/상태별 표본 수와 모델 정확도는 아직 미확인이다
    `work/ctx8192/localizer_c_qwen35_retry01`의 증거를 사용한다. 실패한 C의 기존
    출력과 A/B 결과를 덮어쓰거나 다시 실행하지 않는다.
 
-2. **source 단위 증거를 먼저 만든다.** 변경 위치는
-   `scripts/build_operational_teacher_manifest.py`의 `MANIFEST_FIELDS`와 accepted-row/
-   lineage 생성 부분이다. 기존 검증을 재사용해 실제 입력을 재검증한 source-evidence
+2. **source 단위 증거 생성 완료.** 구현은 standalone
+   `scripts/build_operational_source_evidence.py`다. 기존 teacher의 `MANIFEST_FIELDS`나
+   봉인 코드는 바꾸지 않는다. 기존 검증을 재사용해 실제 입력을 재검증한 source-evidence
    JSON을 봉인한다. 필요한 필드는 `source_filepath`(검증된 원본 절대경로), `captured_at`
    (`capture_timestamp`의 검증된 원래 시각), `teacher_output_sha256`,
    `localizer_output_sha256`, `auditor_sha256`다. 마지막 세 값은 임의 문자열이 아니라

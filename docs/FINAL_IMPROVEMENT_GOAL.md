@@ -42,6 +42,13 @@
 
 ## 현재 출발점
 
-품질 assembly는 NAS에서 완료했고 train-only 후보 9장/거부 11장을 유지했다.
-후보 학습은 아직 시작하지 않았다. 다음 작업은 기존 완료 산출물을 덮어쓰지 않는
-운영 source-evidence adapter와 AIHub 클래스·상태 지원 집계다.
+품질 assembly와 운영 source-evidence adapter의 NAS 실행·재검증은 완료했고
+형식상 후보 9장/거부 11장을 유지했다. 그러나 실제 YOLO 및 원본 사진 진단에서
+비닐·캔의 teacher 오라벨과 배경 대상 위치 오류를 발견하여 **9장 전체 학습 투입을 보류했다.**
+`source_evidence_v1_20260904/material_semantics_hold.json`은 보존하고 새 독립
+의미/전경 검증을 진행한다. 실제 YOLO crop/replay 연결 코드의 통과를 라벨 정확도로
+표현하지 않는다.
+후보 학습은 아직 시작하지 않았다. AIHub 기반 v4 91,938행은 9종+배경을 지원하지만
+상태값은 모두 미확정이다. 별도 v7 상태 라벨을 실제 crop에 검증 없이 복사하지 않고
+원본 근거·동일재질 부속품 모순·누수부터 확인한다. 자세한 실측은
+`V7_STATE_SUPPORT_AUDIT_20260904.md`와 `OPERATIONAL_V4_HANDOFF_PLAN.md`를 따른다.

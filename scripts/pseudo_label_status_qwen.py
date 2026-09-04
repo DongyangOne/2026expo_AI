@@ -95,6 +95,22 @@ def _crop(image: np.ndarray, row: dict, padding: float) -> np.ndarray | None:
     return cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
 
 
+def _reject_accessory_foreign_conflict(result: dict) -> None:
+    """Do not turn contradictory accessory evidence into a positive or a zero."""
+    reason = result.get("reason", "")
+    reason_codes = reason.split(" | ") if isinstance(reason, str) else []
+    accessory_only = (
+        result.get("same_material_accessory_only") is True
+        or "same_material_accessory" in reason_codes
+    )
+    foreign_positive = (
+        result.get("has_true_foreign_material") == True
+        or result.get("decision") in {"foreign_only", "both"}
+    )
+    if accessory_only and foreign_positive:
+        raise ValueError("same_material_accessory_only conflicts with foreign material positive")
+
+
 def parse_teacher_output(text: str) -> dict:
     """모델 출력을 검증하고 결정과 불리언 조합이 일치할 때만 반환한다."""
     value = text.strip()
@@ -185,11 +201,13 @@ def parse_teacher_output(text: str) -> dict:
     actual = (result["has_removable_label"], result["has_true_foreign_material"])
     if actual != expected:
         raise ValueError(f"decision/flags mismatch: {decision} vs {actual}")
+    _reject_accessory_foreign_conflict(result)
     return result
 
 
 def accepted_status(result: dict, category: str, min_confidence: float) -> dict:
     """학습에 넣을 수 있는 상태만 0/1로 바꾸고 나머지는 -1로 마스킹한다."""
+    _reject_accessory_foreign_conflict(result)
     accepted = (
         result["decision"] not in {"exclude", "ambiguous"}
         and result["is_single_primary_item"]
@@ -206,6 +224,8 @@ def consensus_teacher(results: list[dict]) -> dict:
     """여러 시야 판정이 완전히 일치할 때만 하나의 자동 teacher 정답으로 만든다."""
     if not results:
         raise ValueError("no teacher results")
+    for result in results:
+        _reject_accessory_foreign_conflict(result)
     keys = (
         "decision", "has_removable_label", "has_true_foreign_material",
         "is_single_primary_item",
@@ -229,7 +249,39 @@ def consensus_teacher(results: list[dict]) -> dict:
     )
     merged["confidence"] = min(float(result["confidence"]) for result in results)
     merged["reason"] = " | ".join(result["reason"] for result in results)
+    _reject_accessory_foreign_conflict(merged)
     return merged
+
+
+def _validate_cached_accessory_evidence(record: dict) -> None:
+    """Apply the new rejection rule without rewriting legacy cache evidence."""
+    accepted = record.get("accepted") or {}
+    if (not isinstance(accepted, dict)
+            or any(type(accepted.get(name)) is not int or accepted[name] not in allowed
+                   for name, allowed in (("label", {-1, 0, 1}),
+                                         ("foreign_material", {-1, 0, 1}),
+                                         ("status_eligible", {0, 1})))
+            or (accepted["status_eligible"] == 0
+                and (accepted["label"], accepted["foreign_material"]) != (-1, -1))
+            or (accepted["status_eligible"] == 1 and accepted["foreign_material"] == -1)):
+        raise ValueError("cached accepted status must use consistent exact integer labels")
+    accepted_positive = (
+        accepted.get("status_eligible") == 1 and accepted.get("foreign_material") == 1
+    )
+    teacher = record.get("teacher")
+    for result in [teacher, *record.get("teacher_passes", [])]:
+        if isinstance(result, dict):
+            _reject_accessory_foreign_conflict(result)
+            if accepted_positive:
+                _reject_accessory_foreign_conflict({**result, "has_true_foreign_material": True})
+    # A rejected/error record can retain malformed raw output as evidence.
+    # No accepted label (including a zero) can be supported by contradictory
+    # raw evidence.  Only rejected/error records may retain invalid raw replies.
+    if accepted.get("status_eligible") == 1:
+        for raw in record.get("raw_outputs", []):
+            parsed = parse_teacher_output(raw)
+            if accepted_positive:
+                _reject_accessory_foreign_conflict({**parsed, "has_true_foreign_material": True})
 
 
 def _load_results(path: Path) -> dict[tuple[str, str], dict]:
@@ -240,9 +292,14 @@ def _load_results(path: Path) -> dict[tuple[str, str], dict]:
         for line in file:
             try:
                 item = json.loads(line)
-                results[(item["source_id"], item["filepath"])] = item
+                key = (item["source_id"], item["filepath"])
             except (json.JSONDecodeError, KeyError):
                 continue
+            results[key] = item
+    # Validate the effective last record, preserving explicit later retries and
+    # their immutable history. Do not silently drop a contradictory winner.
+    for item in results.values():
+        _validate_cached_accessory_evidence(item)
     return results
 
 
@@ -305,6 +362,12 @@ def _round_robin(rows: list[dict]) -> list[dict]:
 def merge_manifest(
     base_rows: list[dict], results: dict[tuple[str, str], dict], output_path: Path
 ) -> None:
+    # Check before opening/truncating the destination, including direct callers
+    # that supplied a legacy result mapping without going through _load_results.
+    for base in base_rows:
+        result = results.get((base["source_id"], base["filepath"]))
+        if result:
+            _validate_cached_accessory_evidence(result)
     extra_fields = [
         "status_eligible", "teacher_status", "teacher_confidence", "teacher_reason",
         "teacher_model", "teacher_rejected",

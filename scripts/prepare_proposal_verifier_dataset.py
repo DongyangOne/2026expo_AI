@@ -30,6 +30,7 @@ import base64
 import csv
 import hashlib
 import heapq
+import io
 import json
 import math
 import os
@@ -93,6 +94,9 @@ class SourceRecord:
     split: str
     source_id: str
     ground_truth: GroundTruth | None
+    # Only populated by the fully revalidated source-evidence adapter. This
+    # reference box is a pseudo-annotation, NEVER the runtime detector crop.
+    operational_evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -506,7 +510,8 @@ def resolve_split_images(
 
 
 def collect_sources(
-    split_images: dict[str, list[Path]], dataset_dir: Path
+    split_images: dict[str, list[Path]], dataset_dir: Path,
+    *, source_hashes: dict[Path, str] | None = None,
 ) -> tuple[list[SourceRecord], Counter]:
     records = []
     rejected = Counter()
@@ -516,7 +521,8 @@ def collect_sources(
     cross_split_sources: set[str] = set()
     for split in ("training", "validation"):
         for image_path in split_images.get(split, []):
-            source_id = _source_id(split, image_path, dataset_dir)
+            source_id = (source_hashes[image_path] if source_hashes is not None
+                         else _source_id(split, image_path, dataset_dir))
             if source_id in cross_split_sources:
                 rejected["duplicate_source_content_cross_split"] += 1
                 continue
@@ -582,6 +588,110 @@ def collect_sources(
             record for record in records if record.source_id not in quarantined_sources
         ]
     return records, rejected
+
+
+def _reject_operational_material_hold(bundle_dir: Path) -> None:
+    # A sealed format/provenance bundle is not proof of correct material labels.
+    # Keep semantic quarantine outside that immutable bundle and never interpret
+    # malformed/empty markers as clearance, including dangling symlink markers.
+    marker = bundle_dir.parent / "material_semantics_hold.json"
+    if os.path.lexists(marker):
+        raise ValueError("operational source evidence is on material semantics hold")
+
+
+def _operational_bundle_reader(bundle_dir: Path) -> list[dict]:
+    _reject_operational_material_hold(bundle_dir)
+    try:
+        from scripts.build_operational_source_evidence import validate_source_evidence_bundle
+    except ModuleNotFoundError:
+        from build_operational_source_evidence import validate_source_evidence_bundle
+    records = validate_source_evidence_bundle(bundle_dir)
+    _reject_operational_material_hold(bundle_dir)
+    return records
+
+
+def _operational_bundle_binding(bundle_dir: Path) -> dict[str, str]:
+    _reject_operational_material_hold(bundle_dir)
+    reject_symlinks, _ = _mixed_file_helpers()
+    reject_symlinks(bundle_dir, description="operational source evidence bundle")
+    for filename in ("source_evidence_receipt.json", "sources.jsonl", "source_evidence.sha256"):
+        reject_symlinks(bundle_dir / filename, description="operational source evidence binding")
+    return {
+        "bundle_dir": bundle_dir.resolve(strict=True).as_posix(),
+        **{
+            field: _source_id("", bundle_dir / filename, bundle_dir)
+            for field, filename in (
+                ("receipt_sha256", "source_evidence_receipt.json"),
+                ("index_sha256", "sources.jsonl"),
+                ("marker_sha256", "source_evidence.sha256"),
+            )
+        },
+    }
+
+
+def _operational_bundle_input_roots(bundle_dir: Path, binding: dict[str, str]) -> list[Path]:
+    """Protect complete sealed input directories, not only accepted-image leaves."""
+    receipt_path = bundle_dir / "source_evidence_receipt.json"
+    content = receipt_path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != binding["receipt_sha256"]:
+        raise RuntimeError("operational source evidence changed while resolving protected roots")
+    receipt = json.loads(content)
+    roots = {bundle_dir, Path(receipt["image_root"])}
+    roots.update(
+        Path(item["path"]).parent for name, item in receipt["inputs"].items()
+        if name.startswith(("teacher_output_", "quality_"))
+    )
+    reject_symlinks, _ = _mixed_file_helpers()
+    for root in roots:
+        reject_symlinks(root, description="operational protected input root")
+    return sorted({root.resolve(strict=True) for root in roots})
+
+
+def append_operational_sources(
+    sources: Sequence[SourceRecord], evidence: Sequence[dict],
+    *, all_split_images: dict[str, list[Path]], dataset_dir: Path,
+    source_hashes: dict[Path, str] | None = None,
+) -> list[SourceRecord]:
+    """Add train-only positive references, rejecting *all* base-source overlap.
+
+    Include quarantined/missing-label base images in this check: failing base
+    collection must not let an operational copy sneak into the other split.
+    Near-duplicate/group/protected-cohort audits are still downstream gates.
+    """
+    base_hashes = {
+        source_hashes[path] if source_hashes is not None else _source_id("", path, dataset_dir)
+        for images in all_split_images.values() for path in images
+    }
+    result = list(sources)
+    seen: set[str] = set()
+    for row in evidence:
+        sha = row["source_sha256"]
+        if sha in base_hashes or sha in seen:
+            raise ValueError("operational source duplicates a base or operational source")
+        if row.get("role") != "train" or row.get("annotation_authority") != "vlm_teacher_pseudo_label_train_only":
+            raise ValueError("operational source must be a train-only pseudo-annotation")
+        if (type(row.get("source_object_count")) is not int or row["source_object_count"] != 1
+                or type(row.get("material")) is not int or row["material"] not in range(9)):
+            raise ValueError("operational source must contain one positive material")
+        path = Path(row["source_filepath"])
+        if not path.is_absolute() or _source_id("", path, dataset_dir) != sha:
+            raise ValueError("operational source path/hash mismatch")
+        width, height = row["source_width"], row["source_height"]
+        x1, y1, x2, y2 = row["source_bbox_xyxy"]
+        if (type(width) is not int or type(height) is not int or min(width, height) <= 0
+                or any(type(value) not in (int, float) or not math.isfinite(value)
+                       for value in (x1, y1, x2, y2))
+                or not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height)):
+            raise ValueError("operational pseudo-annotation geometry is invalid")
+        gt, error = parse_yolo_label_text(
+            f"{row['material']} {(x1 + x2) / (2 * width)} {(y1 + y2) / (2 * height)} "
+            f"{(x2 - x1) / width} {(y2 - y1) / height}"
+        )
+        if error or gt is None:
+            raise ValueError("operational pseudo-annotation geometry is invalid")
+        seen.add(sha)
+        result.append(SourceRecord(path, "training", sha, gt, dict(row)))
+    return result
 
 
 def iter_yolo_predictions(
@@ -781,6 +891,11 @@ def candidates_from_frames(
             stats[assignment] += 1
             if material is None:
                 continue
+            if frame.source.operational_evidence is not None and material == BACKGROUND_CLASS_ID:
+                # VLM localization is not an exhaustive negative annotation.
+                # A different proposal may contain an unlabelled real object.
+                policy_stats["operational_background_not_authorized"] += 1
+                continue
             if material == BACKGROUND_CLASS_ID and gt is not None:
                 if background_policy == "no-ground-truth-only":
                     # A low-IoU proposal in a labelled frame can be another
@@ -847,6 +962,48 @@ MANIFEST_FIELDS = (
     "source_height", "crop_bytes",
 )
 
+CANONICAL_FIELDS = (
+    "sample_id", "role", "fold", "source_sha256", "image_sha256",
+    "object_group", "capture_session", "origin", "source_filepath",
+    "captured_at", "auditor_sha256", "teacher_output_sha256",
+    "localizer_output_sha256", "annotation_authority", "source_evidence_ref",
+    "source_foreign_material",
+)
+
+
+def _canonical_row_metadata(candidate: Candidate, destination: Path, aihub_origin: str) -> dict:
+    source = candidate.source
+    evidence = source.operational_evidence
+    sha = _source_id("", source.path, source.path.parent)
+    if sha != source.source_id:
+        raise ValueError("source changed between collection and crop writing")
+    image_sha = _source_id("", destination, destination.parent)
+    role = {"training": "train", "validation": "model_validation"}[source.split]
+    group = evidence["object_group"] if evidence else f"source_sha256:{sha}"
+    payload = json.dumps(
+        {"source_sha256": sha, "image_sha256": image_sha, "object_group": group},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "filepath": destination.resolve(strict=True).as_posix(),
+        "source_filepath": source.path.resolve(strict=True).as_posix(),
+        "sample_id": "proposal_" + hashlib.sha256(payload).hexdigest()[:24],
+        "role": role, "fold": role, "source_sha256": sha, "image_sha256": image_sha,
+        "object_group": group,
+        "capture_session": evidence["capture_session"] if evidence else group,
+        "origin": evidence["origin"] if evidence else aihub_origin,
+        "annotation_authority": (
+            "vlm_teacher_pseudo_label_train_only" if evidence else
+            "aihub_annotation_geometry_development_only"
+        ),
+        **{field: evidence[field] if evidence else "" for field in (
+            "captured_at", "auditor_sha256", "teacher_output_sha256",
+            "localizer_output_sha256", "source_evidence_ref",
+        )},
+        # Full-frame teacher states cannot assert presence inside a YOLO crop.
+        "source_foreign_material": evidence["foreign_material"] if evidence else "",
+    }
+
 
 def write_selected_crops(
     selected: Sequence[Candidate],
@@ -857,6 +1014,7 @@ def write_selected_crops(
     jpeg_quality: int,
     min_free_gb: float,
     max_output_gb: float,
+    canonical_aihub_origin: str | None = None,
 ) -> tuple[list[dict[str, object]], int, Counter]:
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -898,8 +1056,15 @@ def write_selected_crops(
             ).hexdigest()[:24] + ".jpg"
             relative = Path(candidate.source.split) / candidate.category / filename
             destination = output_dir / relative
+            if canonical_aihub_origin is not None:
+                reject_symlinks, _ = _mixed_file_helpers()
+                reject_symlinks(destination, description="mixed crop output")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            encoded.tofile(destination)
+            if canonical_aihub_origin is None:
+                encoded.tofile(destination)
+            else:
+                with destination.open("xb") as stream:
+                    stream.write(encoded.tobytes())
             written_bytes += crop_bytes
 
             gt = candidate.source.ground_truth
@@ -949,11 +1114,145 @@ def write_selected_crops(
                     "crop_bytes": crop_bytes,
                 }
             )
+            if canonical_aihub_origin is not None:
+                rows[-1].update(_canonical_row_metadata(candidate, destination, canonical_aihub_origin))
     rows.sort(key=lambda row: (str(row["split"]), int(row["material"]), str(row["filepath"])))
     return rows, written_bytes, rejected
 
 
 PredictionProvider = Callable[[Sequence[SourceRecord]], Iterable[PredictedFrame]]
+
+
+def _mixed_file_helpers():
+    # Reuse the bounded-memory, path-identity-aware reader used by the source
+    # adapter.  This optional path does not change legacy AIHub preparation.
+    try:
+        from scripts.assemble_operational_quality_exclusions import (
+            _reject_symlink_components, _stable_file_sha256,
+        )
+    except ModuleNotFoundError:
+        from assemble_operational_quality_exclusions import (
+            _reject_symlink_components, _stable_file_sha256,
+        )
+    return _reject_symlink_components, _stable_file_sha256
+
+
+def _mixed_input_snapshot(
+    data_path: Path, split_images: dict[str, list[Path]], model_path: Path | None,
+) -> dict[Path, tuple | None]:
+    reject_symlinks, stable_hash = _mixed_file_helpers()
+    paths = {data_path}
+    optional_labels = set()
+    for images in split_images.values():
+        for path in images:
+            paths.add(path)
+            try:
+                optional_labels.add(_label_path(path))
+            except ValueError:
+                pass  # The established collector quarantines unresolved labels.
+    paths.update(optional_labels)
+    if model_path is not None:
+        reject_symlinks(model_path, description="mixed detector model")
+        if model_path.is_dir():
+            model_files = []
+            for path in model_path.rglob("*"):
+                reject_symlinks(path, description="mixed detector model member")
+                if path.is_file():
+                    model_files.append(path)
+            if not model_files:
+                raise ValueError("mixed detector model directory is empty")
+            paths.update(model_files)
+        else:
+            paths.add(model_path)
+    snapshot = {}
+    for path in sorted(paths):
+        reject_symlinks(path, description="mixed generation input")
+        if path in optional_labels and not path.exists():
+            snapshot[path] = None
+            continue
+        _, sha = stable_hash(path, description="mixed generation input")
+        stat = path.stat()
+        snapshot[path] = (sha, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    return snapshot
+
+
+def _mixed_snapshot_unchanged(snapshot: dict[Path, tuple | None]) -> None:
+    """Cheap boundary check; publication also repeats the complete SHA scan."""
+    reject_symlinks, _ = _mixed_file_helpers()
+    for path, previous in snapshot.items():
+        reject_symlinks(path, description="mixed generation input")
+        if previous is None:
+            if path.exists():
+                raise RuntimeError("mixed generation input changed during preparation")
+        else:
+            stat = path.stat()
+            if previous[1:] != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns):
+                raise RuntimeError("mixed generation input changed during preparation")
+
+
+def _claim_mixed_output(output_dir: Path, protected_roots: Sequence[Path]) -> tuple[int, int]:
+    reject_symlinks, _ = _mixed_file_helpers()
+    reject_symlinks(output_dir, description="mixed output")
+    resolved = output_dir.resolve(strict=False)
+    for root in protected_roots:
+        if resolved.is_relative_to(root.resolve(strict=True)):
+            raise ValueError("mixed output cannot be nested in generation inputs")
+    # A fresh directory also keeps a concurrent run from sharing crop paths.
+    output_dir.mkdir(parents=True, exist_ok=False)
+    stat = output_dir.stat()
+    return stat.st_dev, stat.st_ino
+
+
+def _mark_mixed_failure(output_dir: Path, identity: tuple[int, int]) -> None:
+    reject_symlinks, _ = _mixed_file_helpers()
+    reject_symlinks(output_dir, description="mixed output")
+    stat = output_dir.stat()
+    if (stat.st_dev, stat.st_ino) != identity:
+        return  # Never modify a foreign replacement directory.
+    try:
+        with (output_dir / "failed.json").open("x", encoding="utf-8") as stream:
+            stream.write('{"status":"failed","stage":"mixed_preparation"}\n')
+    except FileExistsError:
+        pass
+
+
+def _publish_mixed_metadata(
+    output_dir: Path, rows: list[dict], summary: dict, *,
+    validate: Callable[[bool], None], identity: tuple[int, int],
+) -> None:
+    try:
+        reject_symlinks, _ = _mixed_file_helpers()
+        reject_symlinks(output_dir, description="mixed output")
+        stat = output_dir.stat()
+        if (stat.st_dev, stat.st_ino) != identity:
+            raise RuntimeError("mixed output directory ownership changed")
+        validate(False)
+        csv_buffer = io.StringIO(newline="")
+        writer = csv.DictWriter(csv_buffer, fieldnames=MANIFEST_FIELDS + CANONICAL_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+        metadata = {
+            "manifest.csv": csv_buffer.getvalue(),
+            "dataset_info.json": json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        }
+        for name, content in metadata.items():
+            with (output_dir / name).open("x", encoding="utf-8", newline="") as stream:
+                stream.write(content)
+        # Metadata publication is not success if any upstream input changed at
+        # that boundary.  Consumers reject failed.json even if metadata exists.
+        validate(True)
+        _, stable_hash = _mixed_file_helpers()
+        for name, content in metadata.items():
+            _, sha = stable_hash(output_dir / name, description="mixed published metadata")
+            if sha != hashlib.sha256(content.encode("utf-8")).hexdigest():
+                raise RuntimeError("mixed metadata changed during publication")
+        for row in rows:
+            _, sha = stable_hash(Path(row["filepath"]), description="mixed published crop")
+            if sha != row["image_sha256"]:
+                raise RuntimeError("mixed crop changed during publication")
+    except Exception:
+        _mark_mixed_failure(output_dir, identity)
+        raise
 
 
 def build_proposal_verifier_dataset(
@@ -983,10 +1282,16 @@ def build_proposal_verifier_dataset(
     background_gt_margin: float = 0.10,
     nms_iou: float = 0.70,
     prediction_provider: PredictionProvider | None = None,
+    operational_source_evidence_dir: Path | None = None,
+    aihub_origin: str | None = None,
 ) -> dict:
     # This must remain the first preflight: a bad invocation can never load a
     # multi-GB model or touch an existing dataset before overwrite refusal.
     ensure_empty_output(output_dir)
+    if operational_source_evidence_dir is not None:
+        _reject_operational_material_hold(operational_source_evidence_dir)
+    if operational_source_evidence_dir is not None and (not aihub_origin or not aihub_origin.strip()):
+        raise ValueError("explicit aihub_origin is required for mixed canonical manifests")
     if not 0 <= negative_iou < positive_iou <= 1:
         raise ValueError("IoU thresholds must satisfy 0 <= negative < positive <= 1")
     if batch < 1 or imgsz < 1 or crop_size < 1:
@@ -1019,8 +1324,37 @@ def build_proposal_verifier_dataset(
         else None
     )
 
+    mixed_snapshot = None
+    actual_model_path = model_path if prediction_provider is None else None
+    if operational_source_evidence_dir is not None:
+        _, stable_hash = _mixed_file_helpers()
+        _, initial_data_sha = stable_hash(data_path, description="mixed data YAML")
     split_images = resolve_split_images(data_path, dataset_dir)
-    sources, source_rejections = collect_sources(split_images, dataset_dir)
+    source_hashes = None
+    if operational_source_evidence_dir is not None:
+        mixed_snapshot = _mixed_input_snapshot(data_path, split_images, actual_model_path)
+        if mixed_snapshot[data_path][0] != initial_data_sha:
+            raise RuntimeError("mixed data YAML changed during source collection")
+        source_hashes = {path: mixed_snapshot[path][0] for images in split_images.values() for path in images}
+    sources, source_rejections = collect_sources(
+        split_images, dataset_dir,
+        **({"source_hashes": source_hashes} if source_hashes is not None else {}),
+    )
+    operational_records = None
+    operational_binding = None
+    operational_input_roots = []
+    if operational_source_evidence_dir is not None:
+        operational_binding = _operational_bundle_binding(operational_source_evidence_dir)
+        operational_records = _operational_bundle_reader(operational_source_evidence_dir)
+        if _operational_bundle_binding(operational_source_evidence_dir) != operational_binding:
+            raise RuntimeError("operational source evidence changed during initial validation")
+        operational_input_roots = _operational_bundle_input_roots(
+            operational_source_evidence_dir, operational_binding,
+        )
+        sources = append_operational_sources(
+            sources, operational_records, all_split_images=split_images, dataset_dir=dataset_dir,
+            source_hashes=source_hashes,
+        )
     if not sources:
         raise RuntimeError("no valid zero-or-one-object source images found")
 
@@ -1066,23 +1400,41 @@ def build_proposal_verifier_dataset(
             + ", ".join(sorted(missing_splits))
         )
 
-    rows, written_bytes, write_rejections = write_selected_crops(
-        selected,
-        output_dir,
-        crop_size=crop_size,
-        padding=padding,
-        jpeg_quality=jpeg_quality,
-        min_free_gb=min_free_gb,
-        max_output_gb=max_output_gb,
-    )
-    if not rows:
-        raise RuntimeError("all selected proposal crops failed to write")
+    mixed_output_identity = None
+    if operational_source_evidence_dir is not None:
+        _reject_operational_material_hold(operational_source_evidence_dir)
+        _mixed_snapshot_unchanged(mixed_snapshot)
+        mixed_output_identity = _claim_mixed_output(
+            output_dir, [dataset_dir, *operational_input_roots]
+            + sorted({Path(row["source_filepath"]).parent for row in operational_records})
+            + ([model_path] if actual_model_path is not None and model_path.is_dir() else []),
+        )
+    try:
+        rows, written_bytes, write_rejections = write_selected_crops(
+            selected,
+            output_dir,
+            crop_size=crop_size,
+            padding=padding,
+            jpeg_quality=jpeg_quality,
+            min_free_gb=min_free_gb,
+            max_output_gb=max_output_gb,
+            **({"canonical_aihub_origin": aihub_origin} if operational_records is not None else {}),
+        )
+        if not rows:
+            raise RuntimeError("all selected proposal crops failed to write")
+        if operational_records is not None and {row["split"] for row in rows} != {"training", "validation"}:
+            raise RuntimeError("mixed crop writing did not preserve both source splits")
+    except Exception:
+        if mixed_output_identity is not None:
+            _mark_mixed_failure(output_dir, mixed_output_identity)
+        raise
 
     manifest_path = output_dir / "manifest.csv"
-    with manifest_path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=MANIFEST_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    if operational_records is None:
+        with manifest_path.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=MANIFEST_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
 
     counts = Counter((str(row["split"]), str(row["category"])) for row in rows)
     summary = {
@@ -1151,9 +1503,29 @@ def build_proposal_verifier_dataset(
             "max_output_gb": max_output_gb,
         },
     }
-    (output_dir / "dataset_info.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    if operational_binding is not None:
+        summary["operational_source_evidence"] = operational_binding
+        summary["operational_sources"] = len(operational_records)
+        summary["operational_crop_state_targets"] = "all_unknown_minus_one"
+        summary["source_policy"] = "AIHub zero/one annotation plus verified train-only positive operational pseudo-annotations"
+    if operational_records is None:
+        (output_dir / "dataset_info.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    else:
+        def validate_mixed_generation(full_rehash: bool) -> None:
+            _mixed_snapshot_unchanged(mixed_snapshot)
+            if _operational_bundle_binding(operational_source_evidence_dir) != operational_binding:
+                raise RuntimeError("operational source evidence changed during preparation")
+            if full_rehash:
+                if (resolve_split_images(data_path, dataset_dir) != split_images
+                        or _mixed_input_snapshot(data_path, split_images, actual_model_path) != mixed_snapshot):
+                    raise RuntimeError("mixed generation input changed during preparation")
+                if _operational_bundle_reader(operational_source_evidence_dir) != operational_records:
+                    raise RuntimeError("operational source evidence changed during preparation")
+        _publish_mixed_metadata(
+            output_dir, rows, summary, validate=validate_mixed_generation, identity=mixed_output_identity,
+        )
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return summary
 
@@ -1164,6 +1536,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--dataset-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--operational-source-evidence-dir", type=Path)
+    parser.add_argument("--aihub-origin", help="Explicit base origin for optional canonical mixed manifest; not a license approval")
     parser.add_argument("--device", default="0")
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--imgsz", type=int, default=640)
@@ -1265,6 +1639,8 @@ def main() -> None:
         proposal_selection=args.proposal_selection,
         background_policy=args.background_policy,
         background_gt_margin=args.background_gt_margin,
+        operational_source_evidence_dir=args.operational_source_evidence_dir,
+        aihub_origin=args.aihub_origin,
     )
 
 
