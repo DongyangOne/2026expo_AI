@@ -639,3 +639,60 @@ CPU 276.67%/RAM 1.788GiB(상한 4GiB), GPU 0%/2MiB/16,380MiB/42°C,
 exited/exit0/OOMfalse가 복사 전후 같았다. `source_container_before.txt`,
 `source_container_after.txt`, `pretrained.sha256`를 함께 남겼다. 외부 다운로드나
 기존 모델 교체는 하지 않았다. 이 파일은 backbone 초기값이지 새 쓰레기 분류 후보가 아니다.
+
+## 11. 보호 legacy 전체 연결 자동 대기와 cohort 제외 연결 (2026-09-04)
+
+원본 검사를 다시 실행하지 않고 **같은 producer 정상 종료 뒤 한 번만** 보호 legacy
+2,855장 전체 연결 검사를 실행하도록 NAS 자체 대기를 추가했다.
+
+- script: `scripts/nas/continue_original_audit_to_legacy_20260904.sh`
+- NAS frozen script: `J/legacy_full_release_v1_20260904/scripts/nas/continue_original_audit_to_legacy_20260904.sh`
+- SHA: `4662f9b64e1a443f1d925e9d2f6e55641cc11c0fcf04d23172cd7a5c4426b104`
+- CONTROL: `J/legacy_full_continuation_v1_20260904`
+- bootstrap: `J/legacy_full_bridge_v1_20260904.bootstrap.log`
+- 실제 대기 PID 3906/starttime 632881529/PPid 1, 자식 3949가 원본 producer
+  `306f871abf56624d3076ed01373905972b6d7e99b30e82dea599e1a6a9b0c0c1`을 `docker wait` 중이다.
+  이후 조회에서는 PID 재사용을 다시 검사한다.
+- 다음 컨테이너: `audit_legacy_aihub_link_full_v1_20260904`
+- 다음 산출물: `/share/Container/legacy_aihub_link_full_v1_20260904/result/report.json`
+
+15:17:46 KST에 두 대기 프로세스(기존 cohort PID 22398 포함)와 자식의 실제 명령을
+확인했다. 새 CONTROL에는 `producer_before.txt`와 빈 `producer_wait.txt`만 있었다.
+**legacy 전체 검사는 아직 시작 전**이며 원본은 139,200/162,305(85.8%),
+verified 139,181, 격리 19, 선형 잔여 1,273초(약 21분)다. 학습 ETA가 아니다.
+
+대기는 producer 동일 ID/image/exit0/OOM false와 원본 report/실패 marker를 확인한 뒤,
+기존 9장 pilot에서 검증한 helper·converter·remainder·보호 snapshot·manifest SHA를
+재확인하고 `--max-per-kind 0`으로 실행한다. CPU1/RAM2GiB, network none,
+rootfs/입력 RO, 새 output만 RW, cap-drop ALL + DAC_OVERRIDE, no-new-privileges이며
+GPU나 Docker socket을 전달하지 않는다. 기존 서비스와 모델은 변경하지 않았다.
+`audit_container_id.txt`/`dispatched.txt`는 **dispatch** 근거이지 완료 근거가 아니다.
+`failed.txt`가 우선이고 `observation_error.txt`는 중복 시작 근거가 아니다.
+다음 감시에서는 이 대기와 실제 container ID를 먼저 확인한다.
+
+### 전체 결과가 나온 후 연결할 최소 단계
+
+1. 실제 full legacy report의 정상 종료·SHA·2,855개 coverage·verified/unresolved 수를
+   확인한다. partial 9장 report를 full로 사용하지 않는다.
+2. `build_legacy_protected_inventory.py`는 실제 검증된 원본 링크만 source-only 목록으로
+   만든다. 기존 보호 역할을 상속하고 같은 원본 SHA를 합치며 unresolved의 추정 경로는
+   사용하지 않는다. 이미지나 학습 정답은 생성하지 않는다.
+3. 기존 `audit_protected_image_fingerprints.py`가 이 목록의 **실제 원본 픽셀**을 읽어
+   SHA/pHash를 계산한다. 이전 3,636개 snapshot은 재실행하지 않고 보존한다.
+4. 새 불변 경로에서 `plan_aihub_original_cohort.py`에 `--legacy-link-report`와
+   `--legacy-original-fingerprint-report` 및 각 SHA를 함께 제공한다. 기존 원본/보호
+   report·selected manifest·auditor SHA 입력도 그대로 필요하다. 새 원본 ID 및
+   동일 SHA alias 전체를 제외하고 기존 보호 지문에 원본 pHash를 합친다.
+   공식 split과 pHash 거리 4는 바꾸지 않는다.
+
+기존 `cohort_release_20260904_1428`의 실행 코드와 결과를 덮어쓰지 않는다.
+새 planner는 추가 입력이 없는 기존 mode를 유지한다. 원본 경로·이미지/JSON SHA·
+공식 split·실제 link/fingerprint coverage와 소비 metadata를 전후 검증한다.
+outside-pool 원본도 pHash 보호에 포함하지만, 미해결 링크·변환 alias·변환 후 이미지
+누수 검사는 별도로 명시한다. 물리적 객체 정체성이 모두 입증됐다고 하지 않는다.
+
+관련 테스트는 planner **77 passed**, inventory **17 passed**, NAS 대기 wrapper
+**19 passed**다. fixture 회귀이며 실제 2,855장 연결이나 모델 정확도 통과가 아니다.
+학습 입력은 이 단계 이후 full materialization→새 actual YOLO crop/strict replay→
+lineage 및 source/crop 양쪽 근접중복 검사로 이어진다. `--no-condition-heads` 연구
+학습은 상태 모델 최종 후보나 배포 승인이 아니며 production/Pi/Spring은 유지한다.
