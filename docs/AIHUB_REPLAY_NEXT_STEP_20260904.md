@@ -1037,3 +1037,72 @@ SHA/source/회전 pHash 거리4 보호를 유지하고 absence evidence를 별�
 calibration은 학습 wrapper에 포함되지 않으므로 별도 evidence 생성/정책 calibration이
 필요하며, 고정 41장은 calibration 전용으로 유지한다. 앱에는 두 출력과 고정 crop,
 확률 결합을 읽는 별도 adapter가 필요하다. 현재 production/Pi/Spring은 변경하지 않았다.
+
+## 15. 보호 사진 10장 실제 GPU 관측 완료
+
+`observe_protected_proposals.py`와 회귀 테스트 **52개**를 추가하고 독립 코드 검토를
+마쳤다. producer SHA는 `29a1a12be79aaeb89ff1c925e2299f2e0a80bcb5a3601f213c36baef1a8884e2`,
+테스트 SHA는 `18e4ca69bfb56cbc64fc3d90e80a0d008620bcd2abb9c856826214789ef838f4`다.
+CLI는 실제 CUDA0/batch1 고정 YOLO만 사용한다. 테스트 provider 결과는 runtime 실행
+증거로 표시하지 않는다. 잘못된 결과가 `no_eligible_proposal`로 게시되지 않도록
+boxes 누락/배열 shape·길이 불일치/비정수 class/비유한 값/잘못된 bbox/원본 픽셀 불일치/
+CPU 실행/누락·중복 결과를 실패시킨다. 기존 prepare 및 formal near v1은 변경하지 않았다.
+
+### 첫 실행의 CUDA host 메모리 오류와 무재부팅 복구
+
+- `observe_protected_proposals_v1_20260904`, ID
+  `3d8c55ec6ed09d11e9bb6addc40f41961fc7af066913808e19705b56b9a0cd61`:
+  17:18:43~17:18:46 KST, exit1/OOMfalse, 사진 추론 전 CUDA 초기화 실패.
+- 실제 kernel 로그: `NV_ERR_NO_MEMORY`, `_memdescAllocInternal`,
+  `Error allocating client shadow fault buffer for non-replayable faults`.
+  GPU 실행 PID는 없었고 VRAM은 2MiB였다. Normal zone의 큰 연속 블록이 없는
+  host fault-buffer 할당 문제로 확인했으며 GPU VRAM 부족으로 설명하지 않는다.
+- pinned SSH 키 대조 후 기존 허가된 계정의 sudo로 문서화된
+  `sync` → `drop_caches=3` → `compact_memory=1`만 실행했다.
+  실패 컨테이너 ID/exit/OOM과 GPU idle을 다시 확인한 뒤 실행했고 exit0이었다.
+  비밀번호는 메모리에서만 사용했으며 출력/파일 저장하지 않았다.
+- NAS 재부팅, timiroom/전용 judge 중지, naco 재시작, 진행 중 materializer 중단은
+  하지 않았다. v1 컨테이너/로그/출력 부모는 보존했다.
+
+### 동일 frozen 코드로 새 불변 경로에서 성공
+
+`observe_protected_proposals_v2_20260904`, ID
+`39b43b88ef9784251f9a6bffd7504eba00c4df3b3c4d2aafbf619ebe6edca4f2`는
+17:22:43~17:22:57 KST, **exit0/OOMfalse**로 완료됐다. CUDA 실제 초기화와
+NVIDIA RTX 2000 Ada 실행을 확인했다. CPU2/RAM4GiB/shm8GiB/network none,
+7개 NVIDIA device/QPKG library, 입력 RO/새 OUT만 RW 구성이다.
+
+- CODE: `J/protected_observation_code_v1_20260904`.
+  producer/3개 helper/config를 SHA 대조했고 v1 launch SHA는
+  `0c2fbd468ff34b6f3b7521ed36da2a15ec02895b8d32abb8a647d143f1a8c2e5`다.
+- retry script: `J/retry_protected_observation_v2_20260904.sh`, SHA
+  `ed8dea40bd1b125546455b6f0c938e183380481840835f08863f84a50e519ea5`.
+  pinned launch의 컨테이너 이름/출력 경로만 v2로 바꿨으며 모델·코드·임계값은 동일하다.
+- 결과: `/share/Container/protected_proposal_observation_v2_20260904/result/report.json`,
+  SHA `6f32903ccc2ec24db032286dfb68456d4bb7988550a2654903ec751153493adc`.
+- 요청/완료 **10/10**, 실제 crop 생성 **4**, 성공적인 no-eligible **6**.
+  6건은 모두 모델의 confidence/NMS **이후** 반환 개수 0이었다.
+  모든 행의 `object_absence_established=false`와 학습/정답/선택/formal/blind/배포 권한
+  false를 유지한다. 검출 결과를 실제 재질 정답으로 취급하지 않는다.
+- 별도 NAS read-only 검사에서 report 전후 SHA 동일, failed.json 없음,
+  생성 crop 4개 모두 SHA/bytes 일치 및 320×320×3 decode를 확인했다.
+- runtime: Python3.12.3, torch2.11.0+cu128, Ultralytics8.4.60,
+  OpenCV4.13.0/NumPy2.4.3, CUDA12.8, cuDNN91900.
+
+crop이 없는 여섯 보호 SHA는 그대로 남는다:
+`6210b23a0e119595a223b11ee4f8b3b124200dceb41b5abe062b1e8c5df03554`,
+`7344f55e8e5a3c11190ce8fd67c25997e239029ed7827dd92727fe866cb8834e`,
+`9619af3f1aa23aaa61e16139b2e9354202f8df518dab3b3d98b83fc5ee3ee99b`,
+`d0ee74f0e4a719b6a416a1866d1569cb9b51274d5d6e0bba61c4bff8ad403afa`,
+`e258b4c6f08500321e05199fd608debb6218bbe5ec23f97087410419a6f80408`,
+`f4c9fd25e7a25fa35e40acc52cbc4cff6c936c47a4977ac29ea198408702c1a4`.
+
+다음 보호 참조 준비는 raw bbox가 있는 128장(known103/deployed25)의 **참고 ROI**를
+생성하고, 기존 QX3 crop3498+참고 ROI128+실제 crop4+개별 no-eligible6으로 원래
+보호 union3636을 누락 없이 조립하는 것이다. 참고 bbox에는 과거 모델 결과도 있으므로
+모두 GT나 새 YOLO 결과라고 하지 않는다. 관련 CPU producer 구현과 research-only v2
+소비 접점 검토를 시작했으며, 아직 ROI128 생성/전체 보호 누수 감사 완료는 아니다.
+
+17:24:24 KST 장기 materializer v2는 같은 ID/starttime/running/OOMfalse로
+verified **30,100/155,537**, materialized **28,785**다. GPU0%/2MiB/41°C,
+디스크 여유2.6TiB, timiroom 9개 Up2months를 확인했다. 학습은 아직 시작 전이다.
