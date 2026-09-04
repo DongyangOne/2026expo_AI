@@ -819,3 +819,94 @@ annotation 충돌 4행 전원 제외와 18 strata를 확인한 후 materializati
 별도 shadow adapter와 기존 상태 모델 유지, 독립 하드웨어 E2E 검증이 필요하므로
 연구 학습 완료/오프라인 평가와 운영 교체를 구분한다. production/Pi/Spring,
 timiroom 서비스, 중지된 naco-ollama 2개는 변경하지 않았다.
+
+## 13. 회수 원본 지문과 full refined cohort 완료 (2026-09-04)
+
+12절의 `fingerprint_legacy_originals_v1_20260904`는 16:02:15 KST에 exit0/OOMfalse로
+정상 종료했다. 실제 report SHA는
+`d35de267a695b0462e1f3e35e5e038060e2362bf5fca76138f5fedda7794f0cd`,
+expected/verified/records 모두 2,855, missing 0, failed.json 없음이다.
+report를 읽기 전후 SHA가 같았고 inventory/code SHA도 12절과 같았다.
+원본 픽셀 검사와 게시 전후 재해시까지 끝났으며 학습/배포 권한은 false다.
+
+이어 실행한 `cohort_original_legacy_refined_v1_20260904`/ID
+`b27c511a92f93c26e2af58e8a5afeea66109c8a0792e269ae452659e43265944`는
+16:05:00~16:05:24 KST exit0/OOMfalse다. 산출물은
+`J/cohort_original_legacy_refined_v1_20260904/result/cohort.json`, SHA
+`2383dd91fee9b98b18a108cbba3270484ad6b051ff0dd3bb1196547a2196e6de`다.
+읽기 전후 SHA와 실제 레코드 membership/상태값/개수를 별도 read-only 컨테이너에서
+검사했고 모두 통과했다. 전량 metadata 선별 완료이지 새 모델 학습 완료는 아니다.
+
+- verified 원본 162,280 = accepted **155,537** + excluded **6,743**.
+  최초 원본 감사 격리 25건을 합하면 전체 162,305건이다.
+- annotation 충돌 2그룹/4행 모두 exclusions에 있고 accepted에는 없다.
+- 사유별 수는 **중복 집계**다: annotation conflict 4, cross-split exact/near 4,953,
+  protected exact SHA 1,142, protected near pHash 2,300, protected source ID 1,702.
+- 회수 링크 verified 2,855/unresolved 0, recovered original SHA 2,855 모두 소비했다.
+  최종 verified pool 기준 path/ID 일치는 1,142, pool ID 미연결 1,713이다.
+  이는 full legacy report의 manifest pool membership 1,144/1,711과 다른 집계 범위다.
+  pool 밖 원본도 pHash 보호에서 누락하지 않았다.
+- `phash_distance=4`, `full_cohort=true`, 모든 상태값 `-1`, 학습/배포 권한 false를 확인했다.
+  alias uniqueness와 complete_original_lineage는 여전히 false다.
+- pending: legacy transform aliases, materialized-image leakage, raw proposal replay,
+  independent hardware gate. 이 단계를 생략하거나 모두 완료로 바꾸지 않는다.
+
+| 원본 분류 | training | validation |
+| --- | ---: | ---: |
+| battery | 3,011 | 298 |
+| can | 19,397 | 3,706 |
+| fluorescent | 2,156 | 190 |
+| glass | 29,211 | 5,606 |
+| paper | 9,714 | 1,814 |
+| pet | 19,454 | 3,710 |
+| plastic | 28,974 | 5,526 |
+| styrofoam | 9,509 | 1,692 |
+| vinyl | 9,763 | 1,806 |
+
+원본 학습 분류의 pet/plastic 분리는 기존 9종 기준이며 Spring 반환 계약의
+PET→plastic/class_id=3 통합은 변경하지 않는다.
+
+### Materialization 출력 경로 사전 실패와 수정
+
+첫 `materialize_original_legacy_refined_v1_20260904`/ID
+`9fb560fccf95e2557a46a6d24a62a7372eec73c87d1897cfeea76d5559a11ef0`는
+16:07:57~16:08:00 KST exit1/OOMfalse다. 첫 출력 위치를 `J` 아래에 두었는데,
+cohort가 `J` 바로 아래 원본 auditor 파일도 immutable input으로 결박하므로
+materializer의 보호 경로 검사에 걸렸다. read-only 재현에서 실제 원문은
+`materialize_audited_aihub_sources.py:200: ValueError: output overlaps immutable input evidence`였다.
+원본/이미지 처리 전 실패했고 `J/materialized_original_legacy_refined_v1_20260904/result`는
+생성되지 않았음을 확인했다. 컨테이너와 로그를 보존하며 안전 검사를 완화하지 않았다.
+
+복구 실행은 출력만 `J` **밖의 새 경로**로 옮긴다.
+
+- container: `materialize_original_legacy_refined_v2_20260904`
+- ID: `73ca9e2edb36b9a9196e04e71add905de07cbd91a63c68f54a46d875746ca623`
+- OUT: `/share/Container/aihub_original_legacy_refined_materialized_v2_20260904/result`
+- 기존 frozen 코드: `J/cohort_release_20260904_1428/scripts/materialize_audited_aihub_sources.py`
+  SHA `48598dde8491928f46ab64f9f479946e4a14a800f3e8d1dd1c396d9189e93b06`와
+  같은 디렉터리 원본 auditor SHA `d3d82f6ee009a397716da7abde6e9499d54d85febb55a7c1f23ba337f5d70f99`.
+  실제 NAS에서 두 SHA를 다시 확인했고 코드는 수정하지 않았다.
+- CPU2/RAM6GiB, runc, network none, rootfs/전체 입력 RO, 이 새 OUT 부모만 RW,
+  cap-drop ALL+DAC_OVERRIDE/no-new-privileges, GPU devices 없음.
+- CLI: 위 cohort와 SHA, dataset-root `/app/ai_dataset/학습용_데이터`,
+  `--max-sources 0 --min-free-gib 300 --max-output-gib 30`.
+  시작 전 여유 디스크 2.6TiB/83% 사용, buffers/cache 제외 사용 메모리 약 13.5GiB였다.
+
+현재 materializer는 순차 처리로 `--workers`/`--resume`가 없고 100개마다 진행률을
+출력한다. 초기 path/metadata 검사와 마지막 3회 재해시에는 별도 진행률이 없다.
+원본/JSON은 논리적으로 5회 읽지만 OS cache 영향으로 실제 디스크 I/O와는 다를 수 있다.
+30GiB는 축소 JPEG·label·lineage·report 전체 상한이며 고해상도 원본은 복제하지 않는다.
+완료 판정은 실제 exit0/OOMfalse, snapshot_ready.json, report/lineage SHA,
+failed.json 없음, 품질 제외 후 18 strata 지원까지 확인해야 한다.
+
+16:14:07 KST 실측: v2는 16:10:38 시작 후 running/OOMfalse이며 실제 result 폴더와
+이미지를 생성하고 있다. 16:13:07 verified600/materialized570에서
+16:14:04 verified1,000/materialized960으로 진행됐다. 최근 400건/57초는 약
+7건/초다. 이 초기 속도를 그대로 적용하면 **주 변환 처리만 잔여 약 6.1시간**이며
+마지막 전체 재해시 3회가 추가되므로 최종 완료 ETA는 아직 확정하지 않는다.
+품질 제외 40건은 최종 excluded.jsonl/report에서 사유를 확인한다.
+
+자동 감시 `nas`는 30분 간격 ACTIVE를 유지하면서 이 v2 ID/새 OUT과 완료된
+fingerprint/cohort SHA로 갱신했다. 저장된 prompt 일치를 다시 확인했다.
+이미 끝난 원본·legacy·fingerprint·cohort를 재실행하지 않고 v2 완료 후 다음
+YOLO 생성/strict replay로 이어가며, 변화 없는 정상 상태는 알림을 만들지 않는다.
