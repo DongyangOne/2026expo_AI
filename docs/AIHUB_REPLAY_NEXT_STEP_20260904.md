@@ -339,3 +339,116 @@ training/deployment/blind/selection 권한은 전부 false이고, 이후 소비 
 재확인한다. 전량 검사 종료 후 이 두 보고서를 연결해 cross-source/공식 split/보호집합
 누수를 먼저 검사한다. 원본 1만 장 시점 elapsed 603.35초였으며 전체 검사 선형 잔여
 예상은 약 2시간 33분이었다(품목/크기/캐시에 따라 변동, 학습 ETA가 아님).
+
+## 8. 선별·YOLO 원본 변환 연결 (2026-09-04 13:43 KST)
+
+`scripts/plan_aihub_original_cohort.py`는 전체 원본 감사와 보호 지문 보고서의 SHA,
+메타데이터 5개 및 감사 코드를 고정한 뒤 source ID/exact SHA/pHash distance≤4로
+보호 사진과 공식 분할 간 중복을 제외한다. 같은 분할의 exact duplicate는 source ID
+순서로 하나만 남긴다. 교차 분할 중복은 양쪽을 제외하며 기존 예측값을 정답으로 쓰지 않는다.
+전체 CLI는 18개 품목/분할의 원본 감사 범위가 완결되어야 실행된다. 36장 pilot을 전체
+입력으로 가장하지 않으며 `full_cohort`는 감사 범위이지 학습·배포 승인이 아니다.
+
+보호 이미지의 commercial stem에서 원본 ID 636개는 정확히 연결됐다. 그러나 과거
+순번 이름의 legacy train 1,855장/val 1,000장, **총 2,855장은 원본 ID 연결이 미완료**다.
+이들의 실제 SHA와 pHash는 보호되지만 재인코딩 전 원본 정체성의 완전한 증명은 아니다.
+보고서에 `complete_original_lineage=false` 및 변환 이력·파생 이미지 누수·raw replay·
+독립 하드웨어 gate의 `pending_checks`를 유지한다. 이 조건을 삭제해 수용하지 않는다.
+
+### 실제 36장 선별 및 33장 이미지·정답 생성
+
+다음 세 컨테이너는 13:43 KST 재조회에서 모두 exit 0/OOM false였다.
+
+- `probe_original_cohort_36_20260904`: 원본 pilot 36장의 metadata 선별 36/36.
+  `cohort_probe_36_20260904/report.json` SHA
+  `de19c09ae882e6e58372a4e1299e72987b74d70fcd3bb8c07222f978161a100e`.
+- `build_materializer_pilot_input_20260904`: 전체 학습용이 아닌 36장 진단 입력만 생성.
+  `materializer_pilot_input_20260904/cohort.json` SHA
+  `077a3384b947c06a80619da5df07e7584c47e74ad391d5dc39b022d134c2d4c6`.
+- `materialize_original_pilot_36_20260904`: 13:37:09~13:37:15 KST 실행. 원본·JSON
+  36장 재검증, 33장 변환, bbox 면적 비율 범위 밖 3장 제외. 이미지 33개와 YOLO 정답
+  파일 33개가 실제 존재하며 `failed.json`은 없다. 약 3.19MB의 파생 파일만 생성했다.
+
+변환 출력은 작업 루트 밖의 독립 경로
+`/share/Container/aihub_original_materialization_pilot_20260904/dataset`이다.
+`report.json` SHA는
+`f4526132a62ede5abbb5bfe4b13cb1dcf0ebd695898a879d5add0204b13bb43b`이며
+`snapshot_ready.json`의 report pin과 일치한다. Training 18장(9종 각 2장), Validation
+15장이다. Validation battery가 0장이므로 **이 pilot은 9종 검증 데이터 충족이 아니다**.
+`full_cohort=false`, training/deployment/blind authority=false다.
+
+변환기는 원본 최소 변 320, bbox 면적 비율 0.04~0.80, 축소 grayscale 밝기 18~238,
+Laplacian variance≥20으로 품질을 제외한다. 긴 변 최대 640/업스케일 없음/round/
+INTER_AREA/JPEG90과 원본 JSON bbox의 정규화 8자리 YOLO label을 사용한다.
+lineage에 원본·annotation·파생 이미지·YOLO label SHA를 결박하며 상태는 -1이다.
+이 규칙은 이미지 품질 선별이지 실제 쓰레기통 적합성·상태 정답의 자동 증명은 아니다.
+
+전체 감사는 중단하지 않았다. 13:43 KST 실제 로그 36,400/162,305(22.4%),
+verified 36,400, elapsed 2,007.47초, 선형 잔여 6,944초(약 1시간 56분)였다.
+원본 검사 ETA이며 학습 완료 ETA가 아니다. 보호 및 원본 입력은 계속 read-only다.
+
+### 실제 33장 YOLO proposal 생성 완료
+
+`generate_original_raw_pilot_33_20260904`는 13:46:32~13:46:45 KST 실행 후
+exit 0/OOM false로 종료했다. 기존 모델
+`runs/trash_v2_full-2/weights/best.pt`(SHA
+`7b849c25c3983a54b4b6c922e425798f89326b2da21e862b90d2ee0c6a181f69`)와
+현재 고정 batch1/raw-generation wrapper를 사용했다. GPU에서 33개 source를 실제
+처리했고 proposal 34개 중 runtime top1로 33개를 선택했다. 33개 모두 원 JSON GT에
+대한 positive IoU≥0.5이며 320px crop 33개/708,392 bytes를 생성했다. 이는
+**이 pilot의 객체 위치 연결 결과**이지 9종 재질 정확도 100%라는 뜻이 아니다.
+background와 Validation battery 지원도 이 pilot에는 없다.
+
+출력 `/share/Container/aihub_original_raw_pilot_20260904/generation`:
+
+- `raw/manifest.csv` SHA
+  `105b6a01141fc4ec8a7aa37af778c2963bff2dc5a159a009bffc999c6ea31de2`.
+- `raw/dataset_info.json` SHA
+  `ab5cd47534dc01254b025c241bbbe3e8471197cfbd47429e8ede8405bee79fef`.
+- `control/raw_generation_ready.json` SHA
+  `92b8929b8bf8d48b10810fea32bb41602bf0e6c83aad55c577407417e1a6fe51`.
+  `control/failed.txt`는 없다. 모든 downstream authority는 false다.
+
+원본·annotation→파생 이미지·정답→실제 YOLO crop 생성 연결이 처음부터 확인됐다.
+다음에는 frozen validator의 같은 batch1 replay를 검사한다. 과거 confidence/bbox
+오차 허용 범위는 바꾸지 않으며 원본/기존 CSV를 수정하지 않는다.
+읽기 전용 검사 컨테이너 `inspect_original_raw_pilot_20260904` 역시 exit 0/OOM false다.
+관리용 foreground 요청은 60초 관측 timeout이 있었지만 실제 컨테이너는 약 2.35초 만에
+성공 종료했다. 재접속 후 같은 컨테이너의 상태·로그로 확인했으며 작업은 재시작하지 않았다.
+
+### NAS 자체 원본 검사→선별 자동 연결 설치
+
+`scripts/nas/continue_original_audit_to_cohort_20260904.sh`를 새 불변 code 경로
+`J/cohort_release_20260904_1352`에 복사하고 NAS `/bin/sh -n` 및 SHA를 확인했다.
+J는 위 작업 루트다. bridge SHA는
+`535a2e54921b66ac154b087efe4c131ca02d1ba734869e269ba08b42afded307`,
+planner SHA는 `2bd66a9ed59b95f72265d8ac4f4a9c37b5e3f1533aa118d40c1b02dbbe5f3c33`다.
+
+실제 CONTROL은 **`J/cohort_continuation_20260904_1356`**이며 다음 감시는 먼저 이
+경로를 확인한다. 호스트 PID 26311/PPid 1과 자식 `docker wait` PID 26549가 실제로
+원본 검사 컨테이너 ID
+`306f871abf56624d3076ed01373905972b6d7e99b30e82dea599e1a6a9b0c0c1`을 대기하는 것을
+확인했다. `producer_before.txt`에 running/OOM false 및 고정 image ID가 기록됐다.
+bootstrap 로그는 `J/cohort_bridge_20260904_1356.bootstrap.log`다.
+
+NAS에는 외부 `timeout`/`nohup` 명령이 없다. 초기 nohup 시작 실패 로그
+`cohort_bridge_20260904_1352.bootstrap.log`는 보존했으며 해당 CONTROL은 생성되지
+않았다. 실제 실행은 SIGHUP을 무시하는 분리된 shell과 전용 로그로 시작했다.
+짧은 Docker 관리 명령의 watchdog은 자식 PID+Linux starttime이 같은 경우에만
+TERM→KILL을 보낸다. 다른 서비스/PID 그룹을 건드리지 않으며 `docker wait`에는
+시간 제한이 없다. watchdog의 stdin/stdout/stderr는 `/dev/null`로 분리한다.
+Linux 정상 종료·실패 코드·TERM/KILL timeout·PID 변경·출력 pipe 검사를 포함한
+6개 실행 검사와 shell syntax 검사를 통과했다.
+
+원본 컨테이너의 같은 ID가 exit 0/OOM false로 끝나야 최종 report SHA를 고정하고
+`cohort_original_20260904_1356`을 **한 번만** 생성한다(CPU 2/RAM 3GiB/network none,
+입력 read-only/새 CONTROL만 writable). 그 출력은 `CONTROL/cohort/cohort.json`이다.
+`cohort_ready.json`은 metadata 완료만 의미한다. failed.txt가 ready보다 우선하고,
+관리 timeout은 observation_error.txt로 남긴 뒤 재시작하지 않는다. 자동 연결은 학습이나
+배포를 수행하지 않는다. 감시에서 이 작업과 별도로 cohort를 중복 실행하지 않는다.
+
+최신 코드의 원본 감사/보호 지문/선별/변환 테스트는 합계 **137 passed**다.
+materializer의 기존 코드 SHA pin 덮어쓰기 결함도 수정했다(회귀 4개 포함).
+최신 SHA `48598dde8491928f46ab64f9f479946e4a14a800f3e8d1dd1c396d9189e93b06`을
+위 cohort_release에 배치했다. 앞선 36장 pilot은 코드 경로를 metadata로 pin하지 않아
+그 결함 경로를 사용하지 않았다. 기존 pilot 코드·결과는 변경하지 않는다.
