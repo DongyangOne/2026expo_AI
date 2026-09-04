@@ -32,7 +32,7 @@ from fastapi import UploadFile
 from app.core.config import settings
 from app.models.registry import ModelRegistry
 from app.schemas.enums import DetectionStatus, GeneralWasteCode, WasteClass
-from app.schemas.response import Classification, DetectResponse, WeightInfo
+from app.schemas.response import Classification, Conditions, DetectResponse, WeightInfo
 from app.services import guidance, inference, verifier_shadow
 from app.services.weight_check import is_anomaly
 
@@ -99,6 +99,20 @@ def _verifier_supports_vinyl(prediction: dict | None, yolo_confidence: float) ->
         and verifier_confidence >= settings.VINYL_VERIFIER_CONF
         and verifier_confidence - yolo_confidence >= settings.VINYL_VERIFIER_MARGIN
     )
+
+
+def _apply_verifier_label(conditions: Conditions, prediction: dict | None) -> Conditions:
+    """라벨 판정만 검증기 헤드로 대체한다.
+
+    같은 하드웨어 crop에서 구형 state 모델은 라벨을 놓치는 쪽으로 틀렸고
+    검증기 헤드는 틀리지 않았다. dent는 하드웨어 정답에 양성 표본이 없어 그대로 둔다.
+    """
+    if conditions.has_label is None or prediction is None:
+        return conditions
+    head = (prediction.get("heads") or {}).get("label")
+    if head is None:
+        return conditions
+    return Conditions(has_label=bool(head["value"]), is_dented=conditions.is_dented)
 
 
 def _response_class_id(model_class_id: int | None) -> int | None:
@@ -242,6 +256,18 @@ async def run(
             confidence = rescued_confidence
             correction_applied = True
 
+    # ── 라벨 판정용 검증기 확보 — 고신뢰 PET/플라스틱도 label 헤드가 필요하다 ────────
+    if (
+        settings.VERIFIER_LABEL_HEAD_ENABLED
+        and verifier_prediction is None
+        and class_id in {_PET_MODEL_CLASS_ID, _PLASTIC_CLASS_ID}
+        and verifier_session is not None
+        and not inference.verifier_is_shadow_only(verifier_session)
+    ):
+        verifier_prediction = await loop.run_in_executor(
+            _executor, inference.run_verifier, verifier_session, img, bbox
+        )
+
     # ── 합의 게이트 — 두 모델이 갈리면 어느 쪽도 확정하지 않는다 ────────────────────
     gate_defers = False
     if (
@@ -346,6 +372,8 @@ async def run(
         _executor, inference.run_state, registry.state(), img, bbox, cls
     )
     conditions = state_prediction.conditions
+    if settings.VERIFIER_LABEL_HEAD_ENABLED:
+        conditions = _apply_verifier_label(conditions, verifier_prediction)
     weight_info.anomaly = (
         settings.WEIGHT_ANOMALY_ENABLED
         and weight_g is not None

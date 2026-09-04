@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     VERIFIER_SHADOW_ENABLED: bool = True
     VERIFIER_SHADOW_LOG_PATH: str = "logs/verifier_shadow.jsonl"
 
+    # conditions.has_label을 구형 state 모델 대신 crop 검증기 label 헤드로 만든다.
+    # 학습에 쓰이지 않은 하드웨어 crop 19건(라벨있음 13·없음 6) 실측:
+    #   state 16/19(84.2%), 검증기 19/19(100%).
+    #   state의 오류 3건 중 2건이 "라벨이 있는데 없다고 함"이라 미제거 라벨을 통과시킨다.
+    # dent와 foreign_material은 하드웨어 정답에 양성 표본이 없어 근거가 없으므로 바꾸지 않는다.
+    VERIFIER_LABEL_HEAD_ENABLED: bool = True
+
     # YOLO가 TRUST_CONF에 못 미쳐 일반쓰레기로 보낼 건을 crop 검증기가 확신하면 되살린다.
     # 학습 미사용 하드웨어 35건 실측(현재 동작 → 구제 0.60):
     #   정답 20→27, 보류 14→4, 오답 1→4 (McNemar p=0.016, 현재만 맞은 건 0건).

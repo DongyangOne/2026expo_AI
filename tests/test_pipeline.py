@@ -202,8 +202,9 @@ def test_metadata_candidate는_비닐후보가_있어도_shadow만_수행(monkey
 
 def test_비닐보조후보가_없는_저신뢰_pet은_plastic_low_confidence를_유지(monkeypatch):
     captured = {}
-    # 이 테스트는 비닐 교정 경로만 검증한다. 저신뢰 구제는 별도 테스트에서 다룬다.
+    # 이 테스트는 비닐 교정 경로만 검증한다. 구제·label 헤드는 별도 테스트에서 다룬다.
     monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", False, raising=False)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_LABEL_HEAD_ENABLED", False, raising=False)
 
     def fail_if_verifier_runs(*_args, **_kwargs):
         raise AssertionError("비닐 보조 후보가 없으면 검증기를 동기 실행하면 안 됩니다.")
@@ -457,6 +458,7 @@ def test_구제가_꺼져있으면_저신뢰는_그대로_일반쓰레기(monkey
     monkeypatch.setattr(inference, "run_main", _fake_clear_plastic_detection)
     monkeypatch.setattr(verifier_shadow, "submit", lambda *a, **k: None)
     monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", False, raising=False)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_LABEL_HEAD_ENABLED", False, raising=False)
 
     def fail_if_verifier_runs(*_args, **_kwargs):
         raise AssertionError("구제가 꺼져 있으면 검증기를 동기 실행하면 안 됩니다.")
@@ -493,3 +495,76 @@ def test_고신뢰_판정은_구제_경로가_건드리지_않는다(monkeypatch
     assert result.status is DetectionStatus.ALLOWED
     assert result.classification.class_id == 5
     assert result.classification.confidence == 0.90
+
+
+def _label_head_prediction(value: bool):
+    return {
+        "material": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
+        "heads": {"label": {"value": value, "confidence": 0.99}},
+        "input_size": 320,
+    }
+
+
+def test_검증기_label_헤드가_state_모델의_라벨_판정을_대체한다(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_pet_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit_precomputed", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_LABEL_HEAD_ENABLED", True, raising=False)
+    # state 모델은 라벨을 놓쳤고(False) 검증기는 라벨을 봤다(True).
+    monkeypatch.setattr(
+        inference, "run_state",
+        lambda *_args: pipeline.inference.StatePrediction(
+            conditions=Conditions(has_label=False, is_dented=True),
+            has_foreign_material=None,
+        ),
+    )
+    monkeypatch.setattr(inference, "run_verifier", lambda *_a: _label_head_prediction(True))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "label-head-001", _VerifierRegistry())
+        )
+
+    assert result.conditions.has_label is True
+    # 라벨이 남아 있으므로 재처리 안내가 나가야 한다.
+    assert result.status is DetectionStatus.REJECTED
+    assert GuidanceCode.REMOVE_LABEL in [item.code for item in result.guidance]
+
+
+def test_label_헤드_대체가_꺼져있으면_state_판정을_유지(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_pet_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_LABEL_HEAD_ENABLED", False, raising=False)
+    monkeypatch.setattr(
+        inference, "run_state",
+        lambda *_args: pipeline.inference.StatePrediction(
+            conditions=Conditions(has_label=False, is_dented=True),
+            has_foreign_material=None,
+        ),
+    )
+    monkeypatch.setattr(
+        inference, "run_verifier",
+        lambda *_a: (_ for _ in ()).throw(
+            AssertionError("대체가 꺼져 있으면 label용 검증기를 실행하면 안 됩니다.")),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "label-head-off-001", _VerifierRegistry())
+        )
+
+    assert result.conditions.has_label is False
+    assert result.status is DetectionStatus.ALLOWED
+
+
+def test_라벨_비대상_품목은_검증기_헤드로_덮어쓰지_않는다():
+    # 캔은 라벨 검사 대상이 아니라 state가 None을 준다. 그대로 None이어야 한다.
+    conditions = Conditions(has_label=None, is_dented=True)
+    updated = pipeline._apply_verifier_label(conditions, _label_head_prediction(True))
+    assert updated.has_label is None
+    assert updated.is_dented is True
