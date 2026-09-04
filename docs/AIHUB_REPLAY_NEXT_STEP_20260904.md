@@ -486,3 +486,83 @@ blind/deployment 권한은 계속 false다. 같은 pilot을 변화 없이 다시
 다음 작업은 이미 실행 중인 전량 원본 검사와 NAS 자동 cohort 연결의 결과 확인이다.
 13:57 KST 전량 로그는 processed 52,600/162,305(32.4%), verified 52,599,
 선형 잔여 6,004초(약 1시간 40분)였다. 격리 1건의 상세 사유는 최종 보고서에서 확인한다.
+
+## 9. Legacy 원본 연결 진단과 대기 bridge 보완 (2026-09-04)
+
+과거 전체 train 804,421장은 base 변환 361,546장과 remainder 442,875장의 합이다.
+별도 remainder 컨테이너/실제 로그를 확인했으며, 이전 `DATA_AUDIT.md`의 잔존 파일
+추정을 정정했다. 파일 수만으로 원본을 삭제하거나 기존 train을 비우지 않는다.
+상세 설정·로그 SHA·변환 순서는 `DATA_AUDIT.md`의 9/4 정정 절을 따른다.
+
+새 `scripts/audit_legacy_aihub_links.py`는 기존 converter 순서/stride/나머지 선택으로
+원본 **후보만** 찾고, 실제 BGR decode→floor 크기/640/AREA/JPEG90의 재생성 SHA가
+보호 legacy 이미지 SHA와 같은 경우에만 `verified_source_link`로 기록한다.
+원본·JSON·legacy 이미지/sidecar·코드·metadata를 소비 전후 재해시한다. 신규 GT 생성이나
+역사적으로 유일한 원본이었다는 증명이 아니다. unresolved 행에도 검색 후보의 경로/SHA가
+있을 수 있으므로 후속 소비는 반드시 status와 재생성 SHA 일치를 확인한다.
+
+### NAS 실제 9장 probe 결과
+
+- 최초 `audit_legacy_aihub_link_pilot_20260904`는 exit 1/OOM false다.
+  `cap-drop ALL` 상태의 container UID 0이 host chunwol 소유 mode 0700 출력 경로를
+  통과하지 못했다. 데이터 검사 전 실패이며 원본 연결 실패 9건으로 집계하지 않는다.
+  해당 컨테이너·로그·출력 디렉터리는 보존했다.
+- 별도 불변 출력에서 `audit_legacy_aihub_link_pilot_v2_20260904`를 실행했다.
+  **14:19:45~14:19:55 KST, exit 0/OOM false**, 원본 연결 **9/9**,
+  `failed.json` 없음. train/train_r/val에서 각각 첫 보호 인덱스 3개씩 검사했다.
+- 출력 `/share/Container/legacy_aihub_link_pilot_v2_20260904/result/report.json` SHA:
+  `a5b117f22485250bea6471060e1a8b24a8f40aa0e42bbc82291e685e0ac965de`.
+  container 내부 읽기와 SMB `Get-FileHash`가 일치했다.
+- 9개 모두 기존 sidecar 재현도 같았다. 9개 모두 `outside_v3`이며, 이는 **현재 v3
+  manifest에 원본 경로 bytes가 없다**는 뜻이다. SHA/pHash alias 부재나 누수 검증 완료를
+  뜻하지 않는다. 전체 보호 legacy는 train 1,255/train_r 600/val 1,000, 합계 2,855개다.
+- `partial_selection=true`, `complete_original_lineage=false`,
+  `original_alias_uniqueness_proven=false`, training/blind/deployment 권한 false다.
+  전체 연결을 위해서는 `--max-per-kind 0`의 새 불변 실행과 미해결/별칭 후속 검사가 필요하다.
+  원본 전량 검사가 실행 중이므로 큰 중복 I/O 작업을 즉시 추가하지 않았다.
+- helper SHA `24a4fea8bb9c77d39ae5dd3d5de1ce243dbf33ec13e23c8a7eddaed0a17526f6`.
+  helper 25개와 기존 cohort/materializer를 합쳐 **95 tests passed**다.
+
+### 실제 대기 bridge 교체
+
+위 권한 문제가 원본 검사 뒤의 cohort 컨테이너에도 적용됨을 확인했다. bridge는
+`cap-drop ALL`에 **DAC_OVERRIDE 하나만** 추가했다. rootfs/input read-only, 새 CONTROL만
+read-write, network none, no-new-privileges, CPU 2/RAM 3GiB 및 나머지 격리는 유지한다.
+NAS 파일 권한/소유권은 변경하지 않았다. 회귀·POSIX syntax 검사 4개가 통과했다.
+
+기존 대기 프로세스 PID 26311/starttime 632411687 및 그 자식 docker wait
+PID 26549/starttime 632411906의 실제 명령과 대기 producer ID를 확인한 뒤 **그 둘만**
+TERM으로 종료했다. 원본 컨테이너는 종료/재시작하지 않았다. 기존 CONTROL 1356의
+`replacement_process_evidence.txt`와 `superseded.txt`에 근거와 교체 이유를 보존했다.
+
+이후 사용하는 경로는 다음으로 바뀌었다. 앞의 8절 1356 경로는 역사 기록이다.
+
+- CODE_ROOT: `J/cohort_release_20260904_1428`
+- CONTROL: `J/cohort_continuation_20260904_1428`
+- bootstrap: `J/cohort_bridge_20260904_1428.bootstrap.log`
+- bridge SHA: `fc3ea4d3ce585a011a6984f63cc7309b5a48aef7dc8aa6224da854262a50b7b6`
+- planner/helper SHA는 8절과 같다. 실제 새 bridge PID는 22398이다.
+- 다음 cohort 컨테이너: `cohort_original_20260904_1428`
+
+PID는 다음 실행 때 재사용을 확인한다. 원본 producer의 동일 ID/정상 종료 후 한 번만
+metadata cohort를 생성하며 학습·배포는 하지 않는다. `failed.txt` 우선,
+`observation_error.txt`는 관측 실패이며 중복 재시작 근거가 아니다.
+
+14:23 KST 새 PID 22398/starttime 632597154/PPid 1의 실제 script 명령과
+`producer_before.txt`의 원본 동일 ID/running/OOM false/image pin을 확인했다.
+새 bootstrap과 오류 파일은 비어 있고 failed/observation_error/ready는 아직 없다.
+원본 processed **80,500/162,305(49.6%)**, verified 80,492, 격리 8,
+elapsed 4,437.59초/선형 잔여 4,510초(약 75분)다. 격리 이유는 최종 report로 확인한다.
+이후 CPU 306.71%/RAM 1.485GiB, GPU 0%/2MiB/16,380MiB/42°C,
+디스크 2.6TiB 여유(83% 사용)를 조회했다. GPU 조회는 QNAP 드라이버 lib 경로를
+그 명령의 `LD_LIBRARY_PATH`에만 지정했다. timiroom 컨테이너는 계속 실행 중이며
+naco-ollama 두 컨테이너는 기존 exited 상태다. 학습 ETA가 아닌 원본 검사 ETA다.
+
+### Pi 접근 상태 (14:10 KST)
+
+공개 `https://ai.oneexpo.kro.kr/health`는 HTTP 200, status ok,
+main/state/verifier 모델 loaded를 반환했다. PC→Pi `100.121.110.75:22`는 5초 TCP 확인에서
+도달하지 못했고 local Tailscale BackendState는 NoState였다. VPN/서비스를 바꾸거나
+NAS 비밀번호로 Pi에 로그인하지 않았다. Pi host key는 이번에 live 대조하지 못했으며
+신규 운영 사진 확보 여부는 여전히 미확인이다. health 성공은 신규 모델 성능·실제
+하드웨어/Spring callback E2E 통과 증거가 아니다.

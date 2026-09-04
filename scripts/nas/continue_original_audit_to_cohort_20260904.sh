@@ -152,9 +152,11 @@ check_inputs || fail 'pinned inputs changed while waiting'
 app_control=/app${CONTROL#"$ROOT"}
 app_code=/app${CODE_ROOT#"$ROOT"}
 app_job=/app${JOB#"$ROOT"}
+# CONTROL is host-user-owned mode 0700. Container UID 0 needs DAC_OVERRIDE
+# after dropping other capabilities; read-only input mounts remain read-only.
 if ! bounded_command 60 "$DOCKER" create --name "$PLANNER_CONTAINER" --runtime runc \
     --network none --read-only --cpus 2 --memory 3g --memory-swap 3g --pids-limit 128 \
-    --cap-drop ALL --security-opt no-new-privileges \
+    --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
     --tmpfs /tmp:rw,nosuid,nodev,size=64m \
     -e PYTHONDONTWRITEBYTECODE=1 -e OMP_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 \
     -v "$ROOT:/app:ro" -v "$CONTROL:$app_control:rw" --workdir "$app_code" \
