@@ -171,3 +171,54 @@ Ollama에는 이미지와 JSON schema를 함께 전달하고 반환 필드를 �
 응답의 완료 사유·토큰 수·처리 시간을 기록해 잘린 출력과 정상 JSON을 구분한다.
 [Ollama Chat API](https://docs.ollama.com/api/chat).
 이 기능들이 올바른 재질이나 주대상 선택을 보장하는 것은 아니므로 실제 사진과 비교한다.
+
+## 7. 실제 두 모델 진단 완료 — 배포/hold 해제 아님
+
+`c9555c0`의 v2 진단을 NAS `diagnose_semantics_v2_gpu_20260904`에서 실행했다.
+2026-09-04 03:20:20–03:23:09 UTC에 종료 코드 0, OOM=false로 완료했다.
+결과는 작업 루트의 `work/ctx8192/semantic_diagnostic_v2_gpu_20260904_container/result`다.
+
+| 산출물 | SHA256 |
+|---|---|
+| `diagnostic_summary.json` | `d336b57b9d08ad1050453613daa89ffd0a63415401fc7081536d873122f0289e` |
+| `diagnostic_contract.json` | `0b3c9059c1b77a20d6e7ae0610184851615310e08a1e01e3dead74e5204a2230` |
+| `diagnostic_requests.jsonl` | `d299cac320a7d371077ea547dbada0e609e90cf71cd7bf92a00a611688203506` |
+| `diagnostic_gpu_warmups.jsonl` | `072ad0c56e31b0328e583b830298543af5ba3d86ad7d5a213a7a6d4d478ed723` |
+
+각 모델은 같은 완전한 taxonomy와 원본 사진만 받았다. 기존 teacher/YOLO의 답과
+원본 파일명·기대 정답은 전달하지 않았다. 모델별 preload 뒤 `/api/ps`의 실제
+name/digest/context=8192/VRAM>0을 확인하고 각각 3장씩 처리했다. 8B VRAM은
+6,536,183,152 bytes, 9B는 5,880,141,577 bytes였다. **장당 4.35–5.19초**이며
+별도 모델 preload 약 11초씩과 입력/종료 해시 검증 시간은 이 장당 수치에서 제외한다.
+
+| 진단 사진 | 기존 teacher | 새 8B / 9B 재질 | 8B / 9B label | 두 모델 bbox IoU |
+|---|---|---|---|---:|
+| 비닐봉투 | plastic | vinyl / vinyl | no / yes | 0.9430 |
+| 찌그러진 캔 | plastic | can / can | no / yes | 0.8006 |
+| 전경 PET병 | plastic | pet / pet | no / unknown | 0.0000 |
+
+직접 재확인한 세 원본에서 새 재질 판단은 앞쪽 비닐봉투·금속 캔·PET병에 부합한다.
+그러나 이 세 장은 이미 본 진단 사진이므로 **일반화 정확도 100%, 독립 blind 통과,
+학습 모델 성능 개선 완료로 표현하지 않는다.** 두 모델의 foreign_material=no도
+검증된 음성 라벨로 승격하지 않는다.
+
+PET의 8B box는 `[443,461,582,997]`, 9B는 `[0.448,0.461,0.573,1]`이었다.
+0–1000 계약에 대해 9B가 0–1 척도로 보이는 값을 반환해 원문 그대로 계산한 IoU는 0이다.
+자동으로 1000을 곱해 통과시키지 않는다. 기존 number/range 검사만으로 좌표 단위의
+의미 오류를 배제하지 못한 사례이므로 이후 학습 annotation 계약은 명시적 정수 좌표와
+원본 크기에 대응하는 유효 crop 검증을 포함해야 한다. 그 수정은 신규 버전에서 하고
+이번 기록을 고치지 않는다. bag/can의 라벨 불일치와 관측 cue도 그대로 미확정이다.
+예를 들어 캔의 바닥이 보이는 사진에서 주장한 pull_tab cue를 독립 사실로 취급하지 않는다.
+
+앞선 v1은 잘못 옮긴 source SHA를 사전 검사에서 거부했으며 사진 전송은 없었다.
+retry01은 실제 hold JSON에서 SHA를 읽어 선택했다. 첫 8B 요청에서 CUDA 초기화 실패와
+CPU fallback(size_vram=0)을 확인했고 4/6 결과가 남은 상태에서 그 진단만 중단했다.
+컨테이너 exit 137은 명시적 중단이며 OOM=false다. 기존 출력/로그는 보존했다.
+전용 judge 서비스만 중지한 뒤 문서화된 sync/drop_caches/compact_memory를 적용하고
+다시 시작했다. NAS 재부팅과 timiroom-* 변경은 없었고 naco 두 서비스는 계속 중지다.
+v2는 CPU fallback이면 이미지 전송 전에 실패하는 검사와 57개 회귀 테스트를 추가했다.
+
+**9장 전체 hold는 그대로이며 학습은 시작하지 않았다.** 다음 운영 데이터 단계는
+단일 모델 다수결을 버전만 바꿔 반복하는 것이 아니라, 별도 버전에서 재질·대상·좌표
+단위·라벨/이물질을 검증하는 teacher 연결이다. 병행 가능한 AIHub 재현성 진단은
+`AIHUB_REPLAY_NEXT_STEP_20260904.md`에 분리했다.

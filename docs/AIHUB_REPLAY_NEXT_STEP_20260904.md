@@ -109,4 +109,51 @@ launcher는 별도 검토 대상이지 기존 candidate gate나 v3 watcher를 �
 production/Pi 모델·Spring 계약을 바꾸지 않는다.
 
 이 작업은 운영 9B teacher의 오라벨/전경 혼동과 독립된 **AIHub YOLO replay 재현성 문제**다.
-운영 hold는 계속 유지한다. 이 문서 작성 자체로 새 학습·추론·NAS 변경을 실행하지 않았다.
+운영 hold는 계속 유지한다. 위 1–4절은 당시 문서 작성 시점의 계획이다.
+
+## 5. 실제 4조건 GPU 진단 완료 — 2026-09-04 12:37 KST
+
+`probe_aihub_replay_batch_v2_20260904`가 03:37:16–03:37:27 UTC에 exit 0으로 끝났다.
+실제 원본 첫 12장을 batch 12로, 실패 대상 한 장을 새 YOLO 인스턴스에서 두 번,
+첫 12장을 `rect=false` 대조 조건으로 처리했다. 총 26 image inference이며 전량 재검증은 아니다.
+
+- 원본 행/경로 확인 보고서 SHA: `3203cf7efd93eb86d4fe9b6d30ed0d72f71c5cc12888c934a1d34435bbd783ef`
+- 진단 runner v2 SHA: `d8a634cddc2e7a12553a59979670bcd5d627194892602cfba94e9e1b28bb7576`
+- 결과: 작업 루트의 `aihub_replay_batch_probe_v2_20260904/new.json`
+- 결과 SHA: `75953771b5c491419157dd033cfee018cfcd836fd2cdbaa796976e32e7e42aab`
+- 대상 source SHA: `5f3737d5431d77922771751704a72e2c414bb3648544ccc7a50110a1b382f7a5`
+
+원본 첫 12장 모두 640×360이다. 실제 preprocessing을 교체하지 않고
+`DetectionPredictor.preprocess` 입력/출력을 관측했다. 원본 bytes와 decoded BGR SHA,
+각 결과의 `orig_img` SHA/순서/크기, 모델·manifest·metadata·runner SHA를 대조하고
+종료 후 다시 확인했다. 모든 detector tensor는 CUDA:0, float32, half=false였다.
+
+| 대상 사진 처리 조건 | 실제 NCHW tensor | can confidence | 과거 bbox 최대 차이(px) |
+|---|---|---:|---:|
+| 과거 CSV 저장값 | 당시 실제 shape 미기록 | 0.98830354 | 기준 |
+| 원본 CSV 첫12, 기본 rect=true | 12×3×384×640 | 0.9882251024 | 0.02698517 |
+| 대상 단독 반복 A | 1×3×384×640 | 0.9882209301 | 0.02168274 |
+| 대상 단독 반복 B | 1×3×384×640 | 0.9882209301 | 0.02168274 |
+| 첫12, rect=false 대조군 | 12×3×640×640 | 0.9883035421 | 0 |
+
+단독 반복 A/B의 class/confidence/bbox는 정확히 같았다. 정사각형 대조군의 대상 bbox는
+과거 저장값과 정확히 같고 confidence 차이는 2.14e-9로 8자리 저장 반올림 범위다.
+**이 한 사례에서는 입력 padding 차이가 과거 mismatch를 설명한다는 직접 근거**다.
+원래 generation batch의 동반 이미지/shape를 복원한 것은 아니며, 전체 91,938행의
+원인이 모두 확정됐거나 기존 validator를 통과했다는 뜻은 아니다. 고정 임계값이나
+원본 confidence/bbox를 변경하지 않는다. 새 데이터는 운영 단일 요청에 맞는 batch=1
+생성 후 같은 조건으로 실제 재검증하는 경로가 타당하다.
+
+첫 실행은 CUDA 초기화에서 거부되어 추론이 없었다. 다른 GPU 작업이 없는 것을 확인한
+뒤 문서화된 memory compaction을 실행했고, retry01은 CUDA 진입 후 결과 경로 검사에서
+멈췄다. 실제 pinned Ultralytics 8.4.60은 list 입력을 PIL/NumPy로 바꾸고 filename이
+없으면 `image{i}.jpg`를 사용한다. 이는 source 순서가 달라졌다는 증거가 아니므로 v2는
+표시 경로를 정답으로 믿지 않고 실제 결과 픽셀 SHA·순서를 반드시 검증한다. 이전 실패
+결과는 유지했다. NAS 재부팅, 운영 모델 및 서비스 변경은 없었다.
+
+기존 QX3 3,500 source의 별도 batch=1 생성/검증 완료 marker도 실물로 확인했다.
+`v4_repro_validation_qx3_retry2_5ac3031_20260902_223000/validation/control`의
+`diagnostic_ready.json`은 `batch1_validator_ab_reproducibility_passed`, comparison은
+`validator_ab_exact_reproduction`이다. 생성된 3,498행의 두 report와 validated CSV가
+일치했다. 이는 과거 재현성 진단이며 새 학습 실행·학습 승인·현재 full-quality 계약 통과가
+아니다. 3,500 source 전체를 계속 보호하고 학습에 넣지 않는다.
