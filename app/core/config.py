@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     VERIFIER_SHADOW_ENABLED: bool = True
     VERIFIER_SHADOW_LOG_PATH: str = "logs/verifier_shadow.jsonl"
 
+    # YOLO가 TRUST_CONF에 못 미쳐 일반쓰레기로 보낼 건을 crop 검증기가 확신하면 되살린다.
+    # 학습 미사용 하드웨어 35건 실측(현재 동작 → 구제 0.60):
+    #   정답 20→27, 보류 14→4, 오답 1→4 (McNemar p=0.016, 현재만 맞은 건 0건).
+    # 특히 플라스틱은 7건 전부 보류되던 것이 5건 정답으로 바뀐다.
+    VERIFIER_RESCUE_ENABLED: bool = True
+    VERIFIER_RESCUE_CONF: float = 0.60
+
     # YOLO와 crop 검증기가 응답 클래스에서 불일치하면 확정하지 않고 일반쓰레기로 보낸다.
     # 학습에 쓰이지 않은 하드웨어 감사 35건에서 두 모델이 합의한 21건은 전부 정답이었고,
     # 불일치한 14건은 YOLO 4건·검증기 5건만 맞아 어느 쪽도 근거가 되지 못했다.

@@ -211,6 +211,37 @@ async def run(
             confidence = verifier_confidence
             correction_applied = True
 
+    # ── 저신뢰 구제 — 일반쓰레기로 버려질 건을 검증기가 확신하면 되살린다 ─────────────
+    if (
+        settings.VERIFIER_RESCUE_ENABLED
+        and not correction_applied
+        and confidence < settings.TRUST_CONF
+        and verifier_session is not None
+        and not inference.verifier_is_shadow_only(verifier_session)
+    ):
+        if verifier_prediction is None:
+            verifier_prediction = await loop.run_in_executor(
+                _executor, inference.run_verifier, verifier_session, img, bbox
+            )
+        material = (verifier_prediction or {}).get("material") or {}
+        rescued_id = material.get("class_id")
+        rescued_confidence = float(material.get("confidence", 0.0))
+        if (
+            rescued_id in _CLASS_BY_ID
+            and rescued_confidence >= settings.VERIFIER_RESCUE_CONF
+        ):
+            logger.info(
+                "저신뢰 %s(%.4f)를 검증기 %s(%.4f)로 구제: client_id=%s",
+                _CLASS_BY_ID.get(class_id),
+                confidence,
+                _CLASS_BY_ID.get(rescued_id),
+                rescued_confidence,
+                client_id,
+            )
+            class_id = rescued_id
+            confidence = rescued_confidence
+            correction_applied = True
+
     # ── 합의 게이트 — 두 모델이 갈리면 어느 쪽도 확정하지 않는다 ────────────────────
     gate_defers = False
     if (

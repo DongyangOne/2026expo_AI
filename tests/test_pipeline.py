@@ -202,6 +202,8 @@ def test_metadata_candidate는_비닐후보가_있어도_shadow만_수행(monkey
 
 def test_비닐보조후보가_없는_저신뢰_pet은_plastic_low_confidence를_유지(monkeypatch):
     captured = {}
+    # 이 테스트는 비닐 교정 경로만 검증한다. 저신뢰 구제는 별도 테스트에서 다룬다.
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", False, raising=False)
 
     def fail_if_verifier_runs(*_args, **_kwargs):
         raise AssertionError("비닐 보조 후보가 없으면 검증기를 동기 실행하면 안 됩니다.")
@@ -391,3 +393,103 @@ def test_pet과_plastic은_같은_통이므로_합의로_본다(monkeypatch):
 
     assert result.status is DetectionStatus.ALLOWED
     assert result.classification.class_id == 3
+
+
+def test_저신뢰_구제가_켜지면_검증기_확신으로_일반쓰레기_대신_확정한다(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_clear_plastic_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit_precomputed", lambda *a, **k: None)
+    monkeypatch.setattr(
+        inference, "run_state",
+        lambda *_args: pipeline.inference.StatePrediction(
+            conditions=Conditions(has_label=False, is_dented=True),
+            has_foreign_material=None,
+        ),
+    )
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", True, raising=False)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_CONF", 0.60, raising=False)
+    monkeypatch.setattr(
+        inference, "run_verifier",
+        lambda *_args: {
+            "material": {"class_id": 3, "class_name": "plastic", "confidence": 0.93},
+            "heads": {}, "input_size": 320,
+        },
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "rescue-001", _VerifierRegistry())
+        )
+
+    # YOLO 0.391은 TRUST_CONF 미만이라 원래 일반쓰레기였다.
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification.class_id == 3
+    assert result.classification.confidence == 0.93
+
+
+def test_검증기가_확신하지_못하면_구제하지_않고_일반쓰레기를_유지(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_clear_plastic_detection)
+    monkeypatch.setattr(verifier_shadow, "submit_precomputed", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", True, raising=False)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_CONF", 0.60, raising=False)
+    monkeypatch.setattr(
+        inference, "run_verifier",
+        lambda *_args: {
+            "material": {"class_id": 3, "class_name": "plastic", "confidence": 0.42},
+            "heads": {}, "input_size": 320,
+        },
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "rescue-lowconf-001", _VerifierRegistry())
+        )
+
+    assert result.status is DetectionStatus.GENERAL_WASTE
+
+
+def test_구제가_꺼져있으면_저신뢰는_그대로_일반쓰레기(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_clear_plastic_detection)
+    monkeypatch.setattr(verifier_shadow, "submit", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", False, raising=False)
+
+    def fail_if_verifier_runs(*_args, **_kwargs):
+        raise AssertionError("구제가 꺼져 있으면 검증기를 동기 실행하면 안 됩니다.")
+
+    monkeypatch.setattr(inference, "run_verifier", fail_if_verifier_runs)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "rescue-off-001", _VerifierRegistry())
+        )
+
+    assert result.status is DetectionStatus.GENERAL_WASTE
+
+
+def test_고신뢰_판정은_구제_경로가_건드리지_않는다(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", True, raising=False)
+
+    def fail_if_verifier_runs(*_args, **_kwargs):
+        raise AssertionError("고신뢰 건에 검증기를 실행하면 안 됩니다.")
+
+    monkeypatch.setattr(inference, "run_verifier", fail_if_verifier_runs)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "rescue-highconf-001", _VerifierRegistry())
+        )
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification.class_id == 5
+    assert result.classification.confidence == 0.90
