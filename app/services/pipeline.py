@@ -49,6 +49,7 @@ _CLASS_BY_ID: dict[int, WasteClass] = {
 
 _PLASTIC_CLASS_ID = 3
 _PET_MODEL_CLASS_ID = 1
+_CAN_MODEL_CLASS_ID = 0
 _VINYL_MODEL_CLASS_ID = 5
 
 
@@ -101,18 +102,43 @@ def _verifier_supports_vinyl(prediction: dict | None, yolo_confidence: float) ->
     )
 
 
-def _apply_verifier_label(conditions: Conditions, prediction: dict | None) -> Conditions:
-    """라벨 판정만 검증기 헤드로 대체한다.
+def _needs_verifier_conditions(model_class_id: int) -> bool:
+    """검증기 헤드로 대체할 상태 검사 대상인지 판단한다."""
+    label_target = model_class_id in {_PET_MODEL_CLASS_ID, _PLASTIC_CLASS_ID}
+    dent_target = model_class_id in {_PET_MODEL_CLASS_ID, _CAN_MODEL_CLASS_ID}
+    return (
+        (settings.VERIFIER_LABEL_HEAD_ENABLED and label_target)
+        or (settings.VERIFIER_DENT_HEAD_ENABLED and dent_target)
+    )
 
-    같은 하드웨어 crop에서 구형 state 모델은 라벨을 놓치는 쪽으로 틀렸고
-    검증기 헤드는 틀리지 않았다. dent는 하드웨어 정답에 양성 표본이 없어 그대로 둔다.
+
+def _apply_verifier_conditions(
+    conditions: Conditions, prediction: dict | None,
+) -> Conditions:
+    """라벨·압착 판정을 검증기 헤드로 대체한다.
+
+    압착은 비대칭으로 다룬다. '압착됨'으로 통과시키려면 확신이 필요하고,
+    확신이 없으면 미압착으로 보아 다시 압착을 안내한다. 실제 키오스크 crop에서
+    구형 state 모델은 미압착을 압착됨으로 16.1% 잘못 통과시켰다.
     """
-    if conditions.has_label is None or prediction is None:
+    if prediction is None:
         return conditions
-    head = (prediction.get("heads") or {}).get("label")
-    if head is None:
-        return conditions
-    return Conditions(has_label=bool(head["value"]), is_dented=conditions.is_dented)
+    heads = prediction.get("heads") or {}
+    has_label = conditions.has_label
+    if settings.VERIFIER_LABEL_HEAD_ENABLED and has_label is not None:
+        head = heads.get("label")
+        if head is not None:
+            has_label = bool(head["value"])
+
+    is_dented = conditions.is_dented
+    if settings.VERIFIER_DENT_HEAD_ENABLED and is_dented is not None:
+        head = heads.get("dent")
+        if head is not None:
+            is_dented = (
+                bool(head["value"])
+                and float(head["confidence"]) >= settings.VERIFIER_DENT_CONF
+            )
+    return Conditions(has_label=has_label, is_dented=is_dented)
 
 
 def _response_class_id(model_class_id: int | None) -> int | None:
@@ -256,11 +282,10 @@ async def run(
             confidence = rescued_confidence
             correction_applied = True
 
-    # ── 라벨 판정용 검증기 확보 — 고신뢰 PET/플라스틱도 label 헤드가 필요하다 ────────
+    # ── 상태 판정용 검증기 확보 — 고신뢰 건도 label/dent 헤드가 필요하다 ────────────
     if (
-        settings.VERIFIER_LABEL_HEAD_ENABLED
-        and verifier_prediction is None
-        and class_id in {_PET_MODEL_CLASS_ID, _PLASTIC_CLASS_ID}
+        verifier_prediction is None
+        and _needs_verifier_conditions(class_id)
         and verifier_session is not None
         and not inference.verifier_is_shadow_only(verifier_session)
     ):
@@ -372,8 +397,7 @@ async def run(
         _executor, inference.run_state, registry.state(), img, bbox, cls
     )
     conditions = state_prediction.conditions
-    if settings.VERIFIER_LABEL_HEAD_ENABLED:
-        conditions = _apply_verifier_label(conditions, verifier_prediction)
+    conditions = _apply_verifier_conditions(conditions, verifier_prediction)
     weight_info.anomaly = (
         settings.WEIGHT_ANOMALY_ENABLED
         and weight_g is not None

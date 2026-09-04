@@ -205,6 +205,7 @@ def test_비닐보조후보가_없는_저신뢰_pet은_plastic_low_confidence를
     # 이 테스트는 비닐 교정 경로만 검증한다. 구제·label 헤드는 별도 테스트에서 다룬다.
     monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", False, raising=False)
     monkeypatch.setattr(pipeline.settings, "VERIFIER_LABEL_HEAD_ENABLED", False, raising=False)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_DENT_HEAD_ENABLED", False, raising=False)
 
     def fail_if_verifier_runs(*_args, **_kwargs):
         raise AssertionError("비닐 보조 후보가 없으면 검증기를 동기 실행하면 안 됩니다.")
@@ -459,6 +460,7 @@ def test_구제가_꺼져있으면_저신뢰는_그대로_일반쓰레기(monkey
     monkeypatch.setattr(verifier_shadow, "submit", lambda *a, **k: None)
     monkeypatch.setattr(pipeline.settings, "VERIFIER_RESCUE_ENABLED", False, raising=False)
     monkeypatch.setattr(pipeline.settings, "VERIFIER_LABEL_HEAD_ENABLED", False, raising=False)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_DENT_HEAD_ENABLED", False, raising=False)
 
     def fail_if_verifier_runs(*_args, **_kwargs):
         raise AssertionError("구제가 꺼져 있으면 검증기를 동기 실행하면 안 됩니다.")
@@ -539,6 +541,7 @@ def test_label_헤드_대체가_꺼져있으면_state_판정을_유지(monkeypat
     monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
     monkeypatch.setattr(verifier_shadow, "submit", lambda *a, **k: None)
     monkeypatch.setattr(pipeline.settings, "VERIFIER_LABEL_HEAD_ENABLED", False, raising=False)
+    monkeypatch.setattr(pipeline.settings, "VERIFIER_DENT_HEAD_ENABLED", False, raising=False)
     monkeypatch.setattr(
         inference, "run_state",
         lambda *_args: pipeline.inference.StatePrediction(
@@ -565,6 +568,72 @@ def test_label_헤드_대체가_꺼져있으면_state_판정을_유지(monkeypat
 def test_라벨_비대상_품목은_검증기_헤드로_덮어쓰지_않는다():
     # 캔은 라벨 검사 대상이 아니라 state가 None을 준다. 그대로 None이어야 한다.
     conditions = Conditions(has_label=None, is_dented=True)
-    updated = pipeline._apply_verifier_label(conditions, _label_head_prediction(True))
+    updated = pipeline._apply_verifier_conditions(conditions, _label_head_prediction(True))
     assert updated.has_label is None
     assert updated.is_dented is True
+
+
+def _condition_prediction(label: bool, dent: bool, dent_conf: float):
+    return {
+        "material": {"class_id": 1, "class_name": "pet", "confidence": 0.94},
+        "heads": {
+            "label": {"value": label, "confidence": 0.99},
+            "dent": {"value": dent, "confidence": dent_conf},
+        },
+        "input_size": 320,
+    }
+
+
+def test_압착됨_판정은_확신이_있을때만_인정한다():
+    conditions = Conditions(has_label=False, is_dented=True)
+    # 검증기가 압착됐다고 해도 신뢰도가 낮으면 미압착으로 본다.
+    low = pipeline._apply_verifier_conditions(
+        conditions, _condition_prediction(False, True, 0.649))
+    assert low.is_dented is False
+    # 확신이 있으면 압착됨으로 통과시킨다.
+    high = pipeline._apply_verifier_conditions(
+        conditions, _condition_prediction(False, True, 0.97))
+    assert high.is_dented is True
+
+
+def test_검증기가_미압착이라_하면_state가_압착이라_해도_미압착이다():
+    conditions = Conditions(has_label=False, is_dented=True)
+    updated = pipeline._apply_verifier_conditions(
+        conditions, _condition_prediction(False, False, 1.0))
+    assert updated.is_dented is False
+
+
+def test_압착_비대상_품목은_dent를_덮어쓰지_않는다():
+    # 종이는 압착 검사 대상이 아니라 state가 None을 준다.
+    conditions = Conditions(has_label=None, is_dented=None)
+    updated = pipeline._apply_verifier_conditions(
+        conditions, _condition_prediction(True, True, 1.0))
+    assert updated.is_dented is None
+    assert updated.has_label is None
+
+
+def test_미압착_페트병은_compress_안내와_함께_rejected(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_pet_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit_precomputed", lambda *a, **k: None)
+    # state는 "이미 압착됨"이라고 잘못 말한다.
+    monkeypatch.setattr(
+        inference, "run_state",
+        lambda *_args: pipeline.inference.StatePrediction(
+            conditions=Conditions(has_label=False, is_dented=True),
+            has_foreign_material=None,
+        ),
+    )
+    # 검증기는 압착됐다고 하지만 확신이 없다(0.649).
+    monkeypatch.setattr(
+        inference, "run_verifier", lambda *_a: _condition_prediction(False, True, 0.649))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "uncompressed-pet-001", _VerifierRegistry())
+        )
+
+    assert result.status is DetectionStatus.REJECTED
+    assert GuidanceCode.COMPRESS in [item.code for item in result.guidance]

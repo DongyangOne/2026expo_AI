@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     VERIFIER_SHADOW_ENABLED: bool = True
     VERIFIER_SHADOW_LOG_PATH: str = "logs/verifier_shadow.jsonl"
 
+    # 압착 판정을 검증기 dent 헤드로 만들고, '압착됨'으로 통과시킬 때만 확신을 요구한다.
+    # 실제 키오스크 crop 31건(전부 미압착이 정답)에서 '이미 압착됨' 오탐:
+    #   state 5/31(16.1%), 검증기 1/31(3.2%), 검증기+0.90 요구 0/31(0%).
+    # 오탐은 안 구긴 캔·페트병을 그대로 통과시키므로 확신이 없으면 압착을 요구한다.
+    # 반대 방향(이미 압착된 것을 또 요구)은 하드웨어 정답에 압착 양성이 0건이라
+    # 측정하지 못했다. 재투입 안내가 한 번 더 나가는 쪽이 안전하다고 보고 감수한다.
+    VERIFIER_DENT_HEAD_ENABLED: bool = True
+    VERIFIER_DENT_CONF: float = 0.90
+
     # conditions.has_label을 구형 state 모델 대신 crop 검증기 label 헤드로 만든다.
     # 학습에 쓰이지 않은 하드웨어 crop 19건(라벨있음 13·없음 6) 실측:
     #   state 16/19(84.2%), 검증기 19/19(100%).
