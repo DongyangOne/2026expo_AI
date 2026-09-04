@@ -71,14 +71,24 @@ API 응답과 Spring 계약은 바꾸지 않는다. 검증에 실패하면 기�
   HTTP 400이 발생했다. 재실행은 `num_ctx=8192`와 명시적인 품질 필드 일관성
   지시문을 새 teacher contract에 포함한다. 새 contract SHA이므로 이전 결과는
   재사용하지 않으며 별도 출력에 기록한다. 이미지나 통과 기준을 완화하지 않는다.
+- 수정된 `8edcda3` 계약으로 `work/ctx8192/teacher_labels.jsonl`을 생성한 결과는
+  20장 유효 완료, 고신뢰 합의 19장이다. 이는 자동 라벨 판정 결과이며 모델 정확도
+  95%가 아니다. 위치 검증과 후보학습은 별도 단계다. 같은 입력 예제에서 결과가
+  늘었다는 이유로 독립 검증셋이나 배포 통과로 간주하지 않는다.
 - `localize_operational_captures_ollama.py`는 설치된 서로 다른 vision 모델을
   각각 호출해 실제 독립 bbox 증거를 만든다. 원본 이미지만 전달하며 기존
   detector 결과는 입력하지 않는다. 실제 FROM GGUF 파일과 모델 package digest,
   원시 응답, 추론 spec을 결박한다. 모델 간 합의는 독립 정답 정확도가 아니다.
+  첫 실제 실행은 `localize_qwen_v4_8edcda3_20260904`이며 출력은
+  `work/ctx8192/localizer_a`다. teacher 종료 및 모델 unload 후 순차 시작했고,
+  20장의 유효 bbox 응답을 확인했다. 이어서
+  `localize_ministral_v4_8edcda3_20260904`를 별도로 실행한다. provider B와
+  A/B 합의 검증 결과는 별도로 확인해야 한다.
 - 다음 단계는 A/B 위치 검증, 현재 계약의 teacher manifest/quality assembly,
   AIHub와의 라벨·누수 감사 및 후보학습이다. V4의 운영 pseudo-label provenance
   연결과 실제 frozen config/policy는 아직 완성되지 않았다. 승인 SHA를 임의로
   채워 학습을 강행하거나 고정 41장을 독립 blind로 사용하지 않는다.
+  구체적인 연결 작업과 현재 blocker는 `OPERATIONAL_V4_HANDOFF_PLAN.md`에 기록했다.
 - NAS에서는 메모리 정리 후 CUDA 초기화와 실제 GPU 추론을 확인했다. 재부팅,
   `timiroom-*` 변경, 운영 모델 교체는 하지 않았다. NAS→Pi SSH 경로는 연결되지
   않았으므로 최신 Pi 로그까지 수집했다고 표현하지 않는다.
