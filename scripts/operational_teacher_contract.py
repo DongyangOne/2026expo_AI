@@ -95,7 +95,10 @@ clutter_or_multiple_objects, (4) 반사·가림·구도 때문에 대상
 투입구 장면이면 training_usable=true입니다. confidence는 재질과 이 품질 판정을
 포함한 전체 JSON 판정의 확신도입니다. 캔·병·종이 등 대상 자체가 구겨지거나
 찌그러진 것은 중요한 hard case이며 촬영 실패가 아니므로, 대상 경계와 재질을 판독할
-수 있다면 training_usable=true로 유지하세요."""
+수 있다면 training_usable=true로 유지하세요.
+필드 일관성을 반드시 지키세요: training_usable=true이면 quality_reason은 오직
+usable입니다. training_usable=false이면 quality_reason은 위 네 제외 사유 중
+하나여야 하며 usable은 허용되지 않습니다. 마지막으로 이 조합을 확인하세요."""
 PROMPTS = tuple(f"{prompt}\n\n{QUALITY_INSTRUCTION}" for prompt in BASE_PROMPTS)
 ADJUDICATION_PROMPT = """같은 재활용 키오스크 사진을 최종 독립 판정하세요. 사진만 보고
 주재질 하나, 단일 물체 여부, 다른 재질 이물질 부착 여부를 보수적으로 결정하세요.
@@ -103,7 +106,9 @@ ADJUDICATION_PROMPT = """같은 재활용 키오스크 사진을 최종 독립 �
 
 """ + QUALITY_INSTRUCTION
 JSON_ONLY_SUFFIX = " 설명이나 추론 없이 JSON 스키마 필드만 반환하세요."
-REQUEST_OPTIONS = {"temperature": 0, "seed": 20260819, "num_predict": 1024}
+# Full-resolution captures exceeded Ollama's implicit 4096-token context in a
+# real NAS run. Pin the budget in the contract instead of resizing evidence.
+REQUEST_OPTIONS = {"temperature": 0, "seed": 20260819, "num_predict": 1024, "num_ctx": 8192}
 REQUEST_CONTRACT = {
     "endpoint": "/api/chat",
     "stream": False,

@@ -26,6 +26,14 @@ def test_contract_binds_full_rendered_prompts_model_digest_and_request():
     assert len(digest) == 64
 
 
+def test_contract_pins_full_resolution_context_and_quality_consistency():
+    contract, _ = build_teacher_contract("teacher-model", "a" * 64)
+    assert contract["request"]["options"]["num_ctx"] == 8192
+    for prompt in [*PROMPTS, ADJUDICATION_PROMPT]:
+        assert "training_usable=true이면 quality_reason은 오직" in prompt
+        assert "training_usable=false이면 quality_reason은 위 네 제외 사유" in prompt
+
+
 @pytest.mark.parametrize("digest", ["", "a" * 63, "g" * 64])
 def test_contract_rejects_non_exact_model_digest(digest):
     with pytest.raises(ValueError, match="64 hexadecimal"):

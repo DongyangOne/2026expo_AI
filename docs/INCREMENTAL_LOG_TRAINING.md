@@ -55,3 +55,33 @@ API 응답과 Spring 계약은 바꾸지 않는다. 검증에 실패하면 기�
   `-1`로 마스킹된다. 재질·이물질 데이터 증가를 모든 상태 헤드의 개선으로 표현하지 않는다.
 - 모델 모니터링과 별도 검증 후 재학습 원칙:
   [Ultralytics 공식 안내](https://docs.ultralytics.com/guides/model-monitoring-and-maintenance/).
+
+## 2026-09-04 실제 재개 기록
+
+- NAS `operational_refresh_80bf78a_20260904_101000`에서 새 queue를 생성했다.
+  8월 1일 이후 고유 133장 중 기존 train 72장과 보호 검증 41장을 분리하고
+  나머지 20장만 teacher에 전달했다. 원본 snapshot은 수정하지 않았다.
+- snapshot 폴더의 `20260819`는 촬영일이 아니다. 실제 최신 촬영시각은
+  **2026-08-03 11:22:54 KST**다. 이후 로그 수집 시 폴더 날짜를 cutoff로
+  사용하지 말고 완성된 image/JSON 쌍의 timestamp와 SHA로 중복을 제외한다.
+- 첫 9B teacher 실행은 20장 처리를 마쳤으나 유효 완료 10장, 고신뢰 합의 9장이다.
+  이 9장은 위치 검증 전 후보이며, 정확도 90% 또는 학습 완료를 의미하지 않는다.
+  나머지 응답 오류와 판정 불일치는 그대로 보존했다.
+- 실제 고해상도 입력 하나에서 4,610 tokens가 Ollama 기본 4,096 context를 넘어
+  HTTP 400이 발생했다. 재실행은 `num_ctx=8192`와 명시적인 품질 필드 일관성
+  지시문을 새 teacher contract에 포함한다. 새 contract SHA이므로 이전 결과는
+  재사용하지 않으며 별도 출력에 기록한다. 이미지나 통과 기준을 완화하지 않는다.
+- `localize_operational_captures_ollama.py`는 설치된 서로 다른 vision 모델을
+  각각 호출해 실제 독립 bbox 증거를 만든다. 원본 이미지만 전달하며 기존
+  detector 결과는 입력하지 않는다. 실제 FROM GGUF 파일과 모델 package digest,
+  원시 응답, 추론 spec을 결박한다. 모델 간 합의는 독립 정답 정확도가 아니다.
+- 다음 단계는 A/B 위치 검증, 현재 계약의 teacher manifest/quality assembly,
+  AIHub와의 라벨·누수 감사 및 후보학습이다. V4의 운영 pseudo-label provenance
+  연결과 실제 frozen config/policy는 아직 완성되지 않았다. 승인 SHA를 임의로
+  채워 학습을 강행하거나 고정 41장을 독립 blind로 사용하지 않는다.
+- NAS에서는 메모리 정리 후 CUDA 초기화와 실제 GPU 추론을 확인했다. 재부팅,
+  `timiroom-*` 변경, 운영 모델 교체는 하지 않았다. NAS→Pi SSH 경로는 연결되지
+  않았으므로 최신 Pi 로그까지 수집했다고 표현하지 않는다.
+
+현재 예약된 후속 감시는 단계 완료를 확인하고 다음 안전 단계를 이어가는 용도다.
+Pi 신규 로그 자동 동기화나 실시간 자동 학습/배포 기능을 설치한 것은 아니다.
