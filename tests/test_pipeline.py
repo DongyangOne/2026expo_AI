@@ -14,6 +14,7 @@ from app.schemas.response import Conditions
 from app.models.registry import VerifierRuntime
 from app.services import inference, pipeline
 from app.services import verifier_shadow
+from app.services.inference import _confidence
 
 
 class _Registry:
@@ -637,3 +638,32 @@ def test_미압착_페트병은_compress_안내와_함께_rejected(monkeypatch):
 
     assert result.status is DetectionStatus.REJECTED
     assert GuidanceCode.COMPRESS in [item.code for item in result.guidance]
+
+
+def test_tta가_꺼져있으면_뷰는_원본_한_장이다(monkeypatch):
+    crop = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
+    monkeypatch.setattr(inference.settings, "VERIFIER_TTA_ENABLED", False, raising=False)
+    views = inference._verifier_views(crop)
+    assert len(views) == 1
+    assert np.array_equal(views[0], crop)
+
+
+def test_tta가_켜지면_네_뷰를_만든다(monkeypatch):
+    crop = np.random.randint(0, 255, (320, 320, 3), dtype=np.uint8)
+    monkeypatch.setattr(inference.settings, "VERIFIER_TTA_ENABLED", True, raising=False)
+    views = inference._verifier_views(crop)
+    assert len(views) == 4
+    assert all(view.shape == crop.shape for view in views)
+    # 첫 뷰는 원본이어야 단일 뷰 동작과 이어진다.
+    assert np.array_equal(views[0], crop)
+
+
+def test_confidence는_뷰별_확률을_평균낸다():
+    single = np.array([[0.0, 5.0, 0.0]])
+    class_id, confidence = _confidence(single)
+    assert class_id == 1
+
+    # 두 뷰가 서로 다른 클래스를 지목하면 평균이 반영돼야 한다.
+    two_views = np.array([[5.0, 0.0, 0.0], [0.0, 5.0, 0.0]])
+    _, averaged = _confidence(two_views)
+    assert averaged < confidence

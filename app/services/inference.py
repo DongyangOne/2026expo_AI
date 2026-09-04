@@ -59,6 +59,7 @@ def run_main(registry: ModelRegistry, img: np.ndarray):
         img,
         imgsz=settings.IMG_SIZE,
         conf=candidate_conf,
+        iou=settings.DETECT_IOU,
         device=settings.DEVICE,
         verbose=False,
     )
@@ -136,9 +137,11 @@ def run_state(session, img: np.ndarray, bbox: list[float], cls: WasteClass) -> S
 
 
 def _confidence(logits: np.ndarray) -> tuple[int, float]:
-    values = np.asarray(logits[0], dtype=np.float64)
-    shifted = values - values.max()
-    probabilities = np.exp(shifted) / np.exp(shifted).sum()
+    """뷰가 여러 개면 뷰별 확률을 평균낸다. 단일 뷰면 기존 동작과 같다."""
+    values = np.asarray(logits, dtype=np.float64)
+    shifted = values - values.max(axis=1, keepdims=True)
+    exponent = np.exp(shifted)
+    probabilities = (exponent / exponent.sum(axis=1, keepdims=True)).mean(axis=0)
     class_id = int(probabilities.argmax())
     return class_id, float(probabilities[class_id])
 
@@ -146,6 +149,29 @@ def _confidence(logits: np.ndarray) -> tuple[int, float]:
 def verifier_is_shadow_only(session) -> bool:
     """metadata로 명시된 후보는 검증 전까지 운영 판정을 바꾸지 않는다."""
     return isinstance(session, VerifierRuntime)
+
+
+def _normalize(crop: np.ndarray) -> np.ndarray:
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    return ((rgb - _MEAN) / _STD).transpose(2, 0, 1)[None]
+
+
+def _center_zoom(crop: np.ndarray, keep: float = 0.9) -> np.ndarray:
+    """가장자리를 잘라 물체를 키운다. bbox가 헐거운 경우를 보완한다."""
+    height, width = crop.shape[:2]
+    dy, dx = int(height * (1 - keep) / 2), int(width * (1 - keep) / 2)
+    if dy <= 0 or dx <= 0:
+        return crop
+    zoomed = crop[dy:height - dy, dx:width - dx]
+    return cv2.resize(zoomed, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def _verifier_views(crop: np.ndarray) -> list[np.ndarray]:
+    """TTA가 꺼져 있으면 원본 한 장만 쓴다."""
+    if not settings.VERIFIER_TTA_ENABLED:
+        return [crop]
+    zoomed = _center_zoom(crop)
+    return [crop, cv2.flip(crop, 1), zoomed, cv2.flip(zoomed, 1)]
 
 
 def run_verifier(session, img: np.ndarray, bbox: list[float]) -> dict | None:
@@ -179,8 +205,7 @@ def run_verifier(session, img: np.ndarray, bbox: list[float]) -> dict | None:
     if not isinstance(input_size, int):
         input_size = 320
     crop = _letterbox(img[y1:y2, x1:x2], size=input_size)
-    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    array = ((rgb - _MEAN) / _STD).transpose(2, 0, 1)[None]
+    array = np.concatenate([_normalize(view) for view in _verifier_views(crop)])
 
     output_names = ("material", "dent", "label", "foreign_material")
     available = {output.name for output in runtime_session.get_outputs()}

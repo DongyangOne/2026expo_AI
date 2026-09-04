@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     VERIFIER_SHADOW_ENABLED: bool = True
     VERIFIER_SHADOW_LOG_PATH: str = "logs/verifier_shadow.jsonl"
 
+    # 검증기 추론을 여러 뷰(원본·좌우반전·중앙확대)로 돌려 확률을 평균낸다.
+    # 학습 미사용 하드웨어 35건: 26/35(74.3%) → 28/35(80.0%). 기존 정답을 깨뜨린
+    # 건은 0건이었지만 McNemar p=0.500이라 이 표본 크기로는 개선이 입증되지 않았다.
+    # 뷰 수만큼 forward가 늘어 Pi5 지연시간이 커지므로 기본값은 off로 둔다.
+    VERIFIER_TTA_ENABLED: bool = False
+
     # 압착 판정을 검증기 dent 헤드로 만들고, '압착됨'으로 통과시킬 때만 확신을 요구한다.
     # 실제 키오스크 crop 31건(전부 미압착이 정답)에서 '이미 압착됨' 오탐:
     #   state 5/31(16.1%), 검증기 1/31(3.2%), 검증기+0.90 요구 0/31(0%).

@@ -571,6 +571,11 @@ def main():
         help="camera 증강에 국소대비·강한 색조·모션블러·센서노이즈를 더합니다. "
              "실제 키오스크 조명이 학습 데이터와 다를 때의 오분류를 겨냥합니다.",
     )
+    parser.add_argument(
+        "--augmix", action="store_true",
+        help="AugMix(arXiv:1912.02781)로 미지의 손상에 대한 강건성을 높입니다.",
+    )
+    parser.add_argument("--augmix-severity", type=int, default=3)
     parser.add_argument("--use-label-proxy", action="store_true")
     parser.add_argument("--label-proxy-weight", type=float, default=0.25)
     parser.add_argument("--material-weight", type=float, default=1.0)
@@ -654,6 +659,11 @@ def main():
             transforms.RandomAutocontrast(p=0.25),
             transforms.RandomEqualize(p=0.10),
         ])
+    if args.augmix:
+        # AugMix는 여러 증강 체인을 섞어 원본에 합성한다. CIFAR-10-C에서
+        # RandAugment(19.65%)보다 낮은 오류율(15.24%)을 보고한 손상 강건화 기법이다.
+        # arXiv:1912.02781. uint8 PIL 입력이 필요하므로 ToTensor 앞에 둔다.
+        train_steps.append(transforms.AugMix(severity=args.augmix_severity))
     train_steps.append(
         transforms.ColorJitter(0.35, 0.35, 0.35, 0.08)
         if args.kiosk_augmentation
@@ -887,6 +897,8 @@ def main():
         "initial_checkpoint_transfer": initial_checkpoint_info,
         "camera_augmentation": args.camera_augmentation,
         "kiosk_augmentation": args.kiosk_augmentation,
+        "augmix": args.augmix,
+        "augmix_severity": args.augmix_severity if args.augmix else None,
         "training_config": checkpoint.get("training_config", training_config),
         "best_epoch": checkpoint.get("epoch"),
         "best_selection_score": checkpoint.get("selection_score"),
