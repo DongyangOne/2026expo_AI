@@ -122,6 +122,43 @@ def enabled_tasks_for(
     return enabled
 
 
+class MotionBlur(nn.Module):
+    """투입 순간의 손떨림·이동 흔들림을 모사한다. torchvision에 없어 직접 구현한다."""
+
+    def __init__(self, kernel: int = 7, p: float = 0.15):
+        super().__init__()
+        self.kernel = kernel if kernel % 2 else kernel + 1
+        self.p = p
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() >= self.p:
+            return image
+        weight = torch.zeros(self.kernel, self.kernel)
+        if torch.rand(1).item() < 0.5:
+            weight[self.kernel // 2, :] = 1.0          # 수평 흔들림
+        else:
+            weight[:, self.kernel // 2] = 1.0          # 수직 흔들림
+        weight = (weight / weight.sum()).expand(3, 1, self.kernel, self.kernel)
+        blurred = torch.nn.functional.conv2d(
+            image.unsqueeze(0), weight, padding=self.kernel // 2, groups=3,
+        )
+        return blurred.squeeze(0)
+
+
+class GaussianNoise(nn.Module):
+    """저조도 키오스크 카메라의 센서 노이즈를 모사한다."""
+
+    def __init__(self, sigma: float = 0.04, p: float = 0.20):
+        super().__init__()
+        self.sigma = sigma
+        self.p = p
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() >= self.p:
+            return image
+        return (image + torch.randn_like(image) * self.sigma).clamp(0.0, 1.0)
+
+
 class VerifierDataset(Dataset):
     def __init__(self, rows, transform):
         self.rows = rows
@@ -529,6 +566,11 @@ def main():
         "--camera-augmentation", action="store_true",
         help="하드웨어 카메라의 원근·약한 초점 흐림을 모사합니다.",
     )
+    parser.add_argument(
+        "--kiosk-augmentation", action="store_true",
+        help="camera 증강에 국소대비·강한 색조·모션블러·센서노이즈를 더합니다. "
+             "실제 키오스크 조명이 학습 데이터와 다를 때의 오분류를 겨냥합니다.",
+    )
     parser.add_argument("--use-label-proxy", action="store_true")
     parser.add_argument("--label-proxy-weight", type=float, default=0.25)
     parser.add_argument("--material-weight", type=float, default=1.0)
@@ -599,16 +641,28 @@ def main():
         transforms.RandomHorizontalFlip(),
         transforms.RandomAffine(degrees=10, translate=(0.04, 0.04), scale=(0.92, 1.08)),
     ]
-    if args.camera_augmentation:
+    if args.camera_augmentation or args.kiosk_augmentation:
         train_steps.extend([
             transforms.RandomPerspective(distortion_scale=0.20, p=0.25),
             transforms.RandomApply(
                 [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.15,
             ),
         ])
+    if args.kiosk_augmentation:
+        # 조명·화이트밸런스가 학습 데이터와 다른 실제 키오스크 입력을 겨냥한다.
+        train_steps.extend([
+            transforms.RandomAutocontrast(p=0.25),
+            transforms.RandomEqualize(p=0.10),
+        ])
+    train_steps.append(
+        transforms.ColorJitter(0.35, 0.35, 0.35, 0.08)
+        if args.kiosk_augmentation
+        else transforms.ColorJitter(0.2, 0.2, 0.2, 0.04)
+    )
+    train_steps.append(transforms.ToTensor())
+    if args.kiosk_augmentation:
+        train_steps.extend([MotionBlur(), GaussianNoise()])
     train_steps.extend([
-        transforms.ColorJitter(0.2, 0.2, 0.2, 0.04),
-        transforms.ToTensor(),
         transforms.RandomErasing(p=0.1, scale=(0.01, 0.05)),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
@@ -832,6 +886,7 @@ def main():
         "initial_checkpoint": args.init_checkpoint,
         "initial_checkpoint_transfer": initial_checkpoint_info,
         "camera_augmentation": args.camera_augmentation,
+        "kiosk_augmentation": args.kiosk_augmentation,
         "training_config": checkpoint.get("training_config", training_config),
         "best_epoch": checkpoint.get("epoch"),
         "best_selection_score": checkpoint.get("selection_score"),
