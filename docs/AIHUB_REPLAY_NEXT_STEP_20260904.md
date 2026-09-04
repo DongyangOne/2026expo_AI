@@ -936,3 +936,90 @@ per-class cap은 전체 source 추론 뒤 적용되므로 GPU 추론량을 줄�
 기존 33장 A/B 구조 재현성 검사는 재사용하고 full strict replay는 한 번 수행하는
 경로를 준비한다. 이는 strict 검증 생략이 아니다. 기존 33장 전용 runner 자체는
 hardcoded diagnostic이므로 full에 그대로 사용할 수 없다.
+
+## 14. 기존 crop 재사용 검사 완료와 full replay 도구 배치
+
+2026-09-04 16:57 KST에 보호용 QX3 crop의 실제 bytes 검사를 완료했다.
+`audit_qx3_protected_crop_reuse_v1_20260904` / ID
+`fc2d54f4fafe1aafead0dc25ecfa002e264895777bd758c2cd1e339eda895e66`은
+16:57:03~16:57:12 KST, exit0/OOMfalse다. CPU1/RAM512MiB/network none,
+입력·코드 RO/새 출력만 RW, GPU 없이 실행했다. 새 추론이나 원본 복제는 하지 않았다.
+
+- 결과: `/share/Container/qx3_protected_crop_reuse_v1_20260904/result/report.json`
+- SHA: `b417b07e9c2309deab667af81dae2a5f507158f6c37ff7f76d97c668a3f57fc8`
+- 선택 source 3,500 / 검증 crop **3,498** / crop 미보유 source **2**.
+  training 2,498 / validation 1,000, crop 총 69,276,896 bytes, crop SHA 중복 그룹 0.
+- CSV·selection의 pinned SHA, source metadata path/split, 실제 crop SHA/크기,
+  상대경로와 선언된 bbox 범위를 검사하고 게시 전후 재해시했다.
+  별도 NAS read-only 조회에서 report 전후 SHA 동일, failed.json 없음도 확인했다.
+- 12절의 누락 두 SHA와 경로가 그대로 남아 있다. 이 두 source를 보호 집합에서
+  빼거나 원본을 crop으로 복제하지 않았다.
+- 이것은 기존 crop bytes와 metadata join의 재사용 검사다. 원본 재해시·pixel decode·
+  crop 변환 재계산·모델 파일 재해시·추론은 이번 검사에서 하지 않았다.
+  `formal_protected_coverage`, training/blind/deployment 권한은 모두 false다.
+
+코드는 `J/protected_crop_reuse_code_v1_20260904/scripts/audit_proposal_crop_reuse.py`,
+SHA `4026b232cac62c185867b8f7b8ef0b0a955820c69c8734efe2e6cecec5190b78`다.
+launch.sh SHA는 `91a5c3ab500196e4d935b5e7d25776163abb08a832a7c3ce4d20c37a393c83ae`다.
+동일 crop SHA가 여러 source에 존재해도 행을 숨기거나 임의 중복 제거하지 않고 그룹으로
+기록한다. 이번 실제 자료에서는 0그룹이다. 로컬 회귀 **31 passed**를 확인했다.
+
+### 전량 YOLO 재검증 runner
+
+`scripts/nas/replay_audited_aihub_full.py`를 추가했다. 기존 33장 진단 전용 runner를
+전량에 재사용하지 않는다. 새 도구는 일반 strict validator를 정확히 한 번 호출하며
+`prediction_provider=None`, `diagnostic_only=False`를 고정한다. CUDA context는 큰
+source 스캔 전에 같은 프로세스에서 초기화한다. full original reader는 validator가
+한 번만 호출하며 wrapper가 중복 실행하지 않는다.
+
+materializer의 full report/lineage와 generation source+label inventory의 **전량 membership**,
+원본/JSON 경로, raw output inventory, model/spec/code SHA, batch1를 결박한다.
+원본·raw는 변경하지 않고 새로운 replay 작업 공간에서 상대 symlink로 참조한다.
+품질 제외 원본을 포함한 cohort 전체의 파일 identity도 게시 완료까지 확인한다.
+실패 시 자기 ready만 철회하고 partial output/failure를 보존한다.
+
+- runner SHA: `0777a415911a8c56c1138e987149ea1dbbc46ac0f173c73003cda2b35db415c4`
+- 테스트 SHA: `3d6899c14df9d0a4432d5837d9497f2052c64674762a4e9b39588c291605a884`
+- 독립 코드 검토와 로컬 회귀 **46 passed**. 실제 reader/strict validator를 연결하되
+  CUDA/YOLO만 모의한 CPU 테스트다. 전량 NAS GPU 실행·정확도 통과는 아직 아니다.
+- 새 NAS release: `J/full_replay_release_v1_20260904`. runner를 포함한 14개 CODE_FILES와
+  `configs/detector_inference_v3.json` 총 15개를 새 경로에 복사했다. 기존 13개 코드와
+  config는 linked_pilot_code와 SHA가 모두 같고 복사 후 15개 SHA를 다시 대조했다.
+  NAS에서도 runner SHA와 `--help` exit0을 확인했다. 기존 release는 수정하지 않았다.
+
+full generation도 이 **새 CODE_ROOT**로 실행해야 raw generation의 input marker 경로와
+full replay의 14개 `--code-pin` 경로가 일치한다. materializer가 실제로 완료되면
+그 report SHA/lineage의 실제 JPEG 전체/dataset.yaml을 입력으로 새 generation을 만든다.
+새 generation 완료 후 실제 ready/manifest/dataset_info SHA를 CLI에 제공한다.
+아직 생성되지 않은 SHA를 추정해 쓰지 않는다. OUT은 metadata 보호 부모인 J 밖으로 둔다.
+
+출력 `input_bindings.json`, `replay/validated_manifest.csv`, `replay/validation_report.json`,
+`replay_ready.json`은 lineage 연결 근거이며 학습·blind·promotion·배포 권한은 false다.
+프로세스 exit/OOM 및 failed.json을 별도로 확인해야 한다. full A/B 재생은 중복하지 않고
+기존 33장 A/B 진단 뒤 **full 생성 한 번 + full strict 재생 한 번**을 수행한다.
+
+### 보호 crop 미보유와 연구 학습의 남은 연결
+
+독립 검토에서 현 formal near audit v1은 모든 보호 source마다 source/crop 각각 1개를
+요구하고 연구 wrapper도 그 loader를 소비함을 확인했다. source-only 지문을 formal
+crop 완료라고 바꾸지 않는다. `frames_without_eligible_proposal` 집계만으로는 개별
+무검출을 증명할 수 없으며 비유한 값/필터 탈락/실패를 구분해야 한다.
+
+17:05 이후 실제 metadata 재조회에서 QX3 외 raw 보호 136장은 known bbox 103,
+deployed bbox만 25, 양쪽 bbox 미보유 8이었다. 이는 현재 모델 재생이나 crop 파일
+검사가 아니므로 이전의 crop 보유 추정 112/136 및 미보유 4건과 같은 의미로 쓰지 않는다.
+최소 진단은 미보유 raw 8장과 QX3 resized 2장만 고정 YOLO로 관측해 실제 crop 또는
+개별 성공적인 no-eligible 증거를 얻는 것이다. `crop_absent`는 objectness=0 정답이나
+새 학습행이 아니다. 관련 소형 producer는 구현 검토 중이며 아직 NAS 실행하지 않았다.
+
+향후 필요하면 명시적인 research-only v2에서 **모든 source와 존재하는 실제 crop**의
+SHA/source/회전 pHash 거리4 보호를 유지하고 absence evidence를 별도로 표현한다.
+이는 v1과 다른 coverage 계약이며 기존 정식 candidate/배포 정책을 변경하지 않는다.
+보호 source를 평가에서 제거하거나 존재하지 않는 crop까지 검사했다고 하지 않는다.
+
+기존 trainer는 `--no-condition-heads`의 material9+objectness2 연구 학습을 지원한다.
+두 역할(train/model_validation) 각각 9종 positive와 실제 background 지원이 필요하다.
+상태 -1이나 신규 blind 미확보는 연구 학습 자체의 추가 차단 조건이 아니다.
+calibration은 학습 wrapper에 포함되지 않으므로 별도 evidence 생성/정책 calibration이
+필요하며, 고정 41장은 calibration 전용으로 유지한다. 앱에는 두 출력과 고정 crop,
+확률 결합을 읽는 별도 adapter가 필요하다. 현재 production/Pi/Spring은 변경하지 않았다.
