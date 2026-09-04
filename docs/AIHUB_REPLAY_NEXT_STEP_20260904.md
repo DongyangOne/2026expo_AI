@@ -452,3 +452,37 @@ materializer의 기존 코드 SHA pin 덮어쓰기 결함도 수정했다(회귀
 최신 SHA `48598dde8491928f46ab64f9f479946e4a14a800f3e8d1dd1c396d9189e93b06`을
 위 cohort_release에 배치했다. 앞선 36장 pilot은 코드 경로를 metadata로 pin하지 않아
 그 결함 경로를 사용하지 않았다. 기존 pilot 코드·결과는 변경하지 않는다.
+
+### 33장 frozen GPU replay A/B 완료 (13:57 KST)
+
+`replay_original_raw_pilot_33_20260904`는 13:57:18~13:57:35 KST 실행 후
+exit 0/OOM false로 종료했다. 동일한 원본 pilot raw 33행을 기존
+`validate_v4_background_candidates.validate_manifest(prediction_provider=None,
+diagnostic_only=True)`로 A/B 두 번 실제 GPU 재실행했다. 각 실행은 별도의
+상대 symlink workspace를 사용하고 원본 generation의 파일·inventory는 변경하지 않았다.
+
+- 실제 추론 A/B 모두 33/33. confidence tolerance **1e-6**, bbox tolerance **1e-4**
+  그대로 통과했으며 임계값 완화·정답 변경·custom prediction provider는 없었다.
+- 검증된 A/B manifest가 바이트 단위로 같다. SHA
+  `9994dcb8bf9c2d9e021289afc709309f212d9338f3fe9379d6dd6ac197122437`.
+- A/B report도 바이트 단위로 같다. SHA
+  `1bd59878fd7b2aaa5f96b5f15a1430a44c4b59e01b3ebf193f3ad80d03dd8c15`.
+- 출력 `/share/Container/aihub_original_replay_pilot_20260904/result`의
+  `diagnostic_ready.json` SHA
+  `8d1af01306a515bb9d47bf7777720d43efd6907df08b0a10274d6ddabf43dfc1`.
+  실제 ready를 읽었고 `failed.json`은 없다. 내부 A 9.07초/B 2.27초는 초기화·캐시
+  차이가 포함된 작은 진단 실행 시간이며 전체 학습/추론 처리량 예측으로 사용하지 않는다.
+- runner는 `J/replay_pilot_code_20260904/replay_original_raw_pilot_20260904.py`,
+  SHA `5655c9a4e662bc71c0a176c56b630f7cf0646b037e7b61c43c98f5cd4a08b785`.
+  validator SHA `dd06258012ecd4cd92da06c33937d4d02ddd9f73f7c4f249c1bb55567ea1cbf8`,
+  spec SHA `bc852128e8e7bee542b222c52ba8ff45d3ef0a648e4ac3884d2a0f37e1f9b841`.
+  runner의 CPU 모의 연결 테스트 4개는 실행 순서·binding·실패 처리를 검사한 것이며
+  위 실제 GPU 결과와 구분한다. input/model/code/spec/원본 source·label/raw inventory는
+  A/B 실행 전후와 ready 게시 전후 재해시했다.
+
+이는 **새 원본 기반 33장 pipeline의 실제 재현성 진단 통과**다. 전체 162,305장 또는
+과거 91,938행 검증 완료·재질 성능 향상·독립 blind 통과가 아니다. training/lineage/
+blind/deployment 권한은 계속 false다. 같은 pilot을 변화 없이 다시 돌리지 않는다.
+다음 작업은 이미 실행 중인 전량 원본 검사와 NAS 자동 cohort 연결의 결과 확인이다.
+13:57 KST 전량 로그는 processed 52,600/162,305(32.4%), verified 52,599,
+선형 잔여 6,004초(약 1시간 40분)였다. 격리 1건의 상세 사유는 최종 보고서에서 확인한다.
