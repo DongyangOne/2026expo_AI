@@ -271,3 +271,123 @@ def test_shadow_verifier_receives_yolo_result_without_changing_response(monkeypa
         "confidence": 0.90,
         "client_id": "hardware-shadow-001",
     }
+
+
+def _agreement_gate_registry():
+    class _GateRegistry(_Registry):
+        def verifier(self):
+            return "gate-verifier-session"
+
+    return _GateRegistry()
+
+
+def test_합의게이트가_꺼져있으면_불일치해도_기존_판정을_유지(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        pipeline.settings, "VERIFIER_AGREEMENT_GATE_ENABLED", False, raising=False
+    )
+
+    def fail_if_verifier_runs(*_args, **_kwargs):
+        raise AssertionError("게이트가 꺼져 있으면 검증기를 동기 실행하면 안 됩니다.")
+
+    monkeypatch.setattr(inference, "run_verifier", fail_if_verifier_runs)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "gate-off-001", _agreement_gate_registry())
+        )
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification.class_id == 5
+
+
+def test_합의게이트가_켜지고_불일치하면_확정하지_않고_일반쓰레기로_보낸다(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit_precomputed", lambda *a, **k: None)
+    monkeypatch.setattr(
+        pipeline.settings, "VERIFIER_AGREEMENT_GATE_ENABLED", True, raising=False
+    )
+    monkeypatch.setattr(
+        inference, "run_verifier",
+        lambda *_args: {
+            "material": {"class_id": 2, "class_name": "paper", "confidence": 0.95},
+            "heads": {}, "input_size": 320,
+        },
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "gate-disagree-001", _agreement_gate_registry())
+        )
+
+    assert result.status is DetectionStatus.GENERAL_WASTE
+    assert result.general is not None
+    # 보류해도 무엇을 봤는지는 그대로 돌려준다.
+    assert result.classification.class_id == 5
+
+
+def test_합의게이트가_켜져도_두_모델이_같으면_기존_판정을_그대로_확정(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit_precomputed", lambda *a, **k: None)
+    monkeypatch.setattr(
+        pipeline.settings, "VERIFIER_AGREEMENT_GATE_ENABLED", True, raising=False
+    )
+    monkeypatch.setattr(
+        inference, "run_verifier",
+        lambda *_args: {
+            "material": {"class_id": 5, "class_name": "vinyl", "confidence": 0.88},
+            "heads": {}, "input_size": 320,
+        },
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "gate-agree-001", _agreement_gate_registry())
+        )
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification.class_id == 5
+
+
+def test_pet과_plastic은_같은_통이므로_합의로_본다(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_pet_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(verifier_shadow, "submit_precomputed", lambda *a, **k: None)
+    monkeypatch.setattr(
+        inference, "run_state",
+        lambda *_args: pipeline.inference.StatePrediction(
+            conditions=Conditions(has_label=False, is_dented=True),
+            has_foreign_material=None,
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline.settings, "VERIFIER_AGREEMENT_GATE_ENABLED", True, raising=False
+    )
+    # YOLO는 pet(1), 검증기는 plastic(3) — 응답 계약에서는 둘 다 class_id=3이다.
+    monkeypatch.setattr(
+        inference, "run_verifier",
+        lambda *_args: {
+            "material": {"class_id": 3, "class_name": "plastic", "confidence": 0.91},
+            "heads": {}, "input_size": 320,
+        },
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "gate-pet-plastic-001", _agreement_gate_registry())
+        )
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification.class_id == 3

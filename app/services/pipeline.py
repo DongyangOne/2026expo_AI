@@ -101,6 +101,21 @@ def _verifier_supports_vinyl(prediction: dict | None, yolo_confidence: float) ->
     )
 
 
+def _response_class_id(model_class_id: int | None) -> int | None:
+    """PET는 응답 계약에서 PLASTIC과 같은 통이므로 모델 비교도 같은 기준으로 한다."""
+    if model_class_id is None:
+        return None
+    return _PLASTIC_CLASS_ID if model_class_id == _PET_MODEL_CLASS_ID else model_class_id
+
+
+def _materials_disagree(model_class_id: int, prediction: dict | None) -> bool:
+    """검증기 결과가 없으면 판단 근거가 없으므로 불일치로 보지 않는다."""
+    if prediction is None:
+        return False
+    material = prediction.get("material") or {}
+    return _response_class_id(material.get("class_id")) != _response_class_id(model_class_id)
+
+
 def _build_classification(
     model_class_id: int,
     cls: WasteClass | None,
@@ -196,6 +211,27 @@ async def run(
             confidence = verifier_confidence
             correction_applied = True
 
+    # ── 합의 게이트 — 두 모델이 갈리면 어느 쪽도 확정하지 않는다 ────────────────────
+    gate_defers = False
+    if (
+        settings.VERIFIER_AGREEMENT_GATE_ENABLED
+        and verifier_session is not None
+        and not inference.verifier_is_shadow_only(verifier_session)
+    ):
+        if verifier_prediction is None:
+            verifier_prediction = await loop.run_in_executor(
+                _executor, inference.run_verifier, verifier_session, img, bbox
+            )
+        gate_defers = _materials_disagree(class_id, verifier_prediction)
+        if gate_defers:
+            logger.info(
+                "합의 실패로 확정 보류: yolo=%s(%.4f) verifier=%s client_id=%s",
+                _CLASS_BY_ID.get(class_id),
+                confidence,
+                (verifier_prediction.get("material") or {}).get("class_name"),
+                client_id,
+            )
+
     if verifier_prediction is None:
         verifier_shadow.submit(
             verifier_session, img, bbox, yolo_class_id, yolo_confidence, client_id
@@ -216,8 +252,8 @@ async def run(
     weight_info = WeightInfo(value_g=weight_g)
     classification = _build_classification(class_id, cls, confidence)
 
-    # ── 저신뢰 → 일반쓰레기 ──────────────────────────────────────────────────────
-    if cls is None or confidence < settings.TRUST_CONF:
+    # ── 저신뢰 또는 합의 실패 → 일반쓰레기 ───────────────────────────────────────
+    if cls is None or confidence < settings.TRUST_CONF or gate_defers:
         return DetectResponse(
             client_id=client_id,
             status=DetectionStatus.GENERAL_WASTE,

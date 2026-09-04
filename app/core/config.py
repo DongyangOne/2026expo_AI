@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     VERIFIER_SHADOW_ENABLED: bool = True
     VERIFIER_SHADOW_LOG_PATH: str = "logs/verifier_shadow.jsonl"
 
+    # YOLO와 crop 검증기가 응답 클래스에서 불일치하면 확정하지 않고 일반쓰레기로 보낸다.
+    # 학습에 쓰이지 않은 하드웨어 감사 35건에서 두 모델이 합의한 21건은 전부 정답이었고,
+    # 불일치한 14건은 YOLO 4건·검증기 5건만 맞아 어느 쪽도 근거가 되지 못했다.
+    # 켜면 확정 오답이 7→0건으로 줄지만 보류가 3→14건으로 늘어 처리량을 포기한다.
+    VERIFIER_AGREEMENT_GATE_ENABLED: bool = False
+
     # 저신뢰 PET/PLASTIC과 VINYL이 같은 bbox에서 경쟁할 때만 crop 검증기로 교정한다.
     VINYL_CORRECTION_ENABLED: bool = True
     VINYL_CANDIDATE_CONF: float = 0.10
@@ -36,6 +42,7 @@ class Settings(BaseSettings):
     #   DETECT_CONF 이상 ~ TRUST_CONF 미만 → LOW_CONFIDENCE (일반쓰레기)
     #   TRUST_CONF 이상 → ALLOWED / REJECTED 정상 판정
     DETECT_CONF: float = 0.25       # YOLO 박스 생성 최소 신뢰도
+    DETECT_IOU: float = 0.70        # NMS IoU (Ultralytics 기본값을 명시적으로 고정)
     TRUST_CONF: float = 0.55        # 신뢰 판정 임계값
     IMG_SIZE: int = 640
     SUB_IMG_SIZE: int = 224
