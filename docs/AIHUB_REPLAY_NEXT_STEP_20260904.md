@@ -910,3 +910,29 @@ failed.json 없음, 품질 제외 후 18 strata 지원까지 확인해야 한다
 fingerprint/cohort SHA로 갱신했다. 저장된 prompt 일치를 다시 확인했다.
 이미 끝난 원본·legacy·fingerprint·cohort를 재실행하지 않고 v2 완료 후 다음
 YOLO 생성/strict replay로 이어가며, 변화 없는 정상 상태는 알림을 만들지 않는다.
+
+### 16:36 KST 연결 복구 후 같은 작업의 진행 확인
+
+PC의 기존 SSH 세션 종료 후 NAS TCP22 재접속이 timeout이었다. PC OpenVPN 클라이언트가
+꺼져 있었고 Tailscale은 NoState였다. 기존 `chunwol` 프로필을 GUI 명령으로 다시
+연결했으며 16:34:39 `Initialization Sequence Completed`를 확인했다. 인증값을
+새로 저장하지 않았다. NAS의 기존 ED25519 고정 지문을 다시 대조한 후 같은
+materializer v2 ID/starttime을 확인했다. NAS 재부팅/작업 재시작은 하지 않았다.
+
+16:36:01 로그는 verified10,100/155,537, materialized9,643이다. 컨테이너는
+running/OOMfalse, CPU86.71%, Docker memory5.661GiB/6GiB였다. 이를 프로세스 RSS로
+해석하지 않는다. 바로 확인한 `/proc/1/status`는 VmRSS824,948KiB, RssAnon796,480KiB,
+VmPeak1,377,048KiB, threads2였다. GPU0%/2MiB/16,380MiB/41°C,
+디스크 여유2.6TiB/83% 사용을 확인했다.
+
+16:29 KST 공개 AI `/health`는 HTTP200/status ok, main/state/verifier 모두 loaded였다.
+그러나 PC→Pi `100.121.110.75:22`는 5초 timeout이라 신규 운영 로그는 아직 미확보다.
+저장된 Pi ED25519 지문은 `SHA256:s6/zUrBsCO3yzO4te6qGrX2lrPXVYIuznm58xhV017s`이며
+이번에 실시간 대조/인증/POST는 하지 않았다. NAS 인증을 Pi에 재사용하지 않았다.
+
+후속 검토 결과 full raw 생성은 materializer `lineage.jsonl`에 실제 생성된 JPEG
+전체와 `dataset.yaml`을 사용한다. 품질 제외 원본까지 source list에 넣지 않는다.
+per-class cap은 전체 source 추론 뒤 적용되므로 GPU 추론량을 줄이지 않는다.
+기존 33장 A/B 구조 재현성 검사는 재사용하고 full strict replay는 한 번 수행하는
+경로를 준비한다. 이는 strict 검증 생략이 아니다. 기존 33장 전용 runner 자체는
+hardcoded diagnostic이므로 full에 그대로 사용할 수 없다.
