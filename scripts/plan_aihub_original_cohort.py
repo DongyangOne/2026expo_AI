@@ -92,6 +92,7 @@ def validate_original_row(row):
     require(type(cls) is int and 0 <= cls < 9 and row.get("class_name") == original.CLASS_NAMES[cls], "class mapping mismatch")
     h, w = row.get("image_height"), row.get("image_width")
     require(type(h) is int and type(w) is int and min(h, w) > 0, "invalid source dimensions")
+    require(type(row.get("source_bytes")) is int and row["source_bytes"] > 0, "invalid source byte count")
     try:
         require(type(row.get("bbox_xywh")) is list, "invalid source bbox")
         original.strict_bbox([row["bbox_xywh"]], w, h)
@@ -102,9 +103,11 @@ def validate_original_row(row):
             and all(type(v) is int and v == -1 for v in conditions.values()), "unverified state must remain masked")
 
 
-def plan_records(originals: list[dict], protected: list[dict], protected_source_ids: set[str]) -> dict:
+def plan_records(originals: list[dict], protected: list[dict], protected_source_ids: set[str],
+                 *, quarantine_annotation_conflicts: bool = False) -> dict:
     require(type(originals) is list and bool(originals), "empty original cohort")
     require(type(protected) is list, "invalid protected reference set")
+    require(type(quarantine_annotation_conflicts) is bool, "annotation conflict opt-in must be boolean")
     for sid in protected_source_ids:
         checked_hex(sid, SOURCE_ID, "invalid protected source_id")
     by_id, by_sha = {}, defaultdict(list)
@@ -124,14 +127,28 @@ def plan_records(originals: list[dict], protected: list[dict], protected_source_
         require(sha not in protected_shas, "duplicate protected SHA")
         protected_shas.add(sha)
         protected_index.add(int(phash, 16), sha)
-    reasons = defaultdict(set)
+    reasons, conflict_groups = defaultdict(set), []
     for sha, group in by_sha.items():
-        signatures = {(r["class_id"], tuple(r["bbox_xywh"]), r["image_width"], r["image_height"], r["source_phash64"]) for r in group}
-        require(len(signatures) == 1, "same image SHA has conflicting ground truth or image evidence")
+        image_signatures = {(r["image_width"], r["image_height"], r["source_phash64"], r["source_bytes"]) for r in group}
+        require(len(image_signatures) == 1, "same image SHA has conflicting image evidence")
+        annotation_conflict = len({(r["class_id"], tuple(r["bbox_xywh"])) for r in group}) > 1
+        if annotation_conflict:
+            require(quarantine_annotation_conflicts, "same image SHA has conflicting ground truth or image evidence")
+            for row in group:
+                reasons[row["source_id"]].add("annotation_conflict_same_sha256")
+            conflict_groups.append({
+                "source_sha256": sha,
+                "image_evidence": {key: group[0][key] for key in
+                                   ("image_width", "image_height", "source_phash64", "source_bytes")},
+                "members": [{key: r[key] for key in
+                             ("source_id", "split", "label_sha256", "class_id", "class_name", "bbox_xywh",
+                              "source_path_b64", "label_path_b64")}
+                            for r in sorted(group, key=lambda r: r["source_id"])],
+            })
         if len({r["split"] for r in group}) > 1:
             for row in group:
                 reasons[row["source_id"]].add("cross_split_duplicate")
-        elif len(group) > 1:
+        elif len(group) > 1 and not annotation_conflict:
             for row in sorted(group, key=lambda r: r["source_id"])[1:]:
                 reasons[row["source_id"]].add("same_split_duplicate")
     for sid, row in by_id.items():
@@ -150,7 +167,14 @@ def plan_records(originals: list[dict], protected: list[dict], protected_source_
     counts = {"originals": len(originals), "accepted": len(accepted), "excluded": len(excluded),
               "accepted_by_split_class": dict(sorted(Counter(f'{r["split"]}/{r["class_name"]}' for r in accepted).items())),
               "exclusion_reason_counts_overlapping": dict(sorted(Counter(reason for r in excluded for reason in r["reasons"]).items()))}
-    return {"records": accepted, "exclusions": excluded, "counts": counts}
+    result = {"records": accepted, "exclusions": excluded, "counts": counts}
+    if quarantine_annotation_conflicts:
+        result["annotation_conflict_quarantine"] = {
+            "enabled": True, "group_count": len(conflict_groups),
+            "source_count": sum(len(group["members"]) for group in conflict_groups),
+            "groups": sorted(conflict_groups, key=lambda group: group["source_sha256"]),
+        }
+    return result
 
 
 def decode_path(value) -> PurePosixPath:
@@ -414,6 +438,8 @@ def main():
     for name in ("legacy-link-report", "legacy-original-fingerprint-report"):
         parser.add_argument(f"--{name}", type=Path)
         parser.add_argument(f"--{name}-sha256")
+    parser.add_argument("--quarantine-annotation-conflicts", action="store_true",
+                        help="Exclude every same-SHA class/bbox conflict member; image-evidence conflicts still fail")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     legacy_args = (args.legacy_link_report, args.legacy_link_report_sha256,
@@ -468,7 +494,8 @@ def main():
             if binding["path"] not in existing:
                 bindings.append(binding)
                 existing[binding["path"]] = binding["sha256"]
-    planned = plan_records(records, references, ids)
+    planned = plan_records(records, references, ids,
+                           quarantine_annotation_conflicts=args.quarantine_annotation_conflicts)
     require(bool(planned["records"]), "no eligible original sources")
     require(len(planned["counts"]["accepted_by_split_class"]) == 18, "accepted cohort lacks an official split/class")
     for binding in bindings:
@@ -488,6 +515,8 @@ def main():
                   "note": "Legacy references have exact SHA and pHash protection only; reencoding identity and materialized-image leakage need separate verification."},
               "pending_checks": ["legacy_transformation_identity", "materialized_image_leakage", "raw_proposal_replay", "independent_hardware_gate"],
               "training_authorized": False, "deployment_authorized": False}
+    if args.quarantine_annotation_conflicts:
+        report["policy"] += "; quarantine every member of same-SHA class/bbox conflicts; image-evidence conflicts fail"
     if legacy_summary is not None:
         report["legacy_exclusion_evidence"] = legacy_summary
         report["protected_identity_scope"]["legacy_v2_references_without_original_id"] = (

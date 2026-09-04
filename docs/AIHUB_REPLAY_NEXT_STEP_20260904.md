@@ -740,3 +740,82 @@ formal inventory로 소비할 수 있다. 보호 전용 ROI는 정답 bbox crop�
 연구용 **미실행 초안**이다(SHA `cd97b8b022a1957d15f11403c20d5a7a431b779d27bcee3d672583b856474040`).
 구문·정적 경계만 검사했으며 NAS에 실행하거나 학습 완료로 표시하지 않았다.
 실제 역할별 CSV와 full 보호 감사 입력이 확보된 후 실행 검토한다.
+
+## 12. 전체 원본/legacy 완료, annotation 충돌 격리와 회수 원본 지문 검사
+
+2026-09-04 15:56 KST 기준 실제 상태다. 11절의 대기/진행 중 상태를 대체하며,
+완료된 원본 및 legacy producer와 실패한 1428 cohort는 다시 실행하지 않는다.
+
+- 원본 producer `306f871abf56624d3076ed01373905972b6d7e99b30e82dea599e1a6a9b0c0c1`:
+  15:38:32 KST 종료, exit0/OOMfalse. `J/original_annotation_full_v2_20260904/result/report.json`
+  SHA `aed28757966d86f2a53a461ea089edf577156cec3e6001d57f09670d703655e2`.
+  전체 162,305건 중 검증 162,280건, 격리 25건이다. 격리 사유는 범위 밖/빈 bbox 6,
+  알 수 없거나 충돌하는 재질 7, annotation 파일명 불일치 12다. 검증 데이터에는
+  공식 training/validation × 9종의 18 strata가 모두 존재한다. 학습/배포 권한은 false다.
+- full legacy producer `f24cbf8cfd9fc7004d4fd6fb76bb18eb008157401fa9a681e6c631f594754eef`:
+  15:38:37 시작, 15:47:52 종료, exit0/OOMfalse. 실제 자동 대기가 이어서 시작했다.
+  `/share/Container/legacy_aihub_link_full_v1_20260904/result/report.json`
+  SHA `73da019af967787cb2ca93279bec0ce8c7e5f46bc0a114613a36fbd350be4747`.
+  train 1,255 + train_r 600 + val 1,000 = 2,855건 모두 verified_source_link,
+  unresolved 0, label reproduction 실패 0이다. 원본 pool 내부 1,144, 외부 1,711이며
+  이 실행의 unique original SHA는 2,855다. `original_alias_uniqueness_proven=false`와
+  `complete_original_lineage=false`는 유지된다. 원본 연결 성공이 전체 변환 alias 증명은 아니다.
+
+### 실패한 기존 cohort를 통과 처리하지 않은 이유
+
+`cohort_original_20260904_1428`/ID
+`e186765c5d7339831fff5f806d0eb92891af8053ed842c51ce2aff6cc4ce10b1`은
+15:38:47에 exit1/OOMfalse로 종료했다. 실제 오류는
+`same image SHA has conflicting ground truth or image evidence`이며 OOM이 아니다.
+기존 CONTROL의 failed.txt, 로그, release는 보존했다.
+
+원본 report만 읽는 CPU 진단 `inspect_original_conflicts_v1_20260904`가 exit0으로
+완료했고, `J/original_conflicts_diagnostic_v1_20260904/output/conflicts.json` SHA는
+`af835e77ba33018b2572898dd32d3191c1f15865c1d724cc260bb90bef5764e8`이다.
+사진 bytes/해상도/pHash 충돌은 0이고, 같은 PET 사진의 bbox annotation이 다른
+2개 SHA 그룹/4개 원본 행이 원인이다.
+
+- SHA `d5d3225770e62dadefc5a603bb97d024a7b78d9bf409402298b5bb813b656389`:
+  `2f310e06c1e41d69a911`(training), `d113d77c390402219684`(validation).
+- SHA `e94737689112d5400829bd78583ebf609c9956e8b4925157e2629309582d91ab`:
+  `fdad0d1428cf9276d4d0`, `4ffa3224312bd7da3037`(모두 training).
+
+새 planner의 `--quarantine-annotation-conflicts`는 기본 off다. 명시적으로 켜면
+class/bbox 충돌 그룹 전원을 `annotation_conflict_same_sha256` 사유로 제외하고,
+이미지와 annotation 경로/SHA/bbox 근거를 보고서에 기록한다. 대표 정답을 고르거나
+bbox를 수정하지 않는다. 모든 행을 split/pHash 인덱스에 남겨 다른 near duplicate
+제외까지 유지한다. bytes/해상도/pHash 충돌은 옵션과 관계없이 계속 실패한다.
+공식 split, pHash 거리 4, 보호 SHA 및 학습/배포 권한 false를 변경하지 않았다.
+
+새 코드 `J/legacy_exclusion_code_annfix_v1_20260904/scripts/`의 4개 파일은
+SMB 복사 전후와 실제 NAS SHA가 일치한다. planner SHA는
+`2ebc1612d86d6a36f0d0a56ee13bd129491b9e35f0e530539e5b1b14ff88541f`이며
+나머지 3개 helper SHA는 11절과 같다. 이전 release는 덮어쓰지 않았다.
+planner **99 passed**, inventory/reader/materializer 회귀 **71 passed(53.30초)**를
+확인했다. 데이터 정제 코드 회귀이지 모델 정확도 검증이 아니다.
+
+### 현재 실행 중인 다음 단계
+
+`fingerprint_legacy_originals_v1_20260904`/ID
+`19f2f6c6769ce930ebe36fa648f05acde9d8bed9877782c27c2f1fc9ab1ce859`가
+15:55:57 KST 실제 시작됐다. CPU1/RAM3GiB, runc, network none, rootfs/전체 입력 RO,
+새 `J/legacy_recovered_fingerprints_v1_20260904`만 RW, Devices=[]다.
+builder가 2,855개 원본 inventory를 게시한 뒤 실제 원본 SHA/pHash 검사를 순차 실행한다.
+
+- inventory: `J/legacy_recovered_fingerprints_v1_20260904/inventory/inventory.json`
+- inventory SHA: `5014c0ab08307711172ffc14ca98f307ad8bbb996ea82e0af04cbbda9158134e`
+- 완료 시 report: `J/legacy_recovered_fingerprints_v1_20260904/result/report.json`
+- 15:56:33 로그: verified 300/2,855. 약 8.7장/초로 픽셀 처리 잔여 약 5분이며,
+  이후 원본/metadata의 두 번 재해시가 추가된다. 완료 ETA나 학습 ETA로 혼동하지 않는다.
+- max-read 128GiB/max-file 128MiB는 읽기 상한이다. 원본 이미지를 복사하지 않는다.
+
+다음 실행은 실제 exit0/OOMfalse와 report SHA/coverage를 확인한 뒤 이 새 report와
+full legacy report, 기존 원본/보호/manifest/auditor 핀을 모두 넣은 **새 cohort**다.
+annotation 충돌 4행 전원 제외와 18 strata를 확인한 후 materialization으로 이어간다.
+기존 QX3 보호 crop 3,498개는 재사용 후보이며 아직 전량 실제 bytes 검증 전이다.
+추론이 없는 보호 source를 crop으로 위장하거나 보호 목록에서 빼지 않는다.
+
+현재 앱은 연구용 objectness(2)+material(9) ONNX를 그대로 읽는 계약이 아니다.
+별도 shadow adapter와 기존 상태 모델 유지, 독립 하드웨어 E2E 검증이 필요하므로
+연구 학습 완료/오프라인 평가와 운영 교체를 구분한다. production/Pi/Spring,
+timiroom 서비스, 중지된 naco-ollama 2개는 변경하지 않았다.

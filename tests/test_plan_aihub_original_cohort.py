@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from scripts import plan_aihub_original_cohort as planner
+from test_materialize_audited_aihub_sources import fixture as materializer_inputs
 
 
 def original(number, *, split="training", phash=None, source_sha=None):
@@ -187,6 +188,128 @@ def test_conflicting_same_sha_fails_before_cross_split_exclusion_can_hide_it():
     second.update(class_id=3, class_name="plastic", declared_class="plastic")
     with pytest.raises(planner.PlanError):
         planner.plan_records([first, second], unrelated_protected(), set())
+
+
+@pytest.mark.parametrize("kind", ["class", "bbox"])
+@pytest.mark.parametrize("split", ["training", "validation"])
+def test_opt_in_quarantines_every_annotation_conflict_member_with_exact_evidence(kind, split):
+    first = original(21, phash="0000000000000000")
+    second = original(22, split=split, source_sha=first["source_sha256"], phash=first["source_phash64"])
+    if kind == "class":
+        second.update(class_id=3, class_name="plastic")
+    else:
+        second["bbox_xywh"][0] += 1
+    rows = [second, first, original(23, phash="ffffffffffffffff")]
+    before = copy.deepcopy(rows)
+    result = planner.plan_records(rows, [], set(), quarantine_annotation_conflicts=True)
+    assert accepted_ids(result) == {rows[2]["source_id"]}
+    for sid in (first["source_id"], second["source_id"]):
+        assert "annotation_conflict_same_sha256" in exclusions(result)[sid]
+        assert ("cross_split_duplicate" in exclusions(result)[sid]) is (split == "validation")
+    evidence = result["annotation_conflict_quarantine"]
+    assert evidence["enabled"] is True and evidence["group_count"] == 1 and evidence["source_count"] == 2
+    group = evidence["groups"][0]
+    assert group["source_sha256"] == first["source_sha256"]
+    assert group["image_evidence"] == {k: first[k] for k in
+                                       ("image_width", "image_height", "source_phash64", "source_bytes")}
+    assert [member["source_id"] for member in group["members"]] == [first["source_id"], second["source_id"]]
+    for member, expected in zip(group["members"], (first, second)):
+        assert all(member[k] == expected[k] for k in member)
+    assert result == planner.plan_records(list(reversed(rows)), [], set(), quarantine_annotation_conflicts=True)
+    assert result["counts"]["originals"] == result["counts"]["accepted"] + result["counts"]["excluded"] == 3
+    assert rows == before
+
+
+@pytest.mark.parametrize("field,value", [("image_width", 65), ("image_height", 49),
+                                         ("source_phash64", "f" * 16), ("source_bytes", 1025)])
+def test_opt_in_never_quarantines_conflicting_image_evidence(field, value):
+    first = original(24)
+    second = original(25, source_sha=first["source_sha256"], phash=first["source_phash64"])
+    second["bbox_xywh"][0] += 1
+    second[field] = value
+    with pytest.raises(planner.PlanError, match="conflicting image evidence"):
+        planner.plan_records([first, second], [], set(), quarantine_annotation_conflicts=True)
+
+
+@pytest.mark.parametrize("value", [None, False, 0, -1, 1.5, "1024"])
+def test_source_byte_evidence_requires_exact_positive_integer(value):
+    row = original(26)
+    row["source_bytes"] = value
+    with pytest.raises(planner.PlanError, match="source byte count"):
+        planner.plan_records([row], [], set(), quarantine_annotation_conflicts=True)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_annotation_quarantine_requires_explicit_boolean(value):
+    with pytest.raises(planner.PlanError, match="opt-in must be boolean"):
+        planner.plan_records([original(27)], [], set(), quarantine_annotation_conflicts=value)
+
+
+def test_quarantined_groups_remain_in_split_and_protected_near_indexes():
+    first = original(28, phash="0000000000000000")
+    second = original(29, source_sha=first["source_sha256"], phash=first["source_phash64"])
+    second["bbox_xywh"][0] += 1
+    near = original(30, split="validation", phash="000000000000000f")  # exactly distance four
+    beyond = original(31, split="validation", phash="000000000000001f")
+    protected = [{"source_sha256": first["source_sha256"], "source_phash64": first["source_phash64"]}]
+    result = planner.plan_records([first, second, near, beyond], protected, {first["source_id"]},
+                                  quarantine_annotation_conflicts=True)
+    assert accepted_ids(result) == {beyond["source_id"]}
+    reasons = exclusions(result)
+    assert {"annotation_conflict_same_sha256", "cross_split_duplicate", "protected_exact_sha256",
+            "protected_source_id", "protected_near_phash"} <= set(reasons[first["source_id"]])
+    assert {"cross_split_duplicate", "protected_near_phash"} <= set(reasons[near["source_id"]])
+
+
+def test_opt_in_preserves_nonconflicting_duplicate_and_default_report_behavior():
+    first = original(32)
+    second = original(33, source_sha=first["source_sha256"], phash=first["source_phash64"])
+    default = planner.plan_records([second, first], [], set())
+    enabled = planner.plan_records([second, first], [], set(), quarantine_annotation_conflicts=True)
+    assert enabled.pop("annotation_conflict_quarantine") == {"enabled": True, "group_count": 0,
+                                                            "source_count": 0, "groups": []}
+    assert enabled == default
+    assert set(default) == {"records", "exclusions", "counts"}
+
+
+def test_quarantined_cohort_materializes_and_reader_preserves_exact_full_coverage(materializer_inputs):
+    from scripts import audited_aihub_snapshot as reader
+    from scripts import materialize_audited_aihub_sources as materializer
+
+    data, save, output, sources, labels, _ = materializer_inputs
+    rows = copy.deepcopy(data["records"])
+    for row, path in zip(rows, sources):
+        _, actual_sha, size, phash = planner.original.image_evidence(path)
+        assert actual_sha == row["source_sha256"]
+        row.update(source_bytes=size, source_phash64=phash)
+    # A genuine same-image copy with its own conflicting JSON, not a fabricated winner.
+    source, label = sources[0].with_name("b.png"), labels[0].with_name("b.json")
+    source.write_bytes(sources[0].read_bytes())
+    annotation = json.loads(labels[0].read_text(encoding="utf-8"))
+    annotation["IMAGE_INFO"]["FILE_NAME"] = source.name
+    annotation["ANNOTATION_INFO"][0]["POINTS"][0][0] += 1
+    label.write_text(json.dumps(annotation, ensure_ascii=False), encoding="utf-8")
+    duplicate = copy.deepcopy(rows[0])
+    duplicate.update(source_id=hashlib.sha1(f"Training/{label.parent.name}/b.json".encode()).hexdigest()[:20],
+                     source_path_b64=planner.original.encode_path(source), label_path_b64=planner.original.encode_path(label),
+                     label_sha256=hashlib.sha256(label.read_bytes()).hexdigest())
+    duplicate["bbox_xywh"][0] += 1
+    planned = planner.plan_records([*rows, duplicate], [], set(), quarantine_annotation_conflicts=True)
+    assert planned["counts"]["accepted"] == 1 and planned["counts"]["excluded"] == 2
+    data.update(planned, full_cohort=True, pending_checks=["materialized_image_leakage", "independent_hardware_gate"])
+    args = save()
+    report = materializer.materialize_sources(**args)
+    assert report["full_cohort"] is True
+    assert report["cohort_records"] == report["verified_sources"] == report["materialized_sources"] == 1
+    assert report["quality_excluded_sources"] == report["unprocessed_sources"] == 0
+    assert report["training_authorized"] is report["deployment_authorized"] is False
+    evidence = reader.load_audited_aihub_snapshot(output / "report.json",
+                                                hashlib.sha256((output / "report.json").read_bytes()).hexdigest(),
+                                                cohort_path=args["cohort"])
+    lineage = json.loads((output / "lineage.jsonl").read_text(encoding="utf-8"))
+    assert evidence.split_for(output / lineage["image_ref"]) == "validation"
+    assert lineage["source_id"] == rows[1]["source_id"]
+    evidence.recheck()
 
 
 def test_pure_helper_can_plan_without_protected_references():
@@ -400,7 +523,7 @@ def test_optional_legacy_cli_arguments_are_all_or_none(monkeypatch, tmp_path):
     with pytest.raises(planner.PlanError, match="required together"): planner.main()
 
 
-@pytest.mark.parametrize("fault", [None, "nested_output", "terminal_failure"])
+@pytest.mark.parametrize("fault", [None, "nested_output", "terminal_failure", "annotation_quarantine"])
 def test_legacy_cli_publishes_only_a_pinned_non_authoritative_cohort(legacy_evidence, monkeypatch, tmp_path, fault):
     save, links, fp, originals = legacy_evidence
     args = save()
@@ -414,6 +537,12 @@ def test_legacy_cli_publishes_only_a_pinned_non_authoritative_cohort(legacy_evid
             row = original(100 + split_index * 9 + cls, split=split)
             row.update(class_id=cls, class_name=name, declared_class=name)
             all_originals.append(row)
+    if fault == "annotation_quarantine":
+        for number, split in ((900, "training"), (902, "validation")):
+            first = original(number)
+            second = original(number + 1, split=split, source_sha=first["source_sha256"], phash=first["source_phash64"])
+            second["bbox_xywh"][0] += 1
+            all_originals.extend((first, second))
     raw = {"schema": "aihub_original_annotation_audit_v1", "perceptual_hash": planner.PHASH_CONVENTION,
            "training_authorized": False, "deployment_authorized": False,
            "selected": len(all_originals), "verified": len(all_originals), "quarantined": 0,
@@ -430,6 +559,8 @@ def test_legacy_cli_publishes_only_a_pinned_non_authoritative_cohort(legacy_evid
     args["fingerprint_sha256"] = _write_json(args["fingerprint_report"], fp)
     output = (tmp_path if fault == "nested_output" else tmp_path.parent) / (tmp_path.name + "-cohort")
     argv = ["planner", "--output", str(output)]
+    if fault == "annotation_quarantine":
+        argv.append("--quarantine-annotation-conflicts")
     for name, path, sha in (("original-report", source_report, original_sha),
                            ("protected-report", args["protected_report"], args["protected_sha256"]),
                            ("selected-manifest", selected, selected_sha),
@@ -444,7 +575,7 @@ def test_legacy_cli_publishes_only_a_pinned_non_authoritative_cohort(legacy_evid
             if (output / "cohort.json").exists(): raise planner.PlanError("simulated terminal input drift")
             return check(bindings, reports)
         monkeypatch.setattr(planner, "recheck_legacy_bindings", fail_after_publish)
-    if fault:
+    if fault in {"nested_output", "terminal_failure"}:
         with pytest.raises(planner.PlanError): planner.main()
         assert not (output / "cohort.json").exists()
         assert (output / "failed.json").exists() is (fault == "terminal_failure")
@@ -457,3 +588,11 @@ def test_legacy_cli_publishes_only_a_pinned_non_authoritative_cohort(legacy_evid
     assert report["legacy_exclusion_evidence"]["verified_source_links"] == 3
     assert "legacy_transform_aliases" in report["pending_checks"]
     assert len(report["counts"]["accepted_by_split_class"]) == 18
+    assert hashlib.sha256(source_report.read_bytes()).hexdigest() == original_sha
+    if fault == "annotation_quarantine":
+        assert report["annotation_conflict_quarantine"]["group_count"] == 2
+        assert report["annotation_conflict_quarantine"]["source_count"] == 4
+        assert not {f"{n:020x}" for n in range(900, 904)} & accepted_ids(report)
+        assert "quarantine every member" in report["policy"]
+    else:
+        assert "annotation_conflict_quarantine" not in report
