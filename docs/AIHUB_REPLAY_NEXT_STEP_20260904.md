@@ -1106,3 +1106,43 @@ crop이 없는 여섯 보호 SHA는 그대로 남는다:
 17:24:24 KST 장기 materializer v2는 같은 ID/starttime/running/OOMfalse로
 verified **30,100/155,537**, materialized **28,785**다. GPU0%/2MiB/41°C,
 디스크 여유2.6TiB, timiroom 9개 Up2months를 확인했다. 학습은 아직 시작 전이다.
+
+## 16. 보호용 참고 ROI 128장 생성 완료 — 2026-09-04 17:39 KST
+
+`scripts/materialize_protected_reference_crops.py`와 직접 회귀 44개를 추가했다.
+메인 에이전트도 소스를 읽고 **44 passed**를 재확인한 뒤 NAS에서 실행했다.
+producer SHA는 `2628565cb506bbf44936241c68153baec068c7a1138294553a650042ce24e301`,
+test SHA는 `7ddb816732a03e22944f7cc6f6fece6ed4fd4a2dfaefddcefec7e104dee72b25`다.
+helper `audit_proposal_crop_reuse.py`/`verifier_preprocessing_contract.py`는 §13/15와 동일하다.
+
+- 컨테이너: `materialize_protected_reference_rois_v1_20260904`, ID
+  `5f84d31af4f0fc7346f493e079126e2fb8f280d006a592594000519d34b2fa82`.
+  17:39:07~17:39:09 KST, **exit0/OOMfalse**.
+- CODE: `J/protected_reference_roi_code_v1_20260904`; launch:
+  `J/launch_protected_reference_rois_v1_20260904.sh`, SHA
+  `dff080af9aa00cf767a9a836a605393f48b8700bd2294e6bd58d737f0c431032`.
+- CPU1/RAM512MiB/network none/no GPU、입력 RO/새 OUT만 RW이며 다른 컨테이너는
+  변경하지 않았다. known-audit/capture-inventory/protected-fingerprint SHA를 모두 고정했다.
+- report: `/share/Container/protected_reference_rois_v1_20260904/result/report.json`,
+  SHA `8eb282a9eacaf0b26fc35ca85c4985e5cef10e6d9a1ff19b30f63cd0ea3d81a5`.
+- 원본 **136**, 참고 ROI **128**(known reference103 + historical deployed25),
+  참고 bbox 없음 **8**. missing 8장도 원본 SHA/bytes/decode 확인 후 그대로 기록했다.
+  known bbox의 `bbox_source`도 보존하며 모델 추정 bbox를 GT로 바꾸지 않는다.
+- 별도 NAS read-only 검사에서 crop128개 SHA/bytes/320×320×3 decode,
+  report 전후 동일 SHA, failed.json 없음까지 확인했다.
+
+모든 label/training/blind/formal/deployment 권한은 false다. 이는 보호 사진의
+참고 영역을 만든 결과이며 새 YOLO 추론·정답 라벨·최종 누수 감사 통과가 아니다.
+다음 단계는 원본3636과 crop3630/실제 no-eligible6 증거를 연구용 보호 inventory로
+조립하는 것이다. 기존 formal v1에 가짜 crop을 넣거나 권한을 부여하지 않는다.
+
+17:37:48 KST 장기 materializer v2는 동일 ID/starttime/running/OOMfalse로
+verified **35,500/155,537**, materialized **33,941**다. 첫 변환 진행률은 약22.8%이며,
+완료 후 원본 재검증·YOLO 생성/재검증·학습이 별도로 남는다.
+
+추가로 generation wrapper는 첫 전체 image/sidecar inventory를 별도 Python에서
+읽은 뒤 generator process가 CUDA를 초기화하는 구조임을 확인했다. §15의 실제
+host fault-buffer 부족 재발 위험을 줄이기 위해 **같은 process에서 CUDA를 먼저
+확보하고 inventory→기존 generator.main을 이어 실행**하는 최소 수정/회귀를 진행한다.
+아직 full generation에서 같은 오류가 발생했다고 주장하지 않으며, 기존 NAS frozen
+release는 수정하지 않는다. 변경 시 새 release와 실제 code pins를 사용해야 한다.
