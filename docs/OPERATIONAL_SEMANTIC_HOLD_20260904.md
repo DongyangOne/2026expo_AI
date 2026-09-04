@@ -144,3 +144,30 @@ IoU 합의가 높아도 주대상 annotation이 맞는 것은 아니다.
 
 현재의 다음 진전은 **teacher/대상 의미 검증의 소규모 비교**다. 데이터 무결성 검사를
 약화하거나 기존 9장의 hold를 삭제해서 학습 단계로 넘기는 것은 다음 단계가 아니다.
+
+## 6. 차단 코드와 설치 모델 사전 검증
+
+`7442d85`를 main에 반영했다. 운영 proposal 준비와 V4 validator가 실제
+`material_semantics_hold.json`의 존재를 읽으면 학습용 게시를 거부한다.
+파일이 빈 JSON이거나 손상됐어도 보류를 무시하지 않는다. 신규 source-evidence와
+관련 회귀 묶음은 중복 실행을 제외해 **386 passed, 1 skipped**였다. 이는 전체
+저장소 테스트를 모두 실행했다는 뜻이 아니며 학습 정확도와도 관계없다.
+
+NAS `check_semantic_guard_20260904`는 03:02:40–03:02:52 UTC에 종료 코드 0으로
+완료했다. 실제 보류 파일을 읽어 거부되는 것을 확인하고, 설치된 두 GGUF의 전체
+bytes SHA와 `/api/tags` package digest 및 `/api/show` vision capability를 확인했다.
+모델 추론·학습·서비스 재시작은 하지 않은 읽기 전용 검사다.
+
+- 보고서: 작업 루트의 `check_semantic_guard_20260904.json`
+- 보고서 SHA256: `bab3e428dc0c73906ab7bf5d65edbd5e3b33dc76a3c83be5443263eb9421b513`
+- 8B GGUF SHA256: `ed12a4674d727a74ac4816c906094ea9d3119fbea46ca93288c3ce4ffbe38c55`
+- 9B GGUF SHA256: `dec52a44569a2a25341c4e4d3fee25846eed4f6f0b936278e3a3c900bb99d37c`
+
+비교 구현은 현재 공식 문서도 확인했다. Qwen3-VL의 2D grounding 좌표는
+원본 폭·높이에 대해 0–1000 정규화한다.
+[Qwen3-VL 기술 보고서 3.2.4](https://arxiv.org/html/2511.21631v1).
+Ollama에는 이미지와 JSON schema를 함께 전달하고 반환 필드를 별도로 검증한다.
+[Ollama Structured Outputs](https://docs.ollama.com/capabilities/structured-outputs).
+응답의 완료 사유·토큰 수·처리 시간을 기록해 잘린 출력과 정상 JSON을 구분한다.
+[Ollama Chat API](https://docs.ollama.com/api/chat).
+이 기능들이 올바른 재질이나 주대상 선택을 보장하는 것은 아니므로 실제 사진과 비교한다.
