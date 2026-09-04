@@ -1243,3 +1243,68 @@ lineage 산출물이 필요하며, 모든 연구/정답/학습/blind/배포 권�
 확인한 뒤 새로 복사했으며 기존 파일을 덮어쓰지 않았다. 인증정보는 출력/저장하지 않았다.
 18:08:26 실제 materializer는 같은 ID/starttime/running/OOMfalse로
 verified **47,700/155,537**, materialized **45,606**다.
+
+## 19. 연구 학습 실행기 검증·NAS 준비 완료 (실제 학습은 대기)
+
+임시 초안을 정식 `scripts/nas/run_aihub_material_research.sh`로 옮겼다.
+`tests/test_run_aihub_material_research.py`를 메인에서 독립 실행해 **28 passed/147.59초**를
+확인했다. 별도 읽기 전용 검토에서도 실제 trainer CLI/dry-run JSON/산출물 이름,
+원본 snapshot 필드와 8개 연구 감사 입력·4개 코드 pin 연결을 확인했다.
+연구 auditor의 confidence 변조 회귀도 독립 재실행해 통과했다.
+이는 CPU 계약 테스트다. 실제 GPU 학습·성능 향상·배포 통과를 의미하지 않는다.
+
+- 정식 wrapper SHA: `8d74cd7055e7cf20e37df65755095c768718fe63723650630043d457ebc5d1b8`.
+- test SHA: `678cdc190f54c2022818024d4a3a792e6558bd00af5900cf46d1017fd84898c1`.
+- frozen CODE_ROOT: `J/research_train_release_v1_20260904`.
+  wrapper와 Python 10개를 새 경로에 복사해 각 파일 SHA를 대조했다. 기존 release는 수정하지 않았다.
+- `audit_verifier_dataset.py`는 기존 작업 중인 파일을 바이트 그대로 동결했다.
+  아래 실제 SHA가 실행 근거다. 해당 파일의 기존 미커밋 변경을 이번 커밋에 섞지 않는다.
+  기존 `tests/test_audit_verifier_dataset.py`도 별도 실행해 **12 passed/3.46초**,
+  검사 전후 실제 SHA 일치를 확인했다.
+
+| Python 파일 (`scripts/` 아래) | SHA-256 |
+| --- | --- |
+| train_multitask_verifier.py | `6642ef6b43ccec441c0583dee029aee45ddb206c96a89420eb45270694971301` |
+| train_verifier.py | `1791d147430852503b868ffd8a57840c6b7b01d420c74a53b8e059f7b891b829` |
+| audited_aihub_snapshot.py | `c31ff7ebedede62e78270caad224b4f36cc306819c887e49c648a1e36ba39a32` |
+| materialize_audited_aihub_sources.py | `48598dde8491928f46ab64f9f479946e4a14a800f3e8d1dd1c396d9189e93b06` |
+| audit_aihub_original_annotations.py | `d3d82f6ee009a397716da7abde6e9499d54d85febb55a7c1f23ba337f5d70f99` |
+| audit_verifier_dataset.py | `dda36be1614a8dbd2e6df8d2ecc8a2f79ea0528685e7689b7f8914a0f40cec6f` |
+| audit_v4_near_duplicate_leakage.py | `4318b51f41d0fc3a8804055b100abacbe97e2a6c6a1ce32f4058a53c1dbee2fb` |
+| upgrade_proposal_manifest_lineage.py | `2bbdc5dad1d48ea6b87e12d7799a2cf78b2fa1e4abb9ef2ebc16a09f63ce8462` |
+| assemble_research_protected_references.py | `07f3f023c40b1bd6831cf9e21f517c22191207012e7c55a0f0b4339432ab2ddb` |
+| audit_research_reference_leakage.py | `b370f07848fbd0c5882fc7c33933865c0ec868fffb6fdff6377e5608b22a2c1b` |
+
+NAS의 기존 pinned 이미지 안에서 shell 문법과 위 10개 모듈 import를 실제 확인했다.
+검사 컨테이너 `check_aihub_research_runtime_v1_20260904`, ID
+`02cdf742d757e2907ae3893683e568415156a83a8dfe3708ec05154b3c322962`는
+18:19:43~18:19:51 KST **exit0/OOMfalse**다. CPU1/RAM2GiB/network none/no GPU,
+root/code 읽기 전용이다. 로그의 `training_started=false`처럼 trainer.main은 호출하지 않았다.
+
+TORCH_HOME은 **`J/research_torch_cache_v1_20260904`**로 준비했다.
+기존 NAS 가중치를 새 `hub/checkpoints/mobilenet_v3_small-047dcff4.pth`에 복사했으며
+SHA `047dcff4addef86ea5bc2eff13c9614dc11f47ab1160d0a71a25e7db994f4e1f`가 일치했다.
+추가 다운로드·기존 캐시 변경·서비스 재시작은 없다.
+
+### 실행할 때 지킬 연결
+
+전체 materializer→v2 raw generation→strict replay→lineage/역할 분리→§18 연구 누수 감사가
+실제로 완료돼야 이 학습 실행기를 사용한다. INPUTS 15개와 CODE 10개의 SHA를 실제 파일에서
+고정하고 wrapper SHA도 명시한다. 특히 연구 감사가 기록한 CODE 4개 SHA와 이 release가
+같아야 한다. 아직 없는 결과의 hash/ready를 만들어 채우지 않는다.
+
+RUN은 입력/코드/캐시와 겹치지 않는 신규 불변 경로로, 입력·코드·TORCH_HOME은 RO,
+RUN만 RW로 마운트한다. 동일 프로세스 CUDA 초기화 후 원본/역할/보호 참조와 실제 crop을
+검사하고 dry-run→학습을 실행한다. 실제 학습 시 기존 direct runc/device/QPKG library
+방식을 사용하고 다른 authoritative GPU 단계와 겹치지 않는다.
+
+고정 설정은 MobileNetV3-small, crop320, batch64, workers2, 최대100epochs/patience15,
+9종 material+objectness, condition head 없음이다. 학습/검증 각각 9종 positive와 실제
+background support를 확인한다. `dent/label/foreign_material=-1`을 정답으로 채우지 않는다.
+AIHub license evidence는 실제 문서 파일을 pin하되 법적 권한이 자동 증명됐다고 하지 않는다.
+`research_complete.json`은 학습 산출물 완료일 뿐 최종 정확도/배포 승인이 아니다.
+
+18:18:11 KST materializer v2는 동일 ID/starttime/running/OOMfalse로
+verified **51,600/155,537**, materialized **49,335**다(첫 변환 약33.2%).
+디스크 여유는 **2.6TiB/사용83%**다. 실제 전체 generation/replay/새 후보 학습은 아직 시작 전이며,
+변환 마지막 재해시와 후속 단계가 남아 있다. 현재 운영/Pi 모델과 Spring 계약은 유지한다.
