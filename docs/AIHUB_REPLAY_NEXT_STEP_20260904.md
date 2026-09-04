@@ -696,3 +696,47 @@ outside-pool 원본도 pHash 보호에 포함하지만, 미해결 링크·변환
 학습 입력은 이 단계 이후 full materialization→새 actual YOLO crop/strict replay→
 lineage 및 source/crop 양쪽 근접중복 검사로 이어진다. `--no-condition-heads` 연구
 학습은 상태 모델 최종 후보나 배포 승인이 아니며 production/Pi/Spring은 유지한다.
+
+### 다음 코드 사전 배치와 기존 보호 crop 재사용 확인
+
+main `a9b48e25d6a81dced53dc1ce83307d8de2770ea3`의 다음 네 파일을
+`J/legacy_exclusion_code_a9b48e2_20260904/scripts/`에 새로 복사했다. SMB 복사 전후와
+NAS `sha256sum` 결과가 일치했고, 기존 CPU 컨테이너에서 builder의 `--help` import가
+exit 0으로 완료됐다. 이는 배치/실행 환경 확인이지 full report 처리 완료가 아니다.
+
+- `build_legacy_protected_inventory.py`: `1fbc4e211caf2f7a8e8f920da631b4544f138e3d9ab4408b7c3644d3550a922b`
+- `plan_aihub_original_cohort.py`: `be81331b74385880615ff2b9217eaac89c03cfafda50125f108e2cdb94efef9a`
+- `audit_protected_image_fingerprints.py`: `c291de4f8ce4eb83f4f60b37c3a5e0b8e91933ffe08e86797c8f7eb2fac4ea6a`
+- `audit_aihub_original_annotations.py`: `d3d82f6ee009a397716da7abde6e9499d54d85febb55a7c1f23ba337f5d70f99`
+
+15:28 KST 원본 검사는 150,600/162,305(92.8%), verified 150,579,
+격리 21, 선형 잔여 644초였다. 이후에는 최종 report와 producer 종료 상태를 먼저 확인한다.
+
+보호 crop을 전량 다시 추론하기 전에 실제 기존 QX3 파일을 조회했다.
+
+- `v4_batch1_repro_pilot_qx3_5ac3031_20260902_203411/input/selection_inventory.json`의
+  전체 3,500 source와 `v4_repro_validation_qx3_retry2_5ac3031_20260902_223000/validation/validator-a/manifest.v4.validated.csv`를
+  SHA로 join했다. CSV의 실제 SHA는 `686839341a25cfd81e7a01622db386df72625de657d1b6205712cf2b0d64db70`,
+  3,498행/3,498 unique source다. 기존 diagnostic 역할과 lineage authority false를 유지한다.
+- 기존 generation의 `generation/raw/dataset_info.json`을 실제 읽고 SHA
+  `c15d8310a3f9cf779d483a9a996f7a851df30cfecc97d577d2873701332ddd17`을 대조했다.
+  전체 경로의 root는 `v4_batch1_repro_generation_qx3_retry1_5ac3031_20260902_214200`이다.
+  frames_seen 3,500, proposals_selected 3,498, frames_without_eligible_proposal 2,
+  source/write rejection은 비어 있다. 원본 폴더는 입력 RO로 유지됐고 이 generation은
+  exited 0이다. 새로운 추론은 실행하지 않았다.
+- 누락 두 source는 selection에서 explicit_empty_label=true인 training/background다.
+  `capture_9619af3f1aa23aaa.jpg` SHA `7344f55e8e5a3c11190ce8fd67c25997e239029ed7827dd92727fe866cb8834e`,
+  `capture_d0ee74f0e4a719b6.jpg` SHA `f4c9fd25e7a25fa35e40acc52cbc4cff6c936c47a4977ac29ea198408702c1a4`다.
+  이 두 SHA도 보호 집합에서 제거하지 않는다. 개별 빈 detector 결과의 새 attestation이나
+  다른 crop 파일 존재까지 입증한 것은 아니다.
+
+3,498개는 우선 **재사용 후보**다. 실제 crop bytes/상대경로와 원본 SHA를 다시 대조해야
+formal inventory로 소비할 수 있다. 보호 전용 ROI는 정답 bbox crop인지 YOLO crop인지
+출처를 구분한다. 현 formal v1은 모든 보호 SHA에 source/crop 각 1개를 요구하므로,
+빈 source를 crop이라고 복사하거나 2개를 누락한 목록으로 통과시키지 않는다.
+`crop_absent` 확장은 기존 계약 무변경이 아니므로 이번 작업에서는 적용하지 않았다.
+
+`tmp/run_aihub_material_research_20260904.sh`는 same-process CUDA/dry-run/최대100 epoch
+연구용 **미실행 초안**이다(SHA `cd97b8b022a1957d15f11403c20d5a7a431b779d27bcee3d672583b856474040`).
+구문·정적 경계만 검사했으며 NAS에 실행하거나 학습 완료로 표시하지 않았다.
+실제 역할별 CSV와 full 보호 감사 입력이 확보된 후 실행 검토한다.
