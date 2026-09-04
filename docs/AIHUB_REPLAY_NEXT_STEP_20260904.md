@@ -143,6 +143,8 @@ production/Pi 모델·Spring 계약을 바꾸지 않는다.
 원인이 모두 확정됐거나 기존 validator를 통과했다는 뜻은 아니다. 고정 임계값이나
 원본 confidence/bbox를 변경하지 않는다. 새 데이터는 운영 단일 요청에 맞는 batch=1
 생성 후 같은 조건으로 실제 재검증하는 경로가 타당하다.
+동일한 384×640 padding 안에서도 batch12와 batch1의 confidence는 4.17e-6 차이가
+있었다. 따라서 padding만 유일한 수치 변동 원인이라고 주장하지 않는다.
 
 첫 실행은 CUDA 초기화에서 거부되어 추론이 없었다. 다른 GPU 작업이 없는 것을 확인한
 뒤 문서화된 memory compaction을 실행했고, retry01은 CUDA 진입 후 결과 경로 검사에서
@@ -157,3 +159,71 @@ production/Pi 모델·Spring 계약을 바꾸지 않는다.
 `validator_ab_exact_reproduction`이다. 생성된 3,498행의 두 report와 validated CSV가
 일치했다. 이는 과거 재현성 진단이며 새 학습 실행·학습 승인·현재 full-quality 계약 통과가
 아니다. 3,500 source 전체를 계속 보호하고 학습에 넣지 않는다.
+
+## 6. 다음 데이터 생성 입력을 정하는 순서
+
+이미 확인한 91,938 manifest는 **source 후보 경로 목록으로만** 재사용할 수 있다.
+기존 predicted class/confidence/bbox를 새 정답으로 복사하지 않는다. 전체 약 20만 원본을
+다시 추론하기 전에 이 후보 pool의 출처·보호집합·원래 분할을 검사한다.
+
+`yolo_commercial_single_v1_20260813` 안에는 AIHub 파생 이미지 외에
+`hardware_rN_*` 복사본도 있다. 폴더 접두사만으로 AIHub origin을 부여하지 않는다.
+실제 `selected_manifest.csv`의 exact stem join과 원본 경로/annotation까지 확인해야 한다.
+
+- `selected_manifest.csv`: 18,744,451 bytes,
+  SHA `2f026c4d914ff3b5c6a8e3bf89280678a847e37a5f22611a481d792e8223012a`.
+  필드는 stem/category/class_id/source_id/source_path/area_bin/dent/raw_dirtiness다.
+  여기의 20자리 source_id는 V4 CSV의 64자리 image SHA와 다른 식별자다.
+- `selection_summary.json` SHA
+  `b7c59da5f867ebd60584de650756fce9ef8bef09619bd7fa4f761983fef339b6`.
+  당시 선택 원본 74,906, hardware 복사 528이라고 기록돼 있다. 이것은 새 학습 가능 수가 아니다.
+- 기존 YAML validation은 `/app/yolo_dataset_9class_v2/val/images`를 가리킨다.
+  commercial train의 selected_manifest에 없다는 이유로 validation origin을 추측하지 않는다.
+  해당 원본의 독립 annotation/출처 연결을 추가로 확인한다.
+
+보호 SHA는 QX3 `selected_sources[].source_sha256` 전체와 capture inventory의 모든 SHA,
+known-audit의 모든 SHA key를 합친다. `teacher_required`만 제외하는 방식은 사용하지 않는다.
+metadata SHA 중복 제외는 파일 재인코딩/근접중복 분리의 대체가 아니다.
+다음 metadata-only 감사는 원본 이미지·GT를 읽거나 학습용 CSV/YAML을 게시하지 않는다.
+그 결과에서 후보 수가 확보된 뒤 실제 bytes/단일 객체 GT/원본 연결/역할 분리를 검증하고,
+새 불변 source lists/YAML에서 batch=1 raw generation을 실행한다.
+
+AIHub 개방 데이터 정책과 dataset 71362 설명은 2026-09-04에 공식 페이지에서 다시 읽었다.
+연구·개발 활용과 출처 표시, 재배포·국외 반출 등 제한을 구분한다.
+[데이터 설명](https://www.aihub.or.kr/aihubdata/data/view.do?aihubDataSe=data&currMenu=115&dataSetSn=71362&topMenu=),
+[이용정책](https://www.aihub.or.kr/intrcn/guid/usagepolicy.do?currMenu=151&topMenu=105).
+이 페이지를 읽은 사실은 실제 다운로드 계정 동의나 모든 파생 source의 origin을 증명하지
+않으므로 가짜 license receipt/승인 pin을 만들지 않는다. 원본·선별 이미지는 외부에 게시하지 않는다.
+
+### Metadata-only 전량 집계 완료
+
+2026-09-04 `audit_aihub_source_pool_20260904`에서 기존 91,938행 메타데이터를 모두 읽었다.
+결과는 작업 루트의 `aihub_source_pool_audit_20260904/report.json`이며
+SHA `4eb22923a2a2520e60b8e35c60126018f114c65841c773a864d2a49a83eb9a28`이다.
+runner SHA는 `183f64eb14951e002570330ebfebe3c0fe60daf05461ee317783d84205a72987`이다.
+입력 metadata SHA는 전후 확인했지만 원본 이미지/annotation을 읽거나 해시하지 않았다.
+
+| 메타데이터 source 경로 | 기존 train | 기존 validation |
+|---|---:|---:|
+| commercial single root | 19,941 | 0 |
+| original yolo_dataset_9class_v2 root | 55,516 | 16,479 |
+| hardware_capture_prep root | 2 | 0 |
+
+commercial 19,941행 중 19,919행은 selected_manifest의 원본 경로와 exact stem으로
+연결되고, 22행은 hardware 복사본 이름이었다. QX3 3,500/캡처 133/known-audit 116의
+보호 SHA 합집합은 3,636개였다. 기존 CSV에는 QX3 SHA/path 3,496행이 등장했다.
+QX3 및 hardware 복사본 이름으로 제외할 행의 합집합은 **3,515행**이며 중복 사유를
+더하지 않는다. 나머지 88,423행은 **학습 수용 완료 수가 아니라 다음 확인 대상 수**다.
+
+- commercial exact join train: **19,283행**, 선언상 9종 존재.
+- original v2 tree: train **53,661행**, validation **15,479행**. 이 원본들의 출처 연결은
+  이번 exact commercial join 범위 밖이므로 추가 확인해야 한다.
+- 남은 CSV의 선언값에는 train/validation 모두 9종+background가 있지만, 검증된 GT
+  coverage가 아니다. 새 현재 이미지 hash·GT·재현성·근접중복 검증을 대체하지 않는다.
+- 실제 원천/파생 이미지 삭제, 학습용 목록 게시, YOLO 추론, 학습 및 배포는 하지 않았다.
+
+다음 단계는 이 88,423개를 바로 학습시키는 것이 아니다. commercial 목록의 원본·GT를
+실제로 확인하고, validation의 AIHub 원본 연결을 복원한 뒤 보호집합을 분리한 새 source
+입력을 만든다. 원본 v2의 `train_NNNNNNN.jpg`/`val_NNNNNNN.jpg`는 당시 converter의
+순번 이름이므로 이름만으로 원 JSON을 추측하지 않는다. 변환 목록/설정이 없으면 원본
+경로를 보존한 verifier manifest나 AIHub 원본 annotation에서 새 입력을 구성한다.
