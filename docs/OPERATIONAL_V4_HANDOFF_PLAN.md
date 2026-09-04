@@ -18,6 +18,31 @@ NAS 클래스/상태별 표본 수와 모델 정확도는 아직 미확인이다
 
 ## 다음 작업: 한 번에 한 단계씩
 
+### 2026-09-04 11:09 KST 실제 완료 기록
+
+- source commit `c35407845e51c81f22f3db2bca9e63e1c3f081f7`, NAS source 디렉터리
+  `operational_refresh_80bf78a_20260904_101000/source_empty_quality_c354078`.
+  Git archive SHA256: `77a17c9bc10e16075b682ba21b6288f1b03520314cde3438db117e0f16968d55`.
+- CPU 컨테이너 `assemble_quality_empty_v1_20260904_retry01`이 약 25초 만에
+  종료 코드 0으로 완료했고, full assembly를 공용 소비자 검증기로 다시 확인했다.
+  실제 출력은 작업 루트의 `work/ctx8192/quality_empty_v1_20260904_retry01/assembly`다.
+  같은 상위 디렉터리의 `verified.json` SHA256은
+  `5075c5c308794b26d32e3cf03953d3af09ba258395c493c6f7d2275e1d5fb526`이다.
+  manifest SHA256: `18aab3270c8c5278da93f69aadbe58992f71f23f597048edf4d28b69d26c0e80`.
+  receipt SHA256: `f31edf061522e5045b36676b07bb3d4b80d9964e7d3921211140bc94c335c1cc`.
+- 확정 품질 제외 0건, 기존 후보 9장/거부 11장 유지. 재질 비합의 1장도 계속 거부된다.
+  `training_started=false`, 배포 승인/운영 변경도 false다. 이전 A/B/C/teacher와
+  이번 quality assembly는 다시 실행하지 말고, 아래 2번의 운영 provenance 연결을 이어간다.
+- 첫 실행은 runner에 옮겨 적은 SHA가 65자리인 오류로 사전 검사에서 중단됐다.
+  원본 파일과 기존 teacher lineage의 64자리 SHA가 일치함을 확인한 후 runner만
+  수정하고 신규 retry01 출력에서 실행했다. 기존 실패 컨테이너·로그·출력은 보존했다.
+- 코드 검증: producer/teacher/empty-assembly 150 passed, selector 69 passed,
+  candidate 102 passed/1 skipped, 실제 조립 연결 2 passed, wrapper 선별 3 passed,
+  audit 선별 12 passed. 전체 legacy wrapper 회귀를 모두 실행한 것은 아니다.
+  이는 계약/실행 검증이며 모델 정확도나 독립 하드웨어 gate 통과가 아니다.
+
+### 남은 연결 단계
+
 1. **실제 입력 목록을 고정한다.** 현재 운영 배치 식별자는
    `operational_refresh_80bf78a_20260904_101000`이다. 다음 실행에서 NAS의 실제
    queue/known-audit/capture-inventory, 새 8192-context teacher 결과, A/C provider
