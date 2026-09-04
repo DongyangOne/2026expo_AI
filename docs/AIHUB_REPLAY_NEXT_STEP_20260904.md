@@ -227,3 +227,115 @@ QX3 및 hardware 복사본 이름으로 제외할 행의 합집합은 **3,515행
 입력을 만든다. 원본 v2의 `train_NNNNNNN.jpg`/`val_NNNNNNN.jpg`는 당시 converter의
 순번 이름이므로 이름만으로 원 JSON을 추측하지 않는다. 변환 목록/설정이 없으면 원본
 경로를 보존한 verifier manifest나 AIHub 원본 annotation에서 새 입력을 구성한다.
+
+## 7. 원본 이미지·JSON 검증 착수 (2026-09-04 13:10 KST)
+
+순번으로 저장된 기존 v2 이미지의 원본을 추측하지 않고,
+`crops_verifier_single_v3/manifest.csv`에서 고해상도 원본을 직접 연결한다.
+이 CSV는 72,271,739 bytes, SHA
+`c42f6a31382da5e060bfc784f0460ccc37d6a8e198577db3ba00b821968bafe7`이며
+162,305개의 source_id가 중복 없이 존재한다. `source_path_b64`를 surrogateescape
+왕복으로 복원한다. validation can 4개의 비 UTF-8 경로를 문자 대체로 고치지 않는다.
+
+| 품목 | 원본 Training | 원본 Validation | 기존 commercial exact join |
+|---|---:|---:|---:|
+| can | 19,968 | 3,998 | 10,000 |
+| pet | 19,999 | 4,000 | 10,000 |
+| paper | 9,992 | 1,998 | 9,758 |
+| plastic | 29,992 | 6,000 | 10,000 |
+| styrofoam | 10,000 | 2,000 | 9,986 |
+| vinyl | 9,999 | 1,999 | 9,814 |
+| glass | 29,979 | 5,997 | 10,000 |
+| battery | 3,271 | 409 | 3,105 |
+| fluorescent | 2,403 | 301 | 2,243 |
+| 합계 | 135,603 | 26,702 | 74,906 |
+
+위 숫자는 **CSV 출처 연결 수**이며 전량 원본 검증 통과 수가 아니다.
+commercial selected 74,906개는 모두 source_id/원본 path bytes/category/training/
+source_object_count=1로 v3 CSV와 일치한다. 기존 train_balanced의 hardware 복사는
+이 AIHub 원본 집합에 포함시키지 않는다.
+
+### 실물 pilot 통과, 전량 검사는 진행 중
+
+새 `scripts/audit_aihub_original_annotations.py`는 결정론적으로 선정한 원본에 대해
+실제 컬러 이미지 decode/치수, 원본 JSON 파일명·단일 annotation·재질·bbox,
+폴더/manifest/공식 split/source_id 일치를 검사한다. unknown 품목을 plastic으로
+대체하지 않는다. malformed bbox, 다중 BOX, 중복 JSON key, symlink는 거부한다.
+원본 DAMAGE는 참고 annotation_dent만 기록하고 세 상태 학습값은 전부 -1이다.
+DIRTINESS를 label/foreign_material 정답으로 복사하지 않는다.
+
+작업 루트 `operational_refresh_80bf78a_20260904_101000` 아래 실물 결과:
+
+- `original_annotation_pilot_v1_20260904/result/report.json`: 36/36 원본 연결 통과,
+  실제 읽기 142,975,442 bytes. SHA
+  `393debb6e52905c416edbedaa751dc4ebb216f1624b49f9540c888142c7a7427`.
+- `original_annotation_pilot_v2_20260904/result/report.json`: 위와 같은 36장을
+  강화된 JSON/파일 안정성 검사와 기존 감사의 direct-grayscale/DCT pHash로 다시 검사.
+  36/36 통과, elapsed 5.20초(입력 CSV 로딩/컨테이너 시작 제외), 4 workers.
+  SHA `949f5081c55cb7fa358302327bb7e13e39e1b4a07d9faeb9934c12cbe4ab71b5`.
+- v2 runner SHA
+  `d3d82f6ee009a397716da7abde6e9499d54d85febb55a7c1f23ba337f5d70f99`.
+  코드/단위·CLI 통합 테스트 44개가 통과했다(main `c03770f`).
+
+36장은 9품목×Training/Validation×2장이다. 샘플 통과를 전체 데이터 품질이나
+모델 정확도로 해석하지 않는다. `snapshot_only=true`이고 소비자는 원본/JSON SHA를
+실제 사용 전후 다시 확인해야 한다. 학습·배포 권한은 계속 false다.
+
+**진행 중:** `audit_original_annotation_full_v2_20260904` 컨테이너가 동일 v2 코드로
+162,305장 전체를 읽는다(`--per-class-split 30000`, 현재 모든 그룹 크기보다 큼).
+입력은 read-only, network none, CPU 4/RAM 4GiB, 원본 읽기 상한 1TiB이며
+고해상도 이미지를 복제하지 않는다. 결과 예정 경로는
+`original_annotation_full_v2_20260904/result/report.json`이다.
+완료 여부는 exit code/OOM flag/최종 report·manifest SHA를 확인한다.
+100장 단위 로그에서 실제 처리 수·elapsed와 선형 ETA를 확인할 수 있다.
+첫 1,300장 당시 약 19.7장/초였지만 품목·파일 크기·캐시에 따라 달라질 수 있다.
+
+### 전량 검사 이후 연결할 작업
+
+1. 실제 통과/격리 원인을 집계하고 report SHA 및 입력 pin을 고정한다. 다시 읽은
+   원본 SHA/JSON SHA가 불일치하면 새 입력에서 제외한다.
+2. QX3/모든 운영·known-audit 보호집합을 원본 ID, 실제 SHA, 동일 pHash 규약으로
+   대조한다. 공식 Training/Validation을 유지하고 교차 분할·근접중복을 격리한다.
+3. 원본 JSON GT에서 새 YOLO label과 원본 path/source_id를 보존하는 sidecar를
+   생성한다. 단일 원본·정답 파일·파생 바이트 해시를 함께 결박하고 기존 predicted
+   class/conf/bbox는 재사용하지 않는다.
+4. 신규 불변 source/YAML에서 batch1 raw 생성 → 같은 조건의 strict replay →
+   lineage·누수 감사 → 조건 head 없는 품목 연구학습을 연결한다. 별도 상태 정답
+   검증과 candidate policy pin 없이는 세 상태 head 후보로 승격하지 않는다.
+
+이 단계들은 모델 성능 검증을 대체하지 않는다. 기존 41장과 QX3는 계속 보호하며,
+신규 독립 blind와 하드웨어 이미지+무게→Spring callback gate 전 production은 유지한다.
+
+### 보호 이미지 3,636장 실물 지문 완료 (13:20 KST)
+
+기존 metadata 제외 목록을 실제 이미지 SHA와 같은 DCT pHash 규약으로 확인했다.
+`audit_protected_fingerprints_v1_20260904`는 13:19:23~13:20:11 KST 실행 후
+exit 0/OOM false, `failed.json` 없음으로 종료했다.
+
+- QX3 3,500 + 운영 inventory 133 + known-audit 116의 SHA 합집합은 3,636개다.
+  known 116 중 113개는 NAS 캡처에 있었고 나머지 3개는 노트북 기존 원본에서
+  source SHA를 확인해 NAS의 새 보호 참조 폴더로 복사했다(총 203,234 bytes).
+  누락 3개는 8월 1일 전 사진이므로 **보호 지문 참조 전용**이며 학습에 넣지 않는다.
+  원본·기존 캡처·정답은 변경/삭제하지 않았다.
+- `hardware_capture_prep_20260803/dataset_v2/resolved_audit_by_sha.json`의
+  116 SHA와 membership은 known-audit에 정확히 연결된다. 원본 SHA는
+  `aa835f2262482b1678754d99f547b598cb62ad8a794aa68dcf0033fb12af3982`다.
+- 입력 `protected_fingerprints_inputs_20260904/inventory_strict.json` SHA:
+  `26491c938d26aa90a1db51c187cb5b61d24360c6cb21b5779cc2319a002a74a0`.
+  각 레코드는 SHA/path/roles만 있으며 `qx3`, `capture`, `known_audit` 역할을
+  합친다. 과거 predicted class/bbox/label 값은 정답으로 전달하지 않는다.
+- 출력 `protected_fingerprints_v1_20260904/result/report.json` SHA:
+  `d33cb1105310bbc7da8dff3748d17350a9d5b67351e75d76a789521681c1aa41`.
+  3,636/3,636 실물 이미지 SHA·치수·pHash 확인, missing 0, snapshot_complete다.
+- helper `scripts/audit_protected_image_fingerprints.py` SHA:
+  `c291de4f8ce4eb83f4f60b37c3a5e0b8e91933ffe08e86797c8f7eb2fac4ea6a`.
+  원본 감사 helper와 합쳐 테스트 67개 통과. CPU 1/RAM 1GiB/network none으로
+  실행했고 입력/metadata/code/원본을 게시 전후 다시 해시했다. 사용한 읽기 상한은
+  2GiB이며 데이터 다운로드나 GPU 추론은 없었다.
+
+이 결과는 **보호집합 자체의 바이트/지문 검증**이다. 아직 진행 중인 원본 162,305장과의
+exact/near-duplicate 비교 완료나 학습 데이터 수용을 뜻하지 않는다. 보고서의
+training/deployment/blind/selection 권한은 전부 false이고, 이후 소비 시 원본 SHA를
+재확인한다. 전량 검사 종료 후 이 두 보고서를 연결해 cross-source/공식 split/보호집합
+누수를 먼저 검사한다. 원본 1만 장 시점 elapsed 603.35초였으며 전체 검사 선형 잔여
+예상은 약 2시간 33분이었다(품목/크기/캐시에 따라 변동, 학습 ETA가 아님).
