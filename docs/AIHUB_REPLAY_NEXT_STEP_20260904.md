@@ -1211,3 +1211,35 @@ v1 release/실행 산출물은 수정하지 않았다. full generation과 strict
 
 17:53:42 KST materializer v2는 계속 실행 중이며 verified **41,800/155,537**,
 materialized **39,955**다. 실제 full generation·replay·연구 학습은 아직 시작 전이다.
+
+## 18. 연구 누수 검사기의 replay 행 보존 보완 완료
+
+§17에서 발견한 보존값 결박 누락을 수정했다. 기존 replay의 source/crop SHA는 필수이며,
+실제 업그레이더의 경로·split/fold 정규화와 빈 source-bbox 유도만 허용해 보존 필드
+fingerprint를 비교한다. 남긴 lineage 행은 실제 replay 행의 subset이어야 하며 중복 수와
+기존 validation 격리 수를 receipt와 대조한다. 새로운 pHash/정답/그룹 판단은 추가하지 않았다.
+
+- `scripts/audit_research_reference_leakage.py` 최종 SHA:
+  `b370f07848fbd0c5882fc7c33933865c0ec868fffb6fdff6377e5608b22a2c1b`.
+- `tests/test_audit_research_reference_leakage.py` SHA:
+  `979238b288d043f99aa52e4f5b1777daf139e7afc582f23052680c696e7ea8eb`.
+- 최종 전체 **45 passed/110.71초**, 메인도 새 보존 검사 코드를 읽고
+  confidence/class/bbox/GT/state/hash/기타 근거 변조 7종을 별도로 실행해 **7 passed**를 확인했다.
+  실제 upgrader의 absolute 경로·빈 bbox 유도·64MiB 초과 CSV·실제 v2 reader fixture도 통과했다.
+- NAS CODE는 `J/research_audit_code_v1_20260904`다. auditor/assembler/shared near/
+  lineage upgrader 4개 파일을 새 디렉터리에 복사하고 각각 SHA 일치를 확인했다.
+  앞의 세 helper SHA는 §17과 같으며 lineage upgrader SHA는
+  `2bbdc5dad1d48ea6b87e12d7799a2cf78b2fa1e4abb9ef2ebc16a09f63ce8462`다.
+  NAS 이미지 안에서 신규 CLI의 `--help`도 exit0을 확인했다. 이는 실제 전체 감사 실행은 아니다.
+
+아직 실제 전체 candidate 누수 검사는 실행하지 않았다. 전체 raw generation/replay와
+lineage 산출물이 필요하며, 모든 연구/정답/학습/blind/배포 권한 구분은 그대로 유지한다.
+연구 학습용 `tmp/run_aihub_material_research_20260904.sh`는 이 v2 검사와 reader를
+소비하도록 전환·CPU 계약 테스트 중이다. 완료·NAS 학습 실행으로 취급하지 않는다.
+
+18:02:54 KST OpenVPN connection-reset 이후18:03:07 재연결이 있었고 기존 SSH/SMB
+세션이 끊겼다. 새로운 TCP22/445 응답과 기존 NAS host key 일치를 확인한 뒤 재인증했다.
+실행 중 NAS 작업은 재시작하지 않았다. 실패한 첫 audit-code 복사는 디렉터리 미생성을
+확인한 뒤 새로 복사했으며 기존 파일을 덮어쓰지 않았다. 인증정보는 출력/저장하지 않았다.
+18:08:26 실제 materializer는 같은 ID/starttime/running/OOMfalse로
+verified **47,700/155,537**, materialized **45,606**다.
