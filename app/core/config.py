@@ -45,11 +45,13 @@ class Settings(BaseSettings):
     VERIFIER_LABEL_HEAD_ENABLED: bool = True
 
     # YOLO가 TRUST_CONF에 못 미쳐 일반쓰레기로 보낼 건을 crop 검증기가 확신하면 되살린다.
-    # 학습 미사용 하드웨어 35건 실측(현재 동작 → 구제 0.60):
-    #   정답 20→27, 보류 14→4, 오답 1→4 (McNemar p=0.016, 현재만 맞은 건 0건).
-    # 특히 플라스틱은 7건 전부 보류되던 것이 5건 정답으로 바뀐다.
+    # 학습 미사용 하드웨어 35건, 원본 이미지를 실제 파이프라인 그대로 통과시킨 실측
+    # (2026-09-05, 오프라인 crop 시뮬레이션이 아니라 라이브 bbox 기준):
+    #   0.60 → 정답 24/35, 0.50 → 정답 25/35, 위험허용 양쪽 동일 1건(무관한 기존 결함).
+    #   0.50이 plastic 한 건을 추가로 살리고 다른 품목엔 영향 없다.
+    #   McNemar p=1.000이라 이 표본으로 유의성은 없지만 손해가 없어 채택한다.
     VERIFIER_RESCUE_ENABLED: bool = True
-    VERIFIER_RESCUE_CONF: float = 0.60
+    VERIFIER_RESCUE_CONF: float = 0.50
 
     # YOLO와 crop 검증기가 응답 클래스에서 불일치하면 확정하지 않고 일반쓰레기로 보낸다.
     # 학습에 쓰이지 않은 하드웨어 감사 35건에서 두 모델이 합의한 21건은 전부 정답이었고,
