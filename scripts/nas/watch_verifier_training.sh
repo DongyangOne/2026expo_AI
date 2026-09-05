@@ -52,6 +52,17 @@ if ! grep -q '^nvidia ' /proc/modules; then
 fi
 /sbin/gpuhal_app -e f 4 0 0 >/dev/null 2>&1 || true
 sleep 8
+
+# 모듈 리셋만으로 안 잡히는 반복 원인: 호스트 메모리 단편화로 드라이버가
+# 컨텍스트 생성용 연속 메모리를 못 잡아 "CUDA driver initialization failed"가
+# 난다(2026-09-05 실측 확인). persistence mode + sync/drop_caches/compact_memory로
+# 해결된다. 모듈 리셋 직후, 학습 컨테이너를 시작하기 직전에 실행한다.
+NV=/share/CACHEDEV1_DATA/.qpkg/NVIDIA_GPU_DRV
+LD_LIBRARY_PATH="$NV/usr/lib" "$NV/usr/bin/nvidia-smi" -pm 1 >/dev/null 2>&1 || true
+sync
+echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+[ -f /proc/sys/vm/compact_memory ] && echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true
+sleep 8
 i=0
 while ps | grep -q '[n]vidia-smi'; do
   i=$((i + 1))
