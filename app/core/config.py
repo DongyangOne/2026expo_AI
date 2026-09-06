@@ -82,6 +82,16 @@ class Settings(BaseSettings):
     # ── 무게 이상 감지 ────────────────────────────────────────────────────────────
     WEIGHT_ANOMALY_ENABLED: bool = True
 
+    # 저울에 실제로 아무것도 없을 때 시각 오탐을 막는 하한 가드.
+    # 빈 화면 6장 중 4장에서 오탐이 났고 3장은 ALLOWED까지 갔다(2026-09-07 실측).
+    # 검증기가 background 클래스가 없는 closed-set이라 빈 장면에도 반드시 9종 중
+    # 하나를 고신뢰로 출력하는 게 원인이라, 시각 정보만으로는 막을 수 없다.
+    # weight_g가 None이면(센서 미연결·미전송) 아무 동작도 하지 않는다.
+    # 기본값은 가장 가벼운 정품(영수증 낱장)보다도 확실히 아래로 잡았다.
+    # 저울 정밀도 확정 후 재보정 필요 — docs/WEIGHT_KIOSK_PARAMS.md
+    WEIGHT_MIN_GUARD_ENABLED: bool = True
+    WEIGHT_MIN_G: float = 1.0
+
     # ── Spring 콜백 ──────────────────────────────────────────────────────────────
     # None 이면 콜백 비활성 (Spring URL 미설정 시)
     SPRING_CALLBACK_URL: str | None = None

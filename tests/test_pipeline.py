@@ -667,3 +667,63 @@ def test_confidence는_뷰별_확률을_평균낸다():
     two_views = np.array([[5.0, 0.0, 0.0], [0.0, 5.0, 0.0]])
     _, averaged = _confidence(two_views)
     assert averaged < confidence
+
+
+def test_저울이_비면_시각결과와_무관하게_미감지(monkeypatch):
+    """빈 저울에서는 검출이 성공해도 NOT_DETECTED로 끝낸다.
+
+    검증기에 background 클래스가 없어 빈 장면도 9종 중 하나로 분류되므로,
+    이 가드가 없으면 빈 통이 ALLOWED로 응답될 수 있다(2026-09-07 실측: 6장 중 3장).
+    """
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 0.0, "empty-scale", _Registry()))
+
+    assert result.status is DetectionStatus.NOT_DETECTED
+    assert result.classification is None
+    assert result.weight.value_g == 0.0
+
+
+def test_무게가_None이면_하한가드는_동작하지_않는다(monkeypatch):
+    """센서 미연결 시 기존 동작을 그대로 유지한다."""
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, None, "no-scale", _Registry()))
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification is not None
+
+
+def test_임계이상_가벼운물체는_정상처리(monkeypatch):
+    """영수증 낱장 수준의 가벼운 정품은 가드에 걸리지 않아야 한다."""
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 2.0, "light-item", _Registry()))
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification is not None
+
+
+def test_하한가드_비활성화시_통과(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pipeline.settings, "WEIGHT_MIN_GUARD_ENABLED", False)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 0.0, "guard-off", _Registry()))
+
+    assert result.status is DetectionStatus.ALLOWED

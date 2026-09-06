@@ -202,6 +202,23 @@ async def run(
     loop = asyncio.get_running_loop()
 
     img = await _read_image(upload)
+
+    # ── 저울 하한 가드 ──────────────────────────────────────────────────────────
+    # 저울에 아무것도 없으면 시각 결과와 무관하게 미감지로 끝낸다. 검증기에
+    # background 클래스가 없어 빈 장면도 반드시 9종 중 하나로 분류되기 때문에,
+    # 이 경로가 없으면 빈 통을 ALLOWED로 응답할 수 있다.
+    # weight_g가 None이면 판단 근거가 없으므로 가드를 적용하지 않는다.
+    if (
+        settings.WEIGHT_MIN_GUARD_ENABLED
+        and weight_g is not None
+        and weight_g < settings.WEIGHT_MIN_G
+    ):
+        return DetectResponse(
+            client_id=client_id,
+            status=DetectionStatus.NOT_DETECTED,
+            weight=WeightInfo(value_g=weight_g),
+        )
+
     detection = await loop.run_in_executor(_executor, inference.run_main, registry, img)
 
     # ── 미감지 ──────────────────────────────────────────────────────────────────
