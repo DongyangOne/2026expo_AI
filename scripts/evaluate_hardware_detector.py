@@ -131,6 +131,7 @@ def evaluate(
     batch: int,
     imgsz: int,
     min_iou: float,
+    nms_iou: float = 0.70,
 ) -> dict:
     # 지연 import로 pure helper 테스트가 ultralytics 설치/모델 로드에 의존하지 않게 한다.
     from ultralytics import YOLO
@@ -148,7 +149,7 @@ def evaluate(
             model.predict(
                 source,
                 conf=minimum_threshold,
-                iou=0.6,
+                iou=nms_iou,
                 imgsz=imgsz,
                 device=device,
                 batch=1,
@@ -160,7 +161,7 @@ def evaluate(
         predictions = model.predict(
             sources,
             conf=minimum_threshold,
-            iou=0.6,
+            iou=nms_iou,
             imgsz=imgsz,
             device=device,
             batch=batch,
@@ -173,6 +174,7 @@ def evaluate(
         "dataset": str(dataset_dir.resolve()),
         "raw_image_root": str((dataset_dir / "images" / "val").resolve()),
         "prediction_confidence_floor": float(minimum_threshold),
+        "nms_iou": float(nms_iou),
         "thresholds": {},
     }
     prediction_candidates = []
@@ -247,7 +249,15 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--min-iou", type=float, default=0.3)
+    parser.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.70,
+        help="운영 run_main과 동일한 YOLO NMS IoU",
+    )
     args = parser.parse_args()
+    if not 0 <= args.nms_iou <= 1:
+        parser.error("nms-iou must be in [0, 1]")
     report = evaluate(
         args.model,
         args.dataset_dir,
@@ -257,6 +267,7 @@ def main() -> None:
         args.batch,
         args.imgsz,
         args.min_iou,
+        args.nms_iou,
     )
     summary = {
         threshold: {
