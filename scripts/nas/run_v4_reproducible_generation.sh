@@ -520,6 +520,9 @@ payload = {
     "judge_authority": False,
     "training_authority": False,
     "blind_test_authority": False,
+    # Keep the legacy marker for existing readers, and publish the canonical
+    # authorization spelling required by the strict full-replay contract.
+    "blind_test_authorized": False,
     "production_deployment_authorized": False,
     "bindings": {
         "input_marker_sha256": sha(inputs),

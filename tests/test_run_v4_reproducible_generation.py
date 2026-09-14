@@ -434,7 +434,8 @@ def test_mock_audited_generation_pins_five_extra_inputs_and_passes_canonical_ori
     assert verified.returncode == 0
     ready = json.loads((control / "raw_generation_ready.json").read_text())
     for authority in ("validator_authority", "judge_authority", "training_authority",
-                      "blind_test_authority", "production_deployment_authorized"):
+                      "blind_test_authority", "blind_test_authorized",
+                      "production_deployment_authorized"):
         assert ready[authority] is False
 
 
