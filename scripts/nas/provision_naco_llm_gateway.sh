@@ -7,7 +7,7 @@ DOCKER_BIN="${DOCKER_BIN:-/share/CACHEDEV1_DATA/.qpkg/container-station/bin/dock
 ROOT="${NACO_GATEWAY_ROOT:-/share/Container/naco_ai/gateway}"
 NETWORK="${NACO_OLLAMA_NETWORK:-naco_naco-internal}"
 CONTAINER="${NACO_GATEWAY_CONTAINER:-naco-ollama-gateway}"
-IMAGE="${NACO_GATEWAY_IMAGE:-nginx:1.27-alpine}"
+IMAGE="${NACO_GATEWAY_IMAGE:-nginx:alpine}"
 PORT="${NACO_GATEWAY_PORT:-11435}"
 
 # An explicit private bind address is mandatory: never listen on every NAS NIC.
@@ -49,6 +49,8 @@ if [ ! -f "$KEY_FILE" ]; then
 fi
 
 cat > "$TEMPLATE" <<'EOF'
+map_hash_bucket_size 128;
+
 map $http_authorization $naco_llm_authorized {
     default 0;
     "Bearer ${NACO_LLM_API_KEY}" 1;
