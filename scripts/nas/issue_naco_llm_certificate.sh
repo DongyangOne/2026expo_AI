@@ -77,13 +77,14 @@ EOF
   -v "$ROOT/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro" \
   -v "$ROOT/certbot/www:/var/www/certbot:ro" \
   -v "$ROOT/certbot/conf:/etc/letsencrypt:ro" \
-  "$NGINX_IMAGE" sh -c 'nginx -t || exit 1; (while :; do sleep 21600; nginx -s reload; done) & exec nginx -g "daemon off;"' >/dev/null
+  "$NGINX_IMAGE" nginx -g 'daemon off;' >/dev/null
 "$DOCKER_BIN" network connect "$INTERNAL_NETWORK" "$CONTAINER"
 "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" | grep -qx true
 "$DOCKER_BIN" rm -f "$RENEWER" >/dev/null 2>&1 || true
 "$DOCKER_BIN" run -d --name "$RENEWER" --restart unless-stopped \
+  --pid="container:$CONTAINER" \
   --entrypoint /bin/sh \
   -v "$ROOT/certbot/www:/var/www/certbot" \
   -v "$ROOT/certbot/conf:/etc/letsencrypt" \
-  "$CERTBOT_IMAGE" sh -c 'trap exit TERM; while :; do certbot renew --non-interactive; sleep 12h & wait ${!}; done;' >/dev/null
+  "$CERTBOT_IMAGE" -c 'trap exit TERM; while :; do certbot renew --non-interactive --deploy-hook "kill -HUP 1"; sleep 12h & wait ${!}; done;' >/dev/null
 echo "TLS_READY domain=$DOMAIN"
