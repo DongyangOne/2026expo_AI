@@ -59,6 +59,20 @@ class Settings(BaseSettings):
     # 켜면 확정 오답이 7→0건으로 줄지만 보류가 3→14건으로 늘어 처리량을 포기한다.
     VERIFIER_AGREEMENT_GATE_ENABLED: bool = False
 
+    # ── NAS 로컬 Vision LLM (YOLO crop 재판정) ────────────────────────────────────
+    # YOLO는 물체 위치/미감지를 계속 담당한다. LOCAL_LLM_MODE=primary일 때만
+    # YOLO bbox crop의 품목·라벨·압착·외부 이물질을 NAS Vision LLM으로 판정한다.
+    # LLM 장애·형식 오류·저신뢰는 기존 YOLO/상태 모델로 fail-safe fallback 한다.
+    LOCAL_LLM_MODE: str = "disabled"  # disabled | shadow | primary
+    LOCAL_LLM_BASE_URL: str | None = None
+    LOCAL_LLM_API_KEY: str | None = None
+    LOCAL_LLM_MODEL: str = "qwen3-vl:8b"
+    LOCAL_LLM_TIMEOUT_SEC: float = 20.0
+    LOCAL_LLM_MIN_CONFIDENCE: float = 0.80
+    LOCAL_LLM_SHADOW_LOG_PATH: str = "logs/local_llm_shadow.jsonl"
+    LOCAL_LLM_MAX_IMAGE_SIDE: int = 640
+    LOCAL_LLM_MAX_IMAGE_BYTES: int = 1_500_000
+
     # 저신뢰 PET/PLASTIC과 VINYL이 같은 bbox에서 경쟁할 때만 crop 검증기로 교정한다.
     VINYL_CORRECTION_ENABLED: bool = True
     VINYL_CANDIDATE_CONF: float = 0.10

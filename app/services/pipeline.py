@@ -33,7 +33,7 @@ from app.core.config import settings
 from app.models.registry import ModelRegistry
 from app.schemas.enums import DetectionStatus, GeneralWasteCode, WasteClass
 from app.schemas.response import Classification, Conditions, DetectResponse, WeightInfo
-from app.services import guidance, inference, verifier_shadow
+from app.services import guidance, inference, local_llm, verifier_shadow
 from app.services.weight_check import is_anomaly
 
 logger = logging.getLogger(__name__)
@@ -141,6 +141,21 @@ def _apply_verifier_conditions(
     return Conditions(has_label=has_label, is_dented=is_dented)
 
 
+def _apply_local_llm_conditions(
+    conditions: Conditions, prediction: local_llm.LocalLLMPrediction | None,
+    model_class_id: int,
+) -> Conditions:
+    """Primary-mode LLM may replace only condition heads meaningful for the item."""
+    if prediction is None:
+        return conditions
+    return Conditions(
+        has_label=(prediction.has_label if model_class_id in {_PET_MODEL_CLASS_ID, _PLASTIC_CLASS_ID}
+                   else conditions.has_label),
+        is_dented=(prediction.is_dented if model_class_id in {_PET_MODEL_CLASS_ID, _CAN_MODEL_CLASS_ID}
+                   else conditions.is_dented),
+    )
+
+
 def _response_class_id(model_class_id: int | None) -> int | None:
     """PET는 응답 계약에서 PLASTIC과 같은 통이므로 모델 비교도 같은 기준으로 한다."""
     if model_class_id is None:
@@ -180,6 +195,7 @@ def _build_classification(
 def shutdown() -> None:
     _executor.shutdown(wait=True)
     verifier_shadow.shutdown()
+    local_llm.shutdown()
 
 
 async def _read_image(upload: UploadFile) -> np.ndarray:
@@ -237,6 +253,21 @@ async def run(
 
     yolo_class_id = class_id
     yolo_confidence = confidence
+    llm_prediction = None
+    if local_llm.primary_enabled():
+        llm_prediction = await loop.run_in_executor(_executor, local_llm.classify, img, bbox)
+        if (
+            llm_prediction is not None
+            and llm_prediction.is_single_primary_item
+            and llm_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
+        ):
+            class_id = llm_prediction.class_id
+            confidence = llm_prediction.confidence
+        else:
+            # An unavailable/ambiguous LLM must not turn a kiosk request into a failure.
+            llm_prediction = None
+    else:
+        local_llm.submit_shadow(img, bbox, yolo_class_id, yolo_confidence, client_id)
     verifier_session = (
         registry.verifier() if hasattr(registry, "verifier") else None
     )
@@ -378,7 +409,7 @@ async def run(
         state_prediction = await loop.run_in_executor(
             _executor, inference.run_state, registry.state(), img, bbox, cls
         )
-        conditions = state_prediction.conditions
+        conditions = _apply_local_llm_conditions(state_prediction.conditions, llm_prediction, class_id)
         weight_info.anomaly = (
             settings.WEIGHT_ANOMALY_ENABLED
             and weight_g is not None
@@ -388,7 +419,7 @@ async def run(
             cls,
             conditions,
             weight_info.anomaly,
-            state_prediction.has_foreign_material,
+            (llm_prediction.has_foreign_material if llm_prediction else state_prediction.has_foreign_material),
         )
         if guide:
             return DetectResponse(
@@ -415,6 +446,7 @@ async def run(
     )
     conditions = state_prediction.conditions
     conditions = _apply_verifier_conditions(conditions, verifier_prediction)
+    conditions = _apply_local_llm_conditions(conditions, llm_prediction, class_id)
     weight_info.anomaly = (
         settings.WEIGHT_ANOMALY_ENABLED
         and weight_g is not None
@@ -425,7 +457,7 @@ async def run(
         cls,
         conditions,
         weight_info.anomaly,
-        state_prediction.has_foreign_material,
+        (llm_prediction.has_foreign_material if llm_prediction else state_prediction.has_foreign_material),
     )
     # 안내가 있으면 조건 불충족 → 재처리 거부, 없으면 충족 → 수거 허용
     status = DetectionStatus.REJECTED if guide else DetectionStatus.ALLOWED
