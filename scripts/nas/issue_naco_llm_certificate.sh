@@ -82,6 +82,7 @@ EOF
 "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" | grep -qx true
 "$DOCKER_BIN" rm -f "$RENEWER" >/dev/null 2>&1 || true
 "$DOCKER_BIN" run -d --name "$RENEWER" --restart unless-stopped \
+  --entrypoint /bin/sh \
   -v "$ROOT/certbot/www:/var/www/certbot" \
   -v "$ROOT/certbot/conf:/etc/letsencrypt" \
   "$CERTBOT_IMAGE" sh -c 'trap exit TERM; while :; do certbot renew --non-interactive; sleep 12h & wait ${!}; done;' >/dev/null

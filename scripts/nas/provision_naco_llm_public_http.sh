@@ -33,7 +33,7 @@ fi
 umask 077
 mkdir -p "$ROOT/certbot/www" "$ROOT/certbot/conf" "$ROOT/nginx"
 # Certbot writes the HTTP-01 token here, and nginx workers must traverse it.
-chmod 755 "$ROOT/certbot/www"
+chmod 755 "$ROOT" "$ROOT/certbot" "$ROOT/certbot/www" "$ROOT/certbot/conf" "$ROOT/nginx"
 cat > "$ROOT/nginx/default.conf.template" <<EOF
 server {
     listen 80;
@@ -45,6 +45,7 @@ server {
     location / { return 308 https://\$host\$request_uri; }
 }
 EOF
+chmod 644 "$ROOT/nginx/default.conf.template"
 
 "$DOCKER_BIN" run --rm \
   -v "$ROOT/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro" \
