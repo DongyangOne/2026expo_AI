@@ -13,10 +13,6 @@ INTERNAL_NETWORK="${NACO_OLLAMA_NETWORK:-naco_naco-internal}"
 PUBLIC_IP="${NACO_LLM_PUBLIC_IP:-223.194.166.7}"
 KEY_FILE="${NACO_GATEWAY_KEY_FILE:-/share/Container/naco_ai/gateway/gateway.env}"
 RENEWER="${NACO_CERTBOT_CONTAINER:-naco-llm-certbot}"
-: "${NACO_ACME_SERVER:?Set the ACME directory URL}"
-: "${NACO_ACME_EAB_KID:?Set the ZeroSSL EAB key id}"
-: "${NACO_ACME_EAB_HMAC_KEY:?Set the ZeroSSL EAB HMAC key}"
-: "${NACO_ACME_EMAIL:?Set a renewal-notification email}"
 
 if ! "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
   echo "Public HTTP gateway is not running" >&2; exit 1
@@ -28,14 +24,20 @@ if ! "$DOCKER_BIN" image inspect "$NGINX_IMAGE" >/dev/null 2>&1; then
   echo "Nginx image missing locally: $NGINX_IMAGE" >&2; exit 1
 fi
 
-"$DOCKER_BIN" run --rm \
-  -v "$ROOT/certbot/www:/var/www/certbot" \
-  -v "$ROOT/certbot/conf:/etc/letsencrypt" \
-  "$CERTBOT_IMAGE" certonly --webroot -w /var/www/certbot \
-  --server "$NACO_ACME_SERVER" \
-  --eab-kid "$NACO_ACME_EAB_KID" \
-  --eab-hmac-key "$NACO_ACME_EAB_HMAC_KEY" \
-  --email "$NACO_ACME_EMAIL" --agree-tos --no-eff-email --non-interactive -d "$DOMAIN"
+if [ "${NACO_SKIP_ISSUANCE:-0}" != "1" ]; then
+  : "${NACO_ACME_SERVER:?Set the ACME directory URL}"
+  : "${NACO_ACME_EAB_KID:?Set the ZeroSSL EAB key id}"
+  : "${NACO_ACME_EAB_HMAC_KEY:?Set the ZeroSSL EAB HMAC key}"
+  : "${NACO_ACME_EMAIL:?Set a renewal-notification email}"
+  "$DOCKER_BIN" run --rm \
+    -v "$ROOT/certbot/www:/var/www/certbot" \
+    -v "$ROOT/certbot/conf:/etc/letsencrypt" \
+    "$CERTBOT_IMAGE" certonly --webroot -w /var/www/certbot \
+    --server "$NACO_ACME_SERVER" \
+    --eab-kid "$NACO_ACME_EAB_KID" \
+    --eab-hmac-key "$NACO_ACME_EAB_HMAC_KEY" \
+    --email "$NACO_ACME_EMAIL" --agree-tos --no-eff-email --non-interactive -d "$DOMAIN"
+fi
 
 cat > "$ROOT/nginx/default.conf.template" <<'EOF'
 map_hash_bucket_size 128;
