@@ -183,5 +183,33 @@ def submit_shadow(
         logger.warning("local LLM shadow executor is shutting down")
 
 
+def record_primary(
+    *, bbox: list[float], yolo_class_id: int, yolo_confidence: float,
+    prediction: LocalLLMPrediction | None, selected: bool, reason: str,
+    client_id: str,
+) -> None:
+    """Persist a primary decision audit record without storing an image or secrets."""
+    if settings.LOCAL_LLM_MODE != "primary":
+        return
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "client_id": client_id,
+        "bbox": [round(float(value), 1) for value in bbox],
+        "yolo": {"class_id": yolo_class_id, "confidence": round(float(yolo_confidence), 6)},
+        "local_llm": prediction.__dict__ if prediction else None,
+        "selected": selected,
+        "reason": reason,
+        "mode": "primary",
+    }
+    path = Path(settings.LOCAL_LLM_SHADOW_LOG_PATH)
+    try:
+        with _write_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("local LLM primary audit log skipped: %s", exc)
+
+
 def shutdown() -> None:
     _shadow_executor.shutdown(wait=True)

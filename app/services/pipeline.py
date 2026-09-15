@@ -263,8 +263,18 @@ async def run(
         ):
             class_id = llm_prediction.class_id
             confidence = llm_prediction.confidence
+            local_llm.record_primary(
+                bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
+                prediction=llm_prediction, selected=True, reason="accepted", client_id=client_id,
+            )
         else:
             # An unavailable/ambiguous LLM must not turn a kiosk request into a failure.
+            local_llm.record_primary(
+                bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
+                prediction=llm_prediction, selected=False,
+                reason=("unavailable" if llm_prediction is None else "ambiguous_or_low_confidence"),
+                client_id=client_id,
+            )
             llm_prediction = None
     else:
         local_llm.submit_shadow(img, bbox, yolo_class_id, yolo_confidence, client_id)

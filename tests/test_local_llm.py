@@ -5,7 +5,9 @@ os.environ.setdefault("API_KEY", "test-key")
 import json
 
 import numpy as np
+import pytest
 
+from app.core.config import Settings
 from app.services import local_llm
 
 
@@ -32,6 +34,11 @@ def test_parse_rejects_extra_or_invalid_fields():
         pass
     else:
         raise AssertionError("invalid LLM contract accepted")
+
+
+def test_local_llm_mode_rejects_unknown_value():
+    with pytest.raises(ValueError, match="LOCAL_LLM_MODE"):
+        Settings(API_KEY="test-key", LOCAL_LLM_MODE="unsafe")
 
 
 def test_crop_encoding_is_bounded(monkeypatch):

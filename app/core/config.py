@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -66,12 +67,20 @@ class Settings(BaseSettings):
     LOCAL_LLM_MODE: str = "disabled"  # disabled | shadow | primary
     LOCAL_LLM_BASE_URL: str | None = None
     LOCAL_LLM_API_KEY: str | None = None
-    LOCAL_LLM_MODEL: str = "qwen3-vl:8b"
+    LOCAL_LLM_MODEL: str = "qwen3.5:9b-q4_K_M"
     LOCAL_LLM_TIMEOUT_SEC: float = 20.0
     LOCAL_LLM_MIN_CONFIDENCE: float = 0.80
     LOCAL_LLM_SHADOW_LOG_PATH: str = "logs/local_llm_shadow.jsonl"
     LOCAL_LLM_MAX_IMAGE_SIDE: int = 640
     LOCAL_LLM_MAX_IMAGE_BYTES: int = 1_500_000
+
+    @field_validator("LOCAL_LLM_MODE")
+    @classmethod
+    def validate_local_llm_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "shadow", "primary"}:
+            raise ValueError("LOCAL_LLM_MODE must be disabled, shadow, or primary")
+        return normalized
 
     # 저신뢰 PET/PLASTIC과 VINYL이 같은 bbox에서 경쟁할 때만 crop 검증기로 교정한다.
     VINYL_CORRECTION_ENABLED: bool = True
