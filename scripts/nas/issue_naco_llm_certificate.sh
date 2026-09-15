@@ -7,7 +7,16 @@ DOMAIN="${NACO_LLM_DOMAIN:-llm.naco.kro.kr}"
 ROOT="${NACO_PUBLIC_GATEWAY_ROOT:-/share/Container/naco_ai/llm_gateway}"
 CONTAINER="${NACO_PUBLIC_GATEWAY_CONTAINER:-naco-llm-nginx}"
 CERTBOT_IMAGE="${NACO_CERTBOT_IMAGE:-certbot/certbot:latest}"
-: "${NACO_LETSENCRYPT_EMAIL:?Set a renewal-notification email}"
+NGINX_IMAGE="${NACO_PUBLIC_GATEWAY_IMAGE:-nginx:alpine}"
+STATIC_NETWORK="${NACO_PUBLIC_NETWORK:-qnet-static-bond0-272384}"
+INTERNAL_NETWORK="${NACO_OLLAMA_NETWORK:-naco_naco-internal}"
+PUBLIC_IP="${NACO_LLM_PUBLIC_IP:-223.194.166.7}"
+KEY_FILE="${NACO_GATEWAY_KEY_FILE:-/share/Container/naco_ai/gateway/gateway.env}"
+RENEWER="${NACO_CERTBOT_CONTAINER:-naco-llm-certbot}"
+: "${NACO_ACME_SERVER:?Set the ACME directory URL}"
+: "${NACO_ACME_EAB_KID:?Set the ZeroSSL EAB key id}"
+: "${NACO_ACME_EAB_HMAC_KEY:?Set the ZeroSSL EAB HMAC key}"
+: "${NACO_ACME_EMAIL:?Set a renewal-notification email}"
 
 if ! "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -qx true; then
   echo "Public HTTP gateway is not running" >&2; exit 1
@@ -15,12 +24,18 @@ fi
 if ! "$DOCKER_BIN" image inspect "$CERTBOT_IMAGE" >/dev/null 2>&1; then
   echo "Certbot image missing locally: $CERTBOT_IMAGE" >&2; exit 1
 fi
+if ! "$DOCKER_BIN" image inspect "$NGINX_IMAGE" >/dev/null 2>&1; then
+  echo "Nginx image missing locally: $NGINX_IMAGE" >&2; exit 1
+fi
 
 "$DOCKER_BIN" run --rm \
   -v "$ROOT/certbot/www:/var/www/certbot" \
   -v "$ROOT/certbot/conf:/etc/letsencrypt" \
   "$CERTBOT_IMAGE" certonly --webroot -w /var/www/certbot \
-  --email "$NACO_LETSENCRYPT_EMAIL" --agree-tos --non-interactive -d "$DOMAIN"
+  --server "$NACO_ACME_SERVER" \
+  --eab-kid "$NACO_ACME_EAB_KID" \
+  --eab-hmac-key "$NACO_ACME_EAB_HMAC_KEY" \
+  --email "$NACO_ACME_EMAIL" --agree-tos --no-eff-email --non-interactive -d "$DOMAIN"
 
 cat > "$ROOT/nginx/default.conf.template" <<'EOF'
 map_hash_bucket_size 128;
@@ -53,6 +68,19 @@ server {
 }
 EOF
 
-"$DOCKER_BIN" restart "$CONTAINER" >/dev/null
+"$DOCKER_BIN" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+"$DOCKER_BIN" run -d --name "$CONTAINER" --restart unless-stopped \
+  --network "$STATIC_NETWORK" --ip "$PUBLIC_IP" \
+  --env-file "$KEY_FILE" \
+  -v "$ROOT/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro" \
+  -v "$ROOT/certbot/www:/var/www/certbot:ro" \
+  -v "$ROOT/certbot/conf:/etc/letsencrypt:ro" \
+  "$NGINX_IMAGE" sh -c 'nginx -t || exit 1; (while :; do sleep 21600; nginx -s reload; done) & exec nginx -g "daemon off;"' >/dev/null
+"$DOCKER_BIN" network connect "$INTERNAL_NETWORK" "$CONTAINER"
 "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" | grep -qx true
+"$DOCKER_BIN" rm -f "$RENEWER" >/dev/null 2>&1 || true
+"$DOCKER_BIN" run -d --name "$RENEWER" --restart unless-stopped \
+  -v "$ROOT/certbot/www:/var/www/certbot" \
+  -v "$ROOT/certbot/conf:/etc/letsencrypt" \
+  "$CERTBOT_IMAGE" sh -c 'trap exit TERM; while :; do certbot renew --non-interactive; sleep 12h & wait ${!}; done;' >/dev/null
 echo "TLS_READY domain=$DOMAIN"

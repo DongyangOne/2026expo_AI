@@ -54,7 +54,7 @@ EOF
   -v "$ROOT/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro" \
   -v "$ROOT/certbot/www:/var/www/certbot:ro" \
   -v "$ROOT/certbot/conf:/etc/letsencrypt:ro" \
-  "$IMAGE" >/dev/null
+  "$IMAGE" sh -c 'nginx -t || exit 1; (while :; do sleep 21600; nginx -s reload; done) & exec nginx -g "daemon off;"' >/dev/null
 "$DOCKER_BIN" network connect "$INTERNAL_NETWORK" "$CONTAINER"
 "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" | grep -qx true
 echo "PUBLIC_HTTP_READY ip=$PUBLIC_IP domain=$DOMAIN"
