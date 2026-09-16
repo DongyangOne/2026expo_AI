@@ -30,6 +30,30 @@ LLM 호출 실패, JSON 계약 불일치, `LOCAL_LLM_MIN_CONFIDENCE` 미만, 또
 `classification`을 가진 `GENERAL_WASTE`를 가정해 Spring/하드웨어를 구현하면 안 된다.
 이 상태는 통 선택을 확정하지 못했다는 뜻이다. `client_id`는 모든 응답과 콜백에서 원본 그대로 유지된다.
 
+## 전체 응답 분기표
+
+아래 표는 하드웨어 즉시 응답과 Spring 콜백에 동일하게 적용된다. 여러 재처리 조건이 동시에 맞으면
+하나의 `REJECTED` 응답의 `guidance` 배열에 모두 포함한다.
+
+| 판정 조건 | status | class_id / class_name | 코드 또는 핵심 필드 |
+|---|---|---|---|
+| 센서 무게가 하한 미만(기본 1g) | `NOT_DETECTED` | 생략 | 빈 장면 오탐 방지 |
+| YOLO bbox 미감지 | `NOT_DETECTED` | 생략 | `weight.anomaly=false` |
+| LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `GENERAL_WASTE` | 생략 | `general.code=LOW_CONFIDENCE`, bbox 유지, YOLO fallback 없음 |
+| 캔 정상: 무게 정상·이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `is_dented=true` |
+| 캔 무게 이상/내용물 또는 미압착 | `REJECTED` | `0 / can` | `EMPTY_CONTENTS`, `COMPRESS` |
+| PET/플라스틱 정상: 무게 정상·라벨 없음·이물질 없음; PET는 압착됨 | `ALLOWED` | `3 / plastic` | PET도 `plastic/3`으로 통합 |
+| PET/플라스틱 무게 이상·라벨 미제거·PET 미압착 | `REJECTED` | `3 / plastic` | `EMPTY_CONTENTS`, `REMOVE_LABEL`, `COMPRESS` |
+| 종이 정상: 무게 정상·이물질 없음 | `ALLOWED` | `2 / paper` | `conditions={}` |
+| 종이 무게 이상 | `REJECTED` | `2 / paper` | `WEIGHT_ANOMALY` |
+| 비닐 정상: 무게 정상·이물질 없음 | `ALLOWED` | `5 / vinyl` | 비닐도 정상 시 `ALLOWED` |
+| 비닐 무게 이상 | `REJECTED` | `5 / vinyl` | `WEIGHT_ANOMALY` |
+| 허용 대상의 다른 재질 부착물·혼합 이물질 | `REJECTED` | 최종 품목 유지 | `FOREIGN_MATERIAL` |
+| 유리 | `REJECTED` | `6 / glass` | `rejection.code=GLASS` |
+| 건전지 | `REJECTED` | `7 / battery` | `rejection.code=BATTERY` |
+| 형광등 | `REJECTED` | `8 / fluorescent` | `rejection.code=FLUORESCENT` |
+| 스티로폼 | `REJECTED` | `4 / styrofoam` | `rejection.code=STYROFOAM` |
+
 ## 상태와 안내 코드
 
 `conditions`에는 Spring 계약상 `has_label`, `is_dented`만 포함한다. 외부 이물질은 별도

@@ -89,6 +89,36 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | `GENERAL_WASTE` | LLM 장애·저신뢰·복수 물체 등으로 최종 품목을 확정하지 못함 | `general`, 빈 `guidance`, `bbox`; `classification`은 생략 |
 | `NOT_DETECTED` | 객체 미감지 | `client_id`, `status`, 빈 `conditions`, `weight.anomaly=false`, 빈 `guidance` |
 
+## 전체 분기표
+
+아래 표는 하드웨어 즉시 응답과 Spring 콜백에 같은 형식으로 적용됩니다. `client_id`는 모든 행에서
+그대로 포함됩니다. 여러 재처리 조건이 동시에 맞으면 `guidance`에 코드를 함께 넣습니다.
+
+| 우선순위 | 판정 조건 | status | class_id / class_name | 추가 필드·코드 |
+|---:|---|---|---|---|
+| 1 | `weight_g`가 설정된 하한 미만(기본 1g) | `NOT_DETECTED` | 생략 | 빈 물체 오탐 방지. `weight.anomaly=false` |
+| 2 | YOLO가 bbox를 찾지 못함 | `NOT_DETECTED` | 생략 | `weight.anomaly=false` |
+| 3 | LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `GENERAL_WASTE` | 생략 | `general.code=LOW_CONFIDENCE`, bbox 유지, YOLO 품목 fallback 없음 |
+| 4 | 캔: 무게 정상·외부 이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `conditions.is_dented=true` |
+| 5 | 캔: 무게 이상/내용물 | `REJECTED` | `0 / can` | `guidance=EMPTY_CONTENTS` |
+| 6 | 캔: 미압착 | `REJECTED` | `0 / can` | `guidance=COMPRESS` |
+| 7 | PET 또는 플라스틱: 무게 정상·라벨 없음·외부 이물질 없음 (PET는 압착됨) | `ALLOWED` | `3 / plastic` | PET도 외부 `plastic/3`으로 통합 |
+| 8 | PET 또는 플라스틱: 무게 이상/내용물 | `REJECTED` | `3 / plastic` | `guidance=EMPTY_CONTENTS` |
+| 9 | PET 또는 플라스틱: 라벨 미제거 | `REJECTED` | `3 / plastic` | `guidance=REMOVE_LABEL` |
+| 10 | PET: 미압착 | `REJECTED` | `3 / plastic` | `guidance=COMPRESS` |
+| 11 | 종이: 무게 정상·외부 이물질 없음 | `ALLOWED` | `2 / paper` | `conditions={}` |
+| 12 | 종이: 무게 이상 | `REJECTED` | `2 / paper` | `guidance=WEIGHT_ANOMALY` |
+| 13 | 비닐: 무게 정상·외부 이물질 없음 | `ALLOWED` | `5 / vinyl` | 정상 비닐도 `ALLOWED` |
+| 14 | 비닐: 무게 이상 | `REJECTED` | `5 / vinyl` | `guidance=WEIGHT_ANOMALY` |
+| 15 | 허용 대상에서 다른 재질 이물질/혼합 부착물 감지 | `REJECTED` | 최종 품목 유지 | `guidance=FOREIGN_MATERIAL` |
+| 16 | 유리 | `REJECTED` | `6 / glass` | `rejection.code=GLASS` |
+| 17 | 건전지 | `REJECTED` | `7 / battery` | `rejection.code=BATTERY` |
+| 18 | 형광등 | `REJECTED` | `8 / fluorescent` | `rejection.code=FLUORESCENT` |
+| 19 | 스티로폼 | `REJECTED` | `4 / styrofoam` | `rejection.code=STYROFOAM` |
+
+`FOREIGN_MATERIAL`은 다른 재질의 부착물·혼합 이물질에만 적용합니다. 같은 재질 부속품(예: 플라스틱 빨대)은
+이 코드의 대상이 아닙니다. 표의 5~15는 한 항목에 둘 이상 적용되면 하나의 `REJECTED` 응답에 guidance 배열로 합쳐집니다.
+
 ## 모델/외부 클래스 매핑
 
 | 모델 class_id/name | 외부 응답 class_id/name | 처리 |
