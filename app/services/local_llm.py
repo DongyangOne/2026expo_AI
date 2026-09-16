@@ -135,8 +135,11 @@ def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
     body = {
         "model": settings.LOCAL_LLM_MODEL,
         "stream": False,
+        # Qwen의 reasoning 텍스트는 이 엄격한 JSON 계약에 필요하지 않다. 이를 끄고
+        # 출력 상한을 두어 NAS GPU를 오래 점유하거나 HTTP timeout에 빠지지 않게 한다.
+        "think": False,
         "format": _SCHEMA,
-        "options": {"temperature": 0},
+        "options": {"temperature": 0, "num_predict": settings.LOCAL_LLM_MAX_TOKENS},
         "messages": [{"role": "user", "content": _PROMPT, "images": [image]}],
     }
     url = settings.LOCAL_LLM_BASE_URL.rstrip("/") + "/api/chat"

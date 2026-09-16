@@ -41,6 +41,10 @@ def test_local_llm_mode_rejects_unknown_value():
         Settings(API_KEY="test-key", LOCAL_LLM_MODE="unsafe")
 
 
+def test_local_llm_defaults_bound_json_generation():
+    assert Settings(API_KEY="test-key").LOCAL_LLM_MAX_TOKENS == 80
+
+
 def test_crop_encoding_is_bounded(monkeypatch):
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_SIDE", 64)
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_BYTES", 100_000)

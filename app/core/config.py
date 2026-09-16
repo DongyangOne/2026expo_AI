@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     LOCAL_LLM_API_KEY: str | None = None
     LOCAL_LLM_MODEL: str = "qwen3.5:9b-q4_K_M"
     LOCAL_LLM_TIMEOUT_SEC: float = 20.0
+    # Vision 모델의 숨은 추론/장문 생성을 막아 shadow 요청이 장시간 점유하지 않게 한다.
+    # 현재 JSON 계약은 일반적으로 80 토큰 이내에 완결된다.
+    LOCAL_LLM_MAX_TOKENS: int = 80
     LOCAL_LLM_MIN_CONFIDENCE: float = 0.80
     LOCAL_LLM_SHADOW_LOG_PATH: str = "logs/local_llm_shadow.jsonl"
     LOCAL_LLM_MAX_IMAGE_SIDE: int = 640
