@@ -63,7 +63,8 @@ class Settings(BaseSettings):
     # ── NAS 로컬 Vision LLM (YOLO crop 재판정) ────────────────────────────────────
     # YOLO는 물체 위치/미감지를 계속 담당한다. LOCAL_LLM_MODE=primary일 때만
     # YOLO bbox crop의 품목·라벨·압착·외부 이물질을 NAS Vision LLM으로 판정한다.
-    # LLM 장애·형식 오류·저신뢰는 기존 YOLO/상태 모델로 fail-safe fallback 한다.
+    # LLM 장애·형식 오류·저신뢰는 기본값으로 GENERAL_WASTE/LOW_CONFIDENCE로 보류한다.
+    # 과도기 호환 설정을 켤 때만 기존 YOLO/상태 모델 fallback을 허용한다.
     LOCAL_LLM_MODE: str = "disabled"  # disabled | shadow | primary
     LOCAL_LLM_BASE_URL: str | None = None
     LOCAL_LLM_API_KEY: str | None = None

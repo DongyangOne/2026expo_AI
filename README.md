@@ -1,7 +1,7 @@
 # 2026 동양미래 EXPO — 재활용품 AI 분류 서버
 
 라즈베리파이 5에서 동작하는 FastAPI 기반 AI 분류 서버.  
-하드웨어(카메라 + 무게센서)로부터 이미지와 무게를 받아 9-class YOLO + 멀티헤드 상태분류기로 판정 후 Spring 서버로 결과를 전송한다.
+하드웨어(카메라 + 무게센서)로부터 이미지와 무게를 받아 YOLO로 단일 물체 위치를 찾고, NAS 로컬 Vision LLM이 crop의 품목·라벨·압착·외부 이물질을 최종 판정한 뒤 Spring 서버로 결과를 전송한다.
 
 ---
 
@@ -54,7 +54,7 @@ curl -X POST http://localhost:8000/api/v1/detect \
 |----|------|--------------|
 | `ALLOWED` | 재활용 허용 | `classification`, `conditions`, `weight`, `guidance`(빈 배열) |
 | `REJECTED` | 거부 | 조건불충족: `guidance` / 완전거부(유리 등): `rejection` |
-| `GENERAL_WASTE` | 일반쓰레기 | `general` |
+| `GENERAL_WASTE` | LLM이 최종 품목을 확정하지 못한 보류 | `general`, `bbox` (`classification` 생략) |
 | `NOT_DETECTED` | 감지 실패 | (없음) |
 
 ### `guidance` 코드 (REJECTED 재처리 안내)
@@ -67,7 +67,7 @@ curl -X POST http://localhost:8000/api/v1/detect \
 | `REMOVE_LABEL` | 라벨 제거 (페트·플라스틱) |
 | `COMPRESS` | 압착 (페트·캔) |
 
-> `conditions.has_foreign_material`은 외부 JSON에 보내지 않는다. 향후 `foreign_material` 헤드가 포함된 모델을 탑재하면 `FOREIGN_MATERIAL` guidance 코드로만 전달한다.
+> `conditions.has_foreign_material`은 외부 JSON에 보내지 않는다. 현재는 로컬 Vision LLM의 외부 이물질 판정을 `FOREIGN_MATERIAL` guidance 코드로만 전달한다.
 
 ### `rejection` 코드 (완전 거부)
 
@@ -87,6 +87,8 @@ curl -X POST http://localhost:8000/api/v1/detect \
 | `UNCLASSIFIED` | 미분류 |
 
 > 메인 모델은 PET와 플라스틱을 별도로 감지하지만 API 응답과 Spring 콜백에서는 모두 `class_id=3`, `class_name=plastic`으로 통합한다. 비닐은 정확히 판정되고 상태 조건을 충족한 경우에만 `class_id=5`, `class_name=vinyl`, `status=ALLOWED`로 비닐함 투입을 허용한다. 저신뢰·미분류는 계속 `GENERAL_WASTE`다.
+
+운영 `LOCAL_LLM_MODE=primary`에서는 YOLO가 위치와 미감지만 담당한다. LLM 응답이 없거나, `LOCAL_LLM_MIN_CONFIDENCE` 미만이거나, 복수 물체면 YOLO 품목을 대신 사용하지 않고 `GENERAL_WASTE / general.code=LOW_CONFIDENCE`로 응답한다. 이 경로에서는 `classification`이 없다.
 
 ---
 

@@ -1,35 +1,60 @@
-# NAS naco 로컬 Vision LLM 전환 계획
+# NAS 로컬 Vision LLM 운영 규약
 
-## 목표와 경계
+## 현재 역할
 
-YOLO는 계속 사용한다. YOLO가 `bbox`와 `NOT_DETECTED`를 결정하고, 검출된 단일 crop의
-9개 품목·라벨·압착·외부 이물질은 NAS의 `qwen3.5:9b-q4_K_M`가 재판정한다. 무게 검사,
-`ALLOWED`/`REJECTED`/`GENERAL_WASTE`, guidance, Spring callback DTO는 기존 규칙 엔진을
-그대로 사용한다.
+운영 Pi는 `LOCAL_LLM_MODE=primary`로 동작한다.
 
-## 단계
+1. YOLO는 물체의 bbox와 `NOT_DETECTED`만 결정한다.
+2. bbox crop을 NAS의 API-key 보호 Vision LLM에 보낸다.
+3. LLM은 9개 품목, `has_label`, `is_dented`, `has_foreign_material`, 단일 주 물체 여부를
+   엄격한 JSON으로 반환한다.
+4. AI 서버는 무게와 조건을 조합해 `ALLOWED`·`REJECTED`·`GENERAL_WASTE`를 결정하고,
+   즉시 응답과 Spring 콜백에 같은 JSON을 보낸다.
 
-1. NAS `naco-ollama`의 `qwen3.5:9b-q4_K_M`와 `/api/chat`을 확인한다.
-2. Pi에서만 접근 가능한 TLS/API-key gateway를 만들고, 키는 Pi의 실제 `.env`에만 저장한다.
-3. `LOCAL_LLM_MODE=shadow`로 YOLO와 LLM의 품목·상태 결과/지연 시간을 로그로 비교한다.
-4. 고정 하드웨어 사진과 새 독립 사진에서 품목·상태·무게 guidance 계약을 검증한다.
-5. 기준을 만족할 때만 `primary`를 켠다. 호출 실패, JSON 불일치, 저신뢰(<`LOCAL_LLM_MIN_CONFIDENCE`)는
-   기존 YOLO/상태 모델로 즉시 fallback 한다. `primary`의 선택/복귀 결과도 이미지 없이
-   같은 JSONL 감사 로그에 남긴다.
+PET는 외부 계약에서 항상 `plastic / class_id=3`으로 정규화한다. 정상 비닐은
+`vinyl / class_id=5 / ALLOWED`다.
 
-## 운영 설정
+## Fail-closed 규칙
 
-`LOCAL_LLM_BASE_URL`, `LOCAL_LLM_API_KEY`는 Git에 넣지 않는다. NAS Ollama는 기본적으로
-API-key 인증을 강제하지 않으므로, Pi↔NAS 경로에는 별도 gateway가 필요하다. 공개 인터넷에
-Ollama 11434를 직접 노출하지 않는다.
+LLM 호출 실패, JSON 계약 불일치, `LOCAL_LLM_MIN_CONFIDENCE` 미만, 또는
+`is_single_primary_item=false`이면 기존 YOLO 품목으로 통과시키지 않는다. 기본 설정
+`LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false`에서는 다음처럼 보류한다.
 
-NAS에서는 `scripts/nas/provision_naco_llm_gateway.sh`를 사용한다. 이 스크립트는 이미 실행 중인
-`naco-ollama`를 재시작하지 않고, 별도 `naco-ollama-gateway`만 생성한다. 실행 시 Pi가 닿는 NAS의
-사설 IP를 `NACO_GATEWAY_BIND_IP`로 명시해야 하며, API key는 NAS의 권한 600 파일에만 생성된다.
-키 값은 로그나 Git에 출력하지 않는다.
+```json
+{
+  "status": "GENERAL_WASTE",
+  "general": {"code": "LOW_CONFIDENCE"}
+}
+```
 
-## 승인 전 금지
+`classification`을 가진 `GENERAL_WASTE`를 가정해 Spring/하드웨어를 구현하면 안 된다.
+이 상태는 통 선택을 확정하지 못했다는 뜻이다. `client_id`는 모든 응답과 콜백에서 원본 그대로 유지된다.
 
-- LLM의 자기신뢰도만으로 무게·상태 기준을 완화하지 않는다.
-- 로그를 자동 학습 데이터나 자동 배포 근거로 사용하지 않는다.
-- 독립 하드웨어 E2E와 Spring callback 검증 전 production 응답 계약을 변경하지 않는다.
+## 상태와 안내 코드
+
+`conditions`에는 Spring 계약상 `has_label`, `is_dented`만 포함한다. 외부 이물질은 별도
+필드가 아니라 `guidance[].code`로 전달한다.
+
+| 조건 | guidance code |
+|---|---|
+| 플라스틱(PET 포함)·캔 무게 이상 또는 내용물 존재 추정 | `EMPTY_CONTENTS` |
+| 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
+| 다른 재질의 부착물·혼합 이물질 | `FOREIGN_MATERIAL` |
+| 플라스틱(PET 포함) 라벨 미제거 | `REMOVE_LABEL` |
+| PET병·캔 미압착 | `COMPRESS` |
+
+같은 재질 부속품(예: 플라스틱 빨대)은 `FOREIGN_MATERIAL`로 보지 않는다. 서로 다른 재질의
+테이크아웃 컵 종이 슬리브 같은 부착물은 이물질이다. 여러 위반이면 guidance 배열에 함께 넣는다.
+
+유리·건전지·형광등·스티로폼은 재처리 안내가 아니라 `REJECTED`와 각각
+`GLASS`·`BATTERY`·`FLUORESCENT`·`STYROFOAM` rejection code로 반환한다.
+
+## 보안 및 검증 경계
+
+LLM gateway URL과 API key는 실제 Pi `.env`에만 둔다. 공개 인터넷에 Ollama 포트를 직접
+노출하지 않는다. 이미지/결과 캡처는 재학습 후보로 쓸 수 있지만, 자동 정답이나 자동 배포 근거가
+아니다.
+
+2026-09-16 기준, 실제 하드웨어 capture 한 장을 이 경로로 내부 실행해 `plastic`과
+`FOREIGN_MATERIAL`을 포함한 `REJECTED` 응답을 확인했다. 이는 연결·계약 smoke test이며,
+독립 하드웨어 정답셋 전체에 대한 정확도 보증은 아니다.

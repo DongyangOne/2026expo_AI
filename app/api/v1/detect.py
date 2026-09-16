@@ -16,9 +16,11 @@ router = APIRouter()
 
 
 _DETECT_DESCRIPTION = """
-이미지와 무게 값으로 9-class 분류 후 압착·라벨·무게 상태를 검사합니다.
-외부 이물질은 해당 판별 모델이 탑재된 경우에만 검사하며
-`guidance[].code=FOREIGN_MATERIAL`로 반환합니다.
+이미지와 무게 값으로 단일 투입 재활용품을 판정합니다. 운영 `primary` 모드에서는
+YOLO가 객체 위치와 `NOT_DETECTED`만 결정하고, 해당 crop을 NAS 로컬 Vision LLM이
+품목·라벨·압착·외부 이물질까지 최종 판정합니다. 무게 및 안내 코드는 기존 규칙으로
+결정합니다. LLM이 응답하지 않거나, 저신뢰이거나, 단일 주 물체가 아니면 YOLO 품목으로
+대체하지 않고 `GENERAL_WASTE / LOW_CONFIDENCE`로 보류합니다.
 
 ## 요청 형식
 
@@ -34,7 +36,7 @@ _DETECT_DESCRIPTION = """
 |---|---|---|---|
 | `client_id` | string | 항상 | 요청에서 받은 검사 식별자. 1~128자이며 변경하지 않고 Spring 콜백에도 전달 |
 | `status` | enum | 항상 | `ALLOWED`, `REJECTED`, `GENERAL_WASTE`, `NOT_DETECTED` 중 하나. 최우선 분기값 |
-| `classification` | object | 객체 감지 시 | `class_id`, `class_name`, `confidence`를 포함. 미감지 시 필드 생략 |
+| `classification` | object | 최종 품목 확정 시 | `class_id`, `class_name`, `confidence`를 포함. 미감지 또는 LLM 보류 시 필드 생략 |
 | `conditions` | object | 항상 | 상태 판정값. 대상이 아닌 항목은 내부 필드를 생략하므로 `{}`일 수 있음 |
 | `weight` | object | 항상 | `anomaly`는 항상 포함, 무게 미입력 시 `value_g` 생략 |
 | `guidance` | array | 항상 | 재처리 안내 목록. 통과 또는 완전거부 시 빈 배열 |
@@ -84,7 +86,7 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | `ALLOWED` | 지정 함 투입 허용 | `classification`, `conditions`, `weight`, 빈 `guidance`, `bbox` |
 | `REJECTED` + guidance | 조건 불충족, 재처리 후 재투입 | `classification`, `conditions`, `weight`, 1개 이상의 `guidance`, `bbox` |
 | `REJECTED` + rejection | 기기 수거 불가 | `classification`, `rejection`, 빈 `guidance`, `bbox` |
-| `GENERAL_WASTE` | 저신뢰 또는 미분류 | 가능한 경우 `classification`, `general`, 빈 `guidance`, `bbox` |
+| `GENERAL_WASTE` | LLM 장애·저신뢰·복수 물체 등으로 최종 품목을 확정하지 못함 | `general`, 빈 `guidance`, `bbox`; `classification`은 생략 |
 | `NOT_DETECTED` | 객체 미감지 | `client_id`, `status`, 빈 `conditions`, `weight.anomaly=false`, 빈 `guidance` |
 
 ## 모델/외부 클래스 매핑
@@ -111,7 +113,7 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | `WEIGHT_ANOMALY` | 종이·비닐의 무게 이상 |
 | `REMOVE_LABEL` | 내부 PET·플라스틱에 라벨이 있음 |
 | `COMPRESS` | 내부 PET·캔이 미압착 상태 |
-| `FOREIGN_MATERIAL` | 지원 모델이 외부 이물질을 감지함. 현재 배포된 2헤드 상태 모델에서는 발생하지 않음 |
+| `FOREIGN_MATERIAL` | 로컬 Vision LLM이 다른 재질의 부착물·혼합 이물질을 감지함. 같은 재질 부속품(예: 플라스틱 빨대)은 이물질로 보지 않음 |
 
 ## 완전거부 및 일반분류 코드
 

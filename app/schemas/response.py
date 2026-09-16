@@ -5,7 +5,7 @@
   DetectResponse
   ├─ client_id       : str               ← 하드웨어가 보낸 사용자/피드백 구분 ID
   ├─ status          : DetectionStatus   ← Spring 의 1차 분기 판별자
-  ├─ classification  : Classification?   ← 분류 결과 (NOT_DETECTED 시 생략)
+  ├─ classification  : Classification?   ← 최종 품목 확정 결과 (미감지·LLM 보류 시 생략)
   ├─ conditions      : Conditions        ← 상태 감지 (is_dented/has_label)
   ├─ weight          : WeightInfo        ← 무게 + 이상 여부
   ├─ guidance        : Guidance[]        ← 조건 불충족 시 재처리 안내 (압착/라벨/비우기). 충족 시 빈 배열
@@ -17,7 +17,7 @@ status 별 채워지는 필드:
   ALLOWED        → classification, conditions, weight, guidance(빈 배열)
   REJECTED(재처리) → classification, conditions, weight, guidance(압착/라벨/비우기)
   REJECTED(완전거부) → classification, rejection
-  GENERAL_WASTE  → classification, general
+  GENERAL_WASTE  → general (LLM primary 보류 시 classification 생략)
   NOT_DETECTED   → (없음)
 """
 
@@ -75,7 +75,7 @@ class GeneralWaste(BaseModel):
 class DetectResponse(BaseModel):
     client_id:       str                      = Field(..., min_length=1, max_length=128, description="요청에서 받은 검사 식별자. 변경 없이 하드웨어 응답과 Spring 콜백에 전달")
     status:         DetectionStatus          = Field(..., description="처리 판별자 (Spring 1차 분기)")
-    classification: Classification | SkipJsonSchema[None] = Field(None, description="분류 결과 (미감지 시 생략)")
+    classification: Classification | SkipJsonSchema[None] = Field(None, description="최종 품목 확정 결과. 미감지 또는 LLM primary 보류 시 생략")
     conditions:     Conditions               = Field(default_factory=Conditions, description="라벨·압착 상태. 대상 필드가 없으면 빈 객체")
     weight:         WeightInfo               = Field(default_factory=WeightInfo, description="입력 무게와 품목별 이상 여부")
     guidance:       list[Guidance]           = Field(default_factory=list, description="재처리 안내 목록. code로 분기하며 복수 조건 동시 반환 가능")
@@ -140,7 +140,6 @@ class DetectResponse(BaseModel):
                 {
                     "client_id": "hardware-user-001",
                     "status": "GENERAL_WASTE",
-                    "classification": {"class_id": 2, "class_name": "paper", "confidence": 0.42},
                     "conditions": {},
                     "weight": {"value_g": 55.0, "anomaly": False},
                     "guidance": [],
