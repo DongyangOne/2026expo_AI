@@ -106,6 +106,23 @@ def test_pet은_상태검사후_plastic으로_응답(monkeypatch):
     assert result.guidance == []
 
 
+def test_primary_llm_실패는_yolo_품목으로_대체하지_않고_일반보류(monkeypatch):
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_pet_detection)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(pipeline.local_llm, "classify", lambda *_args: None)
+    monkeypatch.setattr(pipeline.local_llm, "record_primary", lambda **_kwargs: None)
+    monkeypatch.setattr(pipeline.settings, "LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO", False, raising=False)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 20.0, "llm-unavailable-001", _Registry()))
+
+    assert result.status is DetectionStatus.GENERAL_WASTE
+    assert result.classification is None
+    assert result.general is not None
+
+
 def test_저신뢰_pet에_동일_bbox_vinyl후보와_검증기합의가_있으면_vinyl로_교정(monkeypatch):
     captured = {}
 

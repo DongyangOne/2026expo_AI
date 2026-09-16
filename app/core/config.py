@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     # 현재 JSON 계약은 일반적으로 80 토큰 이내에 완결된다.
     LOCAL_LLM_MAX_TOKENS: int = 80
     LOCAL_LLM_MIN_CONFIDENCE: float = 0.80
+    # primary에서는 LLM이 실패·저신뢰·복수 물체라면 기존 YOLO 품목을 답으로 쓰지 않는다.
+    # true는 과도기 호환용이며, 기본값 false는 fail-closed GENERAL_WASTE를 반환한다.
+    LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO: bool = False
     LOCAL_LLM_SHADOW_LOG_PATH: str = "logs/local_llm_shadow.jsonl"
     # 448px은 실제 Pi/NAS warm probe에서 640px보다 빠르면서 같은 분류 결과를 유지했다.
     LOCAL_LLM_MAX_IMAGE_SIDE: int = 448

@@ -268,13 +268,22 @@ async def run(
                 prediction=llm_prediction, selected=True, reason="accepted", client_id=client_id,
             )
         else:
-            # An unavailable/ambiguous LLM must not turn a kiosk request into a failure.
             local_llm.record_primary(
                 bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
                 prediction=llm_prediction, selected=False,
                 reason=("unavailable" if llm_prediction is None else "ambiguous_or_low_confidence"),
                 client_id=client_id,
             )
+            # primary 모드의 기본 계약은 YOLO가 위치만 제공하고 LLM이 최종 품목을
+            # 확정하는 것이다. LLM이 답하지 못하면 YOLO 품목으로 몰래 통과시키지 않는다.
+            if not settings.LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO:
+                return DetectResponse(
+                    client_id=client_id,
+                    status=DetectionStatus.GENERAL_WASTE,
+                    weight=WeightInfo(value_g=weight_g),
+                    general=guidance.build_general(GeneralWasteCode.LOW_CONFIDENCE),
+                    bbox=[round(v, 1) for v in bbox],
+                )
             llm_prediction = None
     else:
         local_llm.submit_shadow(img, bbox, yolo_class_id, yolo_confidence, client_id)
