@@ -74,7 +74,8 @@ class Settings(BaseSettings):
     LOCAL_LLM_MAX_TOKENS: int = 80
     LOCAL_LLM_MIN_CONFIDENCE: float = 0.80
     LOCAL_LLM_SHADOW_LOG_PATH: str = "logs/local_llm_shadow.jsonl"
-    LOCAL_LLM_MAX_IMAGE_SIDE: int = 640
+    # 448px은 실제 Pi/NAS warm probe에서 640px보다 빠르면서 같은 분류 결과를 유지했다.
+    LOCAL_LLM_MAX_IMAGE_SIDE: int = 448
     LOCAL_LLM_MAX_IMAGE_BYTES: int = 1_500_000
 
     @field_validator("LOCAL_LLM_MODE")
