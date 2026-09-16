@@ -1,235 +1,52 @@
-# 2026 동양미래 EXPO — 재활용품 AI 분류 서버
+# 2026 동양미래 EXPO 재활용품 AI 서버
 
-라즈베리파이 5에서 동작하는 FastAPI 기반 AI 분류 서버.  
-하드웨어(카메라 + 무게센서)로부터 이미지와 무게를 받아 YOLO로 단일 물체 위치를 찾고, NAS 로컬 Vision LLM이 crop의 품목·라벨·압착·외부 이물질을 최종 판정한 뒤 Spring 서버로 결과를 전송한다.
+카메라 이미지와 무게 센서값으로 단일 투입 쓰레기를 판정하는 FastAPI 서버입니다.
 
----
+- YOLO: 객체 bbox와 `NOT_DETECTED` 판정
+- NAS 로컬 Vision LLM: bbox crop의 품목·라벨·압착·외부 이물질 최종 판정
+- 규칙 엔진: 무게·상태 조건을 조합해 `ALLOWED`·`REJECTED`·`GENERAL_WASTE` 결정
+- Spring 콜백: 하드웨어 즉시 응답과 같은 JSON을 백그라운드 전송
 
-## 수신 형식 (하드웨어 → AI 서버)
+## API
 
-**`POST /api/v1/detect`**  
-`Content-Type: multipart/form-data`
+`POST /api/v1/detect` (`multipart/form-data`)
 
-| 필드 | 타입 | 필수 | 설명 |
-|------|------|------|------|
-| `image` | File (jpg/png) | ✅ | 카메라 촬영 이미지 |
-| `client_id` | string | ✅ | 사용자/피드백 구분 ID. AI 응답과 Spring 콜백에 그대로 반환 |
-| `weight_g` | float | ❌ | 무게센서 값 (g). 미입력 시 무게 이상감지 생략 |
+| 필드 | 필수 | 설명 |
+|---|---:|---|
+| `image` | 예 | JPG 또는 PNG 이미지 |
+| `client_id` | 예 | 하드웨어·사용자·피드백 구분 ID. 응답과 Spring 콜백에 그대로 포함 |
+| `weight_g` | 아니오 | 그램 단위 무게. 생략하면 무게 이상 검사를 하지 않음 |
 
-**헤더**
+헤더 `X-API-Key`가 필요합니다. 전체 요청·응답 스키마와 모든 분기표는 실행 중인 Swagger
+`/docs` 및 [로컬 LLM 운영 규약](docs/NACO_LOCAL_LLM_ROLLOUT.md)에 있습니다.
 
-| 헤더 | 설명 |
-|------|------|
-| `X-API-Key` | 서버 인증 키 (`.env`의 `API_KEY`와 일치해야 함) |
+### 핵심 응답 규약
 
-**요청 예시**
+| status | 의미 | class/코드 |
+|---|---|---|
+| `ALLOWED` | 조건을 충족한 캔·플라스틱(PET 포함)·종이·비닐 투입 허용 | 정상 비닐도 `5 / vinyl` |
+| `REJECTED` | 재처리 또는 완전 수거 거부 | `guidance` 또는 `rejection`으로 원인 전달 |
+| `GENERAL_WASTE` | LLM이 최종 품목을 확정하지 못한 보류 | `general.code=LOW_CONFIDENCE`, `classification` 생략 |
+| `NOT_DETECTED` | 빈 저울 하한 또는 bbox 미감지 | `classification` 생략 |
 
-```bash
-curl -X POST http://localhost:8000/api/v1/detect \
-  -H "X-API-Key: 인증키" \
-  -F "image=@sample.jpg" \
-  -F "client_id=hardware-user-001" \
-  -F "weight_g=28.0"
-```
+PET는 외부 계약에서 항상 `class_id=3`, `class_name=plastic`으로 통합합니다.
 
----
+`LOCAL_LLM_MODE=primary`에서 LLM이 장애·JSON 오류·저신뢰·복수 물체를 반환하면 YOLO 품목으로
+대체하지 않습니다. 기본 설정 `LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false`에서는
+`GENERAL_WASTE / LOW_CONFIDENCE`로 fail-closed 처리합니다.
 
-## 응답 형식 (AI 서버 → 하드웨어 / Spring)
+## guidance / rejection 코드
 
-```json
-{
-  "client_id": "hardware-user-001",
-  "status": "ALLOWED",
-  "classification": {"class_id": 3, "class_name": "plastic", "confidence": 0.94},
-  "conditions": {"has_label": false, "is_dented": true},
-  "weight": {"value_g": 28.0, "anomaly": false},
-  "guidance": [],
-  "bbox": [120.0, 80.0, 410.0, 560.0]
-}
-```
+| 조건 | 코드 |
+|---|---|
+| 플라스틱(PET 포함)·캔 무게 이상 또는 내용물 존재 추정 | `EMPTY_CONTENTS` |
+| 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
+| 다른 재질의 부착물·혼합 이물질 | `FOREIGN_MATERIAL` |
+| 플라스틱(PET 포함) 라벨 미제거 | `REMOVE_LABEL` |
+| PET병·캔 미압착 | `COMPRESS` |
+| 유리·건전지·형광등·스티로폼 | `GLASS`·`BATTERY`·`FLUORESCENT`·`STYROFOAM` rejection code |
 
-### `status` 판별자
-
-| 값 | 의미 | 채워지는 필드 |
-|----|------|--------------|
-| `ALLOWED` | 재활용 허용 | `classification`, `conditions`, `weight`, `guidance`(빈 배열) |
-| `REJECTED` | 거부 | 조건불충족: `guidance` / 완전거부(유리 등): `rejection` |
-| `GENERAL_WASTE` | LLM이 최종 품목을 확정하지 못한 보류 | `general`, `bbox` (`classification` 생략) |
-| `NOT_DETECTED` | 감지 실패 | (없음) |
-
-### `guidance` 코드 (REJECTED 재처리 안내)
-
-| code | 의미 |
-|------|------|
-| `EMPTY_CONTENTS` | 플라스틱(PET 포함)·캔의 무게 이상 또는 내용물 존재 |
-| `WEIGHT_ANOMALY` | 종이·비닐의 무게 이상 |
-| `FOREIGN_MATERIAL` | 외부 이물질 제거 |
-| `REMOVE_LABEL` | 라벨 제거 (페트·플라스틱) |
-| `COMPRESS` | 압착 (페트·캔) |
-
-> `conditions.has_foreign_material`은 외부 JSON에 보내지 않는다. 현재는 로컬 Vision LLM의 외부 이물질 판정을 `FOREIGN_MATERIAL` guidance 코드로만 전달한다.
-
-### `rejection` 코드 (완전 거부)
-
-| code | 의미 |
-|------|------|
-| `GLASS` | 유리 |
-| `BATTERY` | 건전지 |
-| `FLUORESCENT` | 형광등 |
-| `STYROFOAM` | 스티로폼 |
-
-### `general` 코드 (일반쓰레기)
-
-| code | 의미 |
-|------|------|
-| `VINYL` | 비닐 |
-| `LOW_CONFIDENCE` | 신뢰도 미달 |
-| `UNCLASSIFIED` | 미분류 |
-
-> 메인 모델은 PET와 플라스틱을 별도로 감지하지만 API 응답과 Spring 콜백에서는 모두 `class_id=3`, `class_name=plastic`으로 통합한다. 비닐은 정확히 판정되고 상태 조건을 충족한 경우에만 `class_id=5`, `class_name=vinyl`, `status=ALLOWED`로 비닐함 투입을 허용한다. 저신뢰·미분류는 계속 `GENERAL_WASTE`다.
-
-운영 `LOCAL_LLM_MODE=primary`에서는 YOLO가 위치와 미감지만 담당한다. LLM 응답이 없거나, `LOCAL_LLM_MIN_CONFIDENCE` 미만이거나, 복수 물체면 YOLO 품목을 대신 사용하지 않고 `GENERAL_WASTE / general.code=LOW_CONFIDENCE`로 응답한다. 이 경로에서는 `classification`이 없다.
-
----
-
-## Spring 콜백
-
-하드웨어 응답 직후 백그라운드로 Spring 서버에 `client_id`를 포함한 동일한 JSON을 POST한다.
-`.env`의 `SPRING_CALLBACK_URL` 미설정 시 전송하지 않는다.
-타임아웃·연결 오류·HTTP 408/425/429/5xx는 지수 백오프로 최대 3회 재시도하며,
-HTTP 4xx 계약 오류는 중복 요청을 피하기 위해 재시도하지 않는다.
-
-콜백 URL: `https://oneexpo.kro.kr/api/v1/feedback-detail/result`
-
----
-
-## 환경 설정 (`.env`)
-
-```env
-API_KEY=인증키
-SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result
-SPRING_TIMEOUT_SEC=3.0
-SPRING_MAX_ATTEMPTS=3
-SPRING_RETRY_BACKOFF_SEC=0.5
-# 선택
-MAIN_MODEL_PATH=weights/yolo26m_best_ncnn_model
-STATE_MODEL_PATH=weights/multihead.onnx
-VERIFIER_MODEL_PATH=weights/verifier_qwen35_mnv3_v1.onnx
-VERIFIER_SHADOW_ENABLED=true
-VERIFIER_SHADOW_LOG_PATH=logs/verifier_shadow.jsonl
-VINYL_CORRECTION_ENABLED=true
-VINYL_CANDIDATE_CONF=0.10
-VINYL_CANDIDATE_IOU=0.70
-VINYL_CANDIDATE_RATIO=0.40
-VINYL_VERIFIER_CONF=0.65
-VINYL_VERIFIER_MARGIN=0.25
-DETECT_CONF=0.25
-TRUST_CONF=0.55
-WEIGHT_ANOMALY_ENABLED=true
-# 결과 로깅 (Spring 없이도 logs/results.jsonl 에 저장)
-LOG_RESULTS=true
-LOG_DIR=logs
-# 재학습/오인식 검수용 원본 이미지 + 판정 JSON 저장
-CAPTURE_REQUESTS=true
-CAPTURE_DIR=logs/captures
-CAPTURE_RETENTION_DAYS=90
-CAPTURE_MAX_STORAGE_MB=10240
-```
-
-저신뢰 PET/플라스틱 결과는 같은 bbox에 비닐 보조 후보가 있고 crop 검증기도 비닐을
-충분한 신뢰도와 차이로 지지할 때만 `vinyl(class_id=5)`로 교정한다. 고신뢰 YOLO
-결과나 비닐 보조 후보가 없는 투명 플라스틱 용기는 검증기 단독 판단으로 덮어쓰지 않는다.
-
-### 결과 로그 (`logs/results.jsonl`)
-
-`LOG_RESULTS=true`(기본값)이면 Spring 콜백 여부와 무관하게 판정 결과를 JSONL 형식으로 기록한다.  
-`SPRING_CALLBACK_URL` 미설정 시 로그만 저장하므로 Spring 서버 없이도 결과를 확인할 수 있다.
-
-```jsonl
-{"timestamp":"2026-07-03T10:00:00+00:00","client_id":"hardware-user-001","status":"ALLOWED","classification":{"class_id":3,"class_name":"plastic",...},...}
-```
-
-Spring 전송 결과는 `logs/callbacks.jsonl`에 `client_id`, 시도 횟수, HTTP 상태와 함께
-`delivered`/`retry`/`failed`로 기록한다. 따라서 AI 판정 성공과 Spring 수신 성공을
-별도로 확인할 수 있다.
-
-### 요청 이미지와 판정 캡처 (`logs/captures/`)
-
-`CAPTURE_REQUESTS=true`이면 정상적으로 판정된 요청마다 원본 이미지와 판정 JSON을 같은
-`capture_id`로 저장한다. Docker Compose에서는 `./logs:/app/logs` 볼륨을 사용하므로
-컨테이너를 다시 만들어도 파일이 유지된다.
-
-```text
-logs/captures/2026-07-31/
-  20260731T012345123456Z_a1b2c3d4e5f6.jpg
-  20260731T012345123456Z_a1b2c3d4e5f6.json
-```
-
-JSON에는 요청의 `client_id`와 무게, 예측 클래스·신뢰도·bbox·상태, 이미지 SHA-256과
-아래 검수 필드가 포함된다. API 키와 요청 헤더는 저장하지 않는다.
-
-```json
-{
-  "review": {
-    "is_correct": null,
-    "expected_class": null,
-    "is_single_object": null,
-    "is_dented": null,
-    "has_label": null,
-    "has_foreign_material": null,
-    "notes": null
-  }
-}
-```
-
-기본 보존 기간은 90일, 최대 용량은 10GB이며 초과 시 오래된 이미지/JSON 쌍부터 제거한다.
-운영 캡처는 자동 teacher의 tight/context 합의와 확신도 기준을 통과한 경우에만 hard
-sample로 재학습 데이터에 추가한다. 합의 실패·저신뢰·다중 객체는 `-1`로 마스킹해
-학습에서 제외하며 사람 검토를 전제로 하지 않는다.
-
-### 임시 crop 검증기 shadow 로그
-
-`VERIFIER_SHADOW_ENABLED=true`이면 기존 YOLO가 만든 bbox를 임시 320px 검증기로
-비동기 재검증하고 `logs/verifier_shadow.jsonl`에 YOLO/검증기 품목 일치 여부와
-압착·라벨·외부 이물질 출력을 기록한다. 이 결과는 초기에는 API 응답, guidance,
-Spring 콜백을 변경하지 않는다. 임시 모델의 운영 분포 정확도를 확인한 뒤에만 판정에
-사용한다.
-
-crop 검증기 학습에는 원본 정답이 단일 객체이고 자동 teacher도 단일 주 객체로
-판정한 이미지만 사용한다. `label`과 `foreign_material`은 서로 독립된 정답이며,
-네 조합(둘 다 없음/라벨만/외부 이물질만/둘 다 있음)을 그대로 기록한다.
-
-객체 bbox를 crop한 뒤 9종 품목과 상태를 다시 확인하는 검증기의 확정 구조, 라벨 정책,
-NAS 실행 명령은 [`docs/CROP_VERIFIER_PLAN.md`](docs/CROP_VERIFIER_PLAN.md)에 정리했다.
-1일차 prototype은 고해상도 원본을 복제하지 않고 경로+bbox만 참조하며, 320px crop 생성 →
-기존 `naco-ollama`와 동일 모델 볼륨을 공유하는 두 개의 `qwen3.5:9b-q4_K_M`
-인스턴스로 적응형 tight/context 상태 pseudo-label을 만드는 순서로 진행한다. 384px
-tight 한 장의 1차 판정이 확실한 정상 샘플이면 종료하고, 양성·불확실 샘플과 10%
-정상 감사 샘플만 640px wider-context 한 장으로 2차 합의를 수행한다. 서로 다른 두
-시야의 판정을 비교하되 같은 tight 이미지를 재전송하지 않는다. 사람 검토는 두지 않는다.
-NAS 여유 공간 500GB와
-새 crop 20GB 상한을 통과해야 전체 정제를 계속한다.
-`label` head를 사용하지 않는 can/paper/vinyl의 `label_only`는 2차 강제 대상에서
-제외하고 정상 감사 표본에만 포함한다. 외부 이물질과 PET/plastic 라벨은 항상 2차로
-확인한다.
-teacher 응답은 생성 시간을 줄이기 위해 `decision`으로부터 계산 가능한 label/foreign
-boolean을 보내지 않고 짧은 wire key와 근거 enum만 사용하지만,
-JSONL에는 기존 `decision`/`has_removable_label`/`has_true_foreign_material` 계약으로
-복원해 저장한다.
-Ollama는 연속 이미지 prompt cache를 지원하는 `0.32.0`과 인스턴스당 8K context를
-사용한다. Qwen3.5는 한 Ollama 서버의 parallel slot을 지원하지 않아 두 독립 서버에
-worker를 하나씩 고정하며, 모델 파일은 중복 저장하지 않는다.
-최종 v7은 2026-08-03 00:00 KST에 50,000건을 모두 처리했다. 자동 수용은
-46,913건(93.826%), teacher 오류는 46건(0.092%), 무효 행은 0건이다. 이 결과에서
-9종을 품목별 최대 10,000장으로 균형 선별한 90,274장과 실제 하드웨어 crop 103장을
-결합해 MobileNetV3-Small 검증기를 완성했다. 1차 5배 학습 뒤 하드웨어 training 행을
-증강 포함 100배(전체 training의 약 8%)로 높여 저학습률 보정했고, validation 행은
-항상 한 번만 평가했다. 고정 하드웨어 holdout의 외부 계약 기준(PET→plastic 통합)
-정확도는 기존 `42.86%`에서 `74.29%`, macro-F1은 `0.598`에서 `0.679`로 개선됐다.
-기존 YOLO epoch 40은 bbox 검출기로 계속 유지하며 Spring 콜백 계약도 바꾸지 않는다.
-외부 이물질은 실기기 양성 holdout이 생기기 전까지 런타임 판정에 활성화하지 않는다.
-
----
+같은 재질 부속품(예: 플라스틱 빨대)은 `FOREIGN_MATERIAL` 대상이 아닙니다.
 
 ## 실행
 
@@ -238,9 +55,38 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-API 문서: `http://localhost:8000/docs`
+Swagger: `http://localhost:8000/docs`
+OpenAPI JSON: `http://localhost:8000/openapi.json`
 
-### 배포
+## 필수 환경 변수
 
-`main`에 푸시하면 GitHub Actions에서 테스트를 실행한다. Pi5의 `ai-autodeploy.timer`가
-5분마다 `origin/main`의 새 커밋을 확인하고 `docker compose up -d --build`로 자동 배포한다.
+```env
+API_KEY=replace-me
+LOCAL_LLM_MODE=primary
+LOCAL_LLM_BASE_URL=http://private-nas-gateway:11435
+LOCAL_LLM_API_KEY=replace-me
+LOCAL_LLM_MODEL=qwen3.5:9b-q4_K_M
+LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false
+SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result
+```
+
+전체 설정 예시는 [.env.example](.env.example)에 있습니다. 실제 API key와 gateway 인증값은
+Git에 넣지 않습니다.
+
+## 로그와 캡처
+
+`LOG_RESULTS=true`이면 `logs/results.jsonl`에 결과를 기록합니다. `CAPTURE_REQUESTS=true`이면
+`logs/captures/`에 원본 이미지와 판정 JSON을 저장합니다. 이 데이터는 재학습 후보일 뿐 자동 정답이나
+자동 배포 근거가 아닙니다.
+
+## 검증과 배포
+
+로컬 핵심 회귀 검증:
+
+```bash
+python -m pytest -q tests/test_pipeline.py tests/test_local_llm.py tests/test_verifier_pipeline.py
+```
+
+`main` push 시 GitHub Actions가 테스트를 실행합니다. Pi 운영 checkout은 현재 원격 `main`과
+분기되어 있으므로, 자동 pull 성공을 배포 증거로 보지 않습니다. 운영 반영은 컨테이너 health와
+`/openapi.json`을 실제로 확인합니다.

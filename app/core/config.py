@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     # 하나를 고신뢰로 출력하는 게 원인이라, 시각 정보만으로는 막을 수 없다.
     # weight_g가 None이면(센서 미연결·미전송) 아무 동작도 하지 않는다.
     # 기본값은 가장 가벼운 정품(영수증 낱장)보다도 확실히 아래로 잡았다.
-    # 저울 정밀도 확정 후 재보정 필요 — docs/WEIGHT_KIOSK_PARAMS.md
+    # 저울 정밀도 확정 후 재보정 필요.
     WEIGHT_MIN_GUARD_ENABLED: bool = True
     WEIGHT_MIN_G: float = 1.0
 

@@ -4,7 +4,7 @@
 bbox 크기로 용량을 추정해 '빈 용기 표준무게 + margin' 과 비교 → 초과 시 내용물/이물질 간주.
 bbox 미제공 시 품목별 단일 상한(_MAX_FALLBACK_G)으로 폴백.
 
-⚠️ 캘리브레이션 필요 (키오스크 셋업 후) — docs/WEIGHT_KIOSK_PARAMS.md:
+⚠️ 캘리브레이션 필요 (키오스크 셋업 후):
    - 카메라-물체 거리 고정 가정 → bbox 면적비가 실제 크기에 비례
    - 대표 샘플로 _EMPTY_WEIGHT_G · _SIZE_*_MAX 실측 보정
    - 저울 정밀도 확정 후 _MARGIN_G 조정

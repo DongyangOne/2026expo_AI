@@ -23,7 +23,10 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: pytest
-        run: pytest tests/ -v
+        # 현재 운영 API/LLM 계약 회귀만 실행한다. 과거 NAS 학습 실험 테스트는
+        # main에서 더 이상 제공하지 않는 데이터 생성 스크립트·ONNX 도구를 요구하므로
+        # 운영 CI의 수집 대상이 아니다.
+        run: pytest -q tests/test_pipeline.py tests/test_local_llm.py tests/test_verifier_pipeline.py
 
   # Pi5 배포는 서버의 ai-autodeploy.timer가 main을 확인해 수행한다.
   # GitHub 호스팅 러너는 Pi5의 Tailscale SSH ACL 대상이 아니므로 CI에서는 테스트만 실행한다.
