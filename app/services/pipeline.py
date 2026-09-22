@@ -22,6 +22,7 @@
 
 import asyncio
 import logging
+from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -235,7 +236,13 @@ async def run(
             weight=WeightInfo(value_g=weight_g),
         )
 
+    yolo_started_at = perf_counter()
     detection = await loop.run_in_executor(_executor, inference.run_main, registry, img)
+    logger.info(
+        "YOLO 검출 시간: client_id=%s yolo_ms=%.1f",
+        client_id,
+        (perf_counter() - yolo_started_at) * 1000,
+    )
 
     # ── 미감지 ──────────────────────────────────────────────────────────────────
     if detection is None:
@@ -255,7 +262,14 @@ async def run(
     yolo_confidence = confidence
     llm_prediction = None
     if local_llm.primary_enabled():
+        llm_started_at = perf_counter()
         llm_prediction = await loop.run_in_executor(_executor, local_llm.classify, img, bbox)
+        logger.info(
+            "NAS LLM 분류 시간: client_id=%s llm_ms=%.1f available=%s",
+            client_id,
+            (perf_counter() - llm_started_at) * 1000,
+            llm_prediction is not None,
+        )
         if (
             llm_prediction is not None
             and llm_prediction.is_single_primary_item

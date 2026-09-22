@@ -120,6 +120,7 @@ def test_detect_response_omits_spring_optional_null_fields(monkeypatch):
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
+    assert float(response.headers["X-Process-Time-Ms"]) >= 0
     assert response.json() == {
         "client_id": "spring-null-contract",
         "status": "NOT_DETECTED",
@@ -166,6 +167,7 @@ def test_detect_echoes_client_id_to_response_and_callback(monkeypatch):
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
+    assert float(response.headers["X-Process-Time-Ms"]) >= 0
     assert response.json()["client_id"] == "hardware-user-001"
     assert captured == {
         "pipeline_client_id": "hardware-user-001",

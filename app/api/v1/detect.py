@@ -1,7 +1,8 @@
 import logging
+from time import perf_counter
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 
 from app.core.security import verify_api_key
 from app.models.registry import ModelRegistry
@@ -29,6 +30,12 @@ YOLO가 객체 위치와 `NOT_DETECTED`만 결정하고, 해당 crop을 NAS 로�
 - Form `image` (file, 필수): 분류할 JPG 또는 PNG 이미지
 - Form `client_id` (string, 필수, 1~128자): 사용자·피드백·하드웨어 요청 구분 ID
 - Form `weight_g` (number, 선택, 0 이상): 무게 센서의 그램값. 생략하면 무게 이상 검사를 하지 않음
+
+## 응답 시간 확인
+
+- HTTP 응답 헤더 `X-Process-Time-Ms`: 이미지 수신 뒤 AI가 최종 판정을 만들 때까지의 서버 처리 시간(밀리초)
+- Spring callback은 비동기 후속 작업이므로 이 헤더에 포함되지 않는다. Pi AI 로그에는 `YOLO 검출 시간`,
+  `NAS LLM 분류 시간`, `Spring 콜백 전송 완료 ... callback_ms`가 각각 기록된다.
 
 ## 응답 필드
 
@@ -198,7 +205,9 @@ async def detect(
     form: Annotated[DetectFormData, Depends()],
     background_tasks: BackgroundTasks,
     registry: Annotated[ModelRegistry, Depends(_get_registry)],
+    response: Response,
 ) -> DetectResponse:
+    started_at = perf_counter()
     try:
         result = await pipeline.run(form.image, form.weight_g, form.client_id, registry)
     except ValueError as exc:
@@ -212,6 +221,17 @@ async def detect(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "INFERENCE_ERROR", "message": "추론 중 오류가 발생했습니다."},
         )
+
+    elapsed_ms = (perf_counter() - started_at) * 1000
+    # 기존 JSON/Spring 계약은 바꾸지 않는다. 하드웨어·프론트는 이 헤더로 요청 단위
+    # 분류 지연시간을 확인할 수 있고, 콜백은 백그라운드라 이 시간에 포함되지 않는다.
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.1f}"
+    logger.info(
+        "분류 완료: client_id=%s status=%s process_ms=%.1f",
+        form.client_id,
+        result.status.value,
+        elapsed_ms,
+    )
 
     if settings.CAPTURE_REQUESTS:
         try:

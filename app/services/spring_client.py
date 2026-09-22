@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from time import perf_counter
 
 import httpx
 
@@ -69,6 +70,7 @@ def _is_retryable_status(status_code: int) -> bool:
 
 
 async def notify(result: DetectResponse) -> None:
+    callback_started_at = perf_counter()
     if settings.LOG_RESULTS:
         _log_result(result)
 
@@ -109,11 +111,12 @@ async def notify(result: DetectResponse) -> None:
                 else:
                     if 200 <= response.status_code < 300:
                         logger.info(
-                            "Spring 콜백 전송 완료: client_id=%s HTTP %s (%s/%s)",
+                            "Spring 콜백 전송 완료: client_id=%s HTTP %s (%s/%s) callback_ms=%.1f",
                             result.client_id,
                             response.status_code,
                             attempt,
                             max_attempts,
+                            (perf_counter() - callback_started_at) * 1000,
                         )
                         _log_callback(
                             result,
