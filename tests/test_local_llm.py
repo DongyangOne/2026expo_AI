@@ -45,6 +45,7 @@ def test_local_llm_defaults_bound_json_generation():
     settings = Settings(API_KEY="test-key")
     assert settings.LOCAL_LLM_MAX_TOKENS == 80
     assert settings.LOCAL_LLM_MAX_IMAGE_SIDE == 448
+    assert settings.LOCAL_LLM_KEEP_ALIVE == "24h"
 
 
 def test_crop_encoding_is_bounded(monkeypatch):

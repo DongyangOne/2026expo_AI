@@ -135,6 +135,8 @@ def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
     body = {
         "model": settings.LOCAL_LLM_MODEL,
         "stream": False,
+        # 매 요청마다 모델을 다시 올리면 NAS의 cold start가 하드웨어 HTTP timeout을 유발한다.
+        "keep_alive": settings.LOCAL_LLM_KEEP_ALIVE,
         # Qwen의 reasoning 텍스트는 이 엄격한 JSON 계약에 필요하지 않다. 이를 끄고
         # 출력 상한을 두어 NAS GPU를 오래 점유하거나 HTTP timeout에 빠지지 않게 한다.
         "think": False,

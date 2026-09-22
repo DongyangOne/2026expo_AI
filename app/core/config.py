@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     LOCAL_LLM_API_KEY: str | None = None
     LOCAL_LLM_MODEL: str = "qwen3.5:9b-q4_K_M"
     LOCAL_LLM_TIMEOUT_SEC: float = 20.0
+    # 모델 cold start가 하드웨어 요청 timeout으로 보이지 않게 NAS 메모리에 유지한다.
+    # Ollama API keep_alive 형식(예: "24h", "0")을 그대로 전달한다.
+    LOCAL_LLM_KEEP_ALIVE: str = "24h"
     # Vision 모델의 숨은 추론/장문 생성을 막아 shadow 요청이 장시간 점유하지 않게 한다.
     # 현재 JSON 계약은 일반적으로 80 토큰 이내에 완결된다.
     LOCAL_LLM_MAX_TOKENS: int = 80
