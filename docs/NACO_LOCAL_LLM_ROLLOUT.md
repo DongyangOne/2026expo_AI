@@ -75,9 +75,9 @@ LLM 호출 실패, JSON 계약 불일치, `LOCAL_LLM_MIN_CONFIDENCE` 미만, 또
 
 ## 보안 및 검증 경계
 
-LLM gateway URL과 API key는 실제 Pi `.env`에만 둔다. 공개 인터넷에 Ollama 포트를 직접
-노출하지 않는다. 이미지/결과 캡처는 재학습 후보로 쓸 수 있지만, 자동 정답이나 자동 배포 근거가
-아니다.
+LLM gateway URL과 API key는 실제 Pi `.env`에만 둔다. Pi는 API-key 인증이 적용된
+`https://llm.naco.kro.kr` TLS gateway를 사용하며, Ollama 원 포트는 공개하지 않는다.
+이미지/결과 캡처는 재학습 후보로 쓸 수 있지만, 자동 정답이나 자동 배포 근거가 아니다.
 
 2026-09-16 기준, 실제 하드웨어 capture 한 장을 이 경로로 내부 실행해 `plastic`과
 `FOREIGN_MATERIAL`을 포함한 `REJECTED` 응답을 확인했다. 이는 연결·계약 smoke test이며,

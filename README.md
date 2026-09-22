@@ -63,7 +63,8 @@ OpenAPI JSON: `http://localhost:8000/openapi.json`
 ```env
 API_KEY=replace-me
 LOCAL_LLM_MODE=primary
-LOCAL_LLM_BASE_URL=http://private-nas-gateway:11435
+# API-key 인증이 적용된 공개 TLS gateway. Ollama 원 포트는 공개하지 않는다.
+LOCAL_LLM_BASE_URL=https://llm.naco.kro.kr
 LOCAL_LLM_API_KEY=replace-me
 LOCAL_LLM_MODEL=qwen3.5:9b-q4_K_M
 LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false
