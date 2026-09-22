@@ -275,6 +275,18 @@ async def run(
             and llm_prediction.is_single_primary_item
             and llm_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
         ):
+            if llm_prediction.class_name == "general_waste":
+                local_llm.record_primary(
+                    bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
+                    prediction=llm_prediction, selected=True, reason="general_waste", client_id=client_id,
+                )
+                return DetectResponse(
+                    client_id=client_id,
+                    status=DetectionStatus.GENERAL_WASTE,
+                    weight=WeightInfo(value_g=weight_g),
+                    general=guidance.build_general(GeneralWasteCode.GENERAL_WASTE),
+                    bbox=[round(v, 1) for v in bbox],
+                )
             class_id = llm_prediction.class_id
             confidence = llm_prediction.confidence
             local_llm.record_primary(

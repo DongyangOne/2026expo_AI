@@ -26,14 +26,18 @@
 |---|---|---|
 | `ALLOWED` | 조건을 충족한 캔·플라스틱(PET 포함)·종이·비닐 투입 허용 | 정상 비닐도 `5 / vinyl` |
 | `REJECTED` | 재처리 또는 완전 수거 거부 | `guidance` 또는 `rejection`으로 원인 전달 |
-| `GENERAL_WASTE` | LLM이 최종 품목을 확정하지 못한 보류 | `general.code=LOW_CONFIDENCE`, `classification` 생략 |
+| `GENERAL_WASTE` | LLM이 단독 일반폐기물(예: 빨대)을 확정했거나, 최종 품목을 확정하지 못한 보류 | 확정 일반폐기물은 `general.code=GENERAL_WASTE`, 보류는 `LOW_CONFIDENCE`; 모두 `classification` 생략 |
 | `NOT_DETECTED` | 빈 저울 하한 또는 bbox 미감지 | `classification` 생략 |
 
 PET는 외부 계약에서 항상 `class_id=3`, `class_name=plastic`으로 통합합니다.
 
 `LOCAL_LLM_MODE=primary`에서 LLM이 장애·JSON 오류·저신뢰·복수 물체를 반환하면 YOLO 품목으로
 대체하지 않습니다. 기본 설정 `LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false`에서는
-`GENERAL_WASTE / LOW_CONFIDENCE`로 fail-closed 처리합니다.
+`GENERAL_WASTE / LOW_CONFIDENCE`로 fail-closed 처리합니다. 단독 빨대처럼 LLM이 일반폐기물로
+확정한 물체는 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다. 재활용품에 붙은 빨대·종이띠 등
+다른 재질 부착물은 최종 품목을 유지한 `REJECTED / FOREIGN_MATERIAL`입니다.
+카페 음료컵은 빨대·컵홀더를 제거한 뒤 `plastic`, 단독 컵홀더는 `paper`, 단독 빨대와 그 밖의
+비재활용 생활폐기물은 `GENERAL_WASTE / GENERAL_WASTE`입니다.
 
 ## guidance / rejection 코드
 

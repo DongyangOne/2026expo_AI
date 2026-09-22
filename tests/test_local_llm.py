@@ -22,6 +22,17 @@ def test_parse_accepts_exact_vision_contract():
     assert result.class_name == "vinyl"
 
 
+def test_parse_accepts_llm_only_general_waste_class():
+    answer = json.dumps({
+        "material": "general_waste", "confidence": 0.91, "has_label": False,
+        "is_dented": False, "has_foreign_material": False,
+        "is_single_primary_item": True,
+    })
+    result = local_llm._parse(answer)
+    assert result.class_id == 9
+    assert result.class_name == "general_waste"
+
+
 def test_parse_rejects_extra_or_invalid_fields():
     invalid = json.dumps({
         "material": "vinyl", "confidence": 0.91, "has_label": False,

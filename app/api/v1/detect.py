@@ -20,7 +20,8 @@ _DETECT_DESCRIPTION = """
 이미지와 무게 값으로 단일 투입 재활용품을 판정합니다. 운영 `primary` 모드에서는
 YOLO가 객체 위치와 `NOT_DETECTED`만 결정하고, 해당 crop을 NAS 로컬 Vision LLM이
 품목·라벨·압착·외부 이물질까지 최종 판정합니다. 무게 및 안내 코드는 기존 규칙으로
-결정합니다. LLM이 응답하지 않거나, 저신뢰이거나, 단일 주 물체가 아니면 YOLO 품목으로
+결정합니다. LLM이 단독 일반폐기물(예: 빨대)을 확정하면 `GENERAL_WASTE / GENERAL_WASTE`로
+일반함 처리합니다. LLM이 응답하지 않거나, 저신뢰이거나, 단일 주 물체가 아니면 YOLO 품목으로
 대체하지 않고 `GENERAL_WASTE / LOW_CONFIDENCE`로 보류합니다.
 
 ## 요청 형식
@@ -48,7 +49,7 @@ YOLO가 객체 위치와 `NOT_DETECTED`만 결정하고, 해당 crop을 NAS 로�
 | `weight` | object | 항상 | `anomaly`는 항상 포함, 무게 미입력 시 `value_g` 생략 |
 | `guidance` | array | 항상 | 재처리 안내 목록. 통과 또는 완전거부 시 빈 배열 |
 | `rejection` | object | 완전거부 시 | 유리·건전지·형광등·스티로폼의 거부 코드와 메시지. 그 외에는 필드 생략 |
-| `general` | object | `GENERAL_WASTE` 시 | 저신뢰·미분류 코드와 메시지. 그 외에는 필드 생략 |
+| `general` | object | `GENERAL_WASTE` 시 | 확정 일반폐기물 또는 저신뢰·미분류 코드와 메시지. 그 외에는 필드 생략 |
 | `bbox` | number[4] | 객체 감지 시 | 원본 이미지 픽셀 기준 `[x1, y1, x2, y2]`. 미감지 시 필드 생략 |
 
 선택 필드는 값이 없을 때 JSON `null`을 보내지 않고 **필드 자체를 생략**합니다.
@@ -93,7 +94,7 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | `ALLOWED` | 지정 함 투입 허용 | `classification`, `conditions`, `weight`, 빈 `guidance`, `bbox` |
 | `REJECTED` + guidance | 조건 불충족, 재처리 후 재투입 | `classification`, `conditions`, `weight`, 1개 이상의 `guidance`, `bbox` |
 | `REJECTED` + rejection | 기기 수거 불가 | `classification`, `rejection`, 빈 `guidance`, `bbox` |
-| `GENERAL_WASTE` | LLM 장애·저신뢰·복수 물체 등으로 최종 품목을 확정하지 못함 | `general`, 빈 `guidance`, `bbox`; `classification`은 생략 |
+| `GENERAL_WASTE` | 단독 일반폐기물 확정 또는 LLM 장애·저신뢰·복수 물체 보류 | `general`, 빈 `guidance`, `bbox`; `classification`은 생략 |
 | `NOT_DETECTED` | 객체 미감지 | `client_id`, `status`, 빈 `conditions`, `weight.anomaly=false`, 빈 `guidance` |
 
 ## 전체 분기표
@@ -105,26 +106,30 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 |---:|---|---|---|---|
 | 1 | `weight_g`가 설정된 하한 미만(기본 1g) | `NOT_DETECTED` | 생략 | 빈 물체 오탐 방지. `weight.anomaly=false` |
 | 2 | YOLO가 bbox를 찾지 못함 | `NOT_DETECTED` | 생략 | `weight.anomaly=false` |
-| 3 | LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `GENERAL_WASTE` | 생략 | `general.code=LOW_CONFIDENCE`, bbox 유지, YOLO 품목 fallback 없음 |
-| 4 | 캔: 무게 정상·외부 이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `conditions.is_dented=true` |
-| 5 | 캔: 무게 이상/내용물 | `REJECTED` | `0 / can` | `guidance=EMPTY_CONTENTS` |
-| 6 | 캔: 미압착 | `REJECTED` | `0 / can` | `guidance=COMPRESS` |
-| 7 | PET 또는 플라스틱: 무게 정상·라벨 없음·외부 이물질 없음 (PET는 압착됨) | `ALLOWED` | `3 / plastic` | PET도 외부 `plastic/3`으로 통합 |
-| 8 | PET 또는 플라스틱: 무게 이상/내용물 | `REJECTED` | `3 / plastic` | `guidance=EMPTY_CONTENTS` |
-| 9 | PET 또는 플라스틱: 라벨 미제거 | `REJECTED` | `3 / plastic` | `guidance=REMOVE_LABEL` |
-| 10 | PET: 미압착 | `REJECTED` | `3 / plastic` | `guidance=COMPRESS` |
-| 11 | 종이: 무게 정상·외부 이물질 없음 | `ALLOWED` | `2 / paper` | `conditions={}` |
-| 12 | 종이: 무게 이상 | `REJECTED` | `2 / paper` | `guidance=WEIGHT_ANOMALY` |
-| 13 | 비닐: 무게 정상·외부 이물질 없음 | `ALLOWED` | `5 / vinyl` | 정상 비닐도 `ALLOWED` |
-| 14 | 비닐: 무게 이상 | `REJECTED` | `5 / vinyl` | `guidance=WEIGHT_ANOMALY` |
-| 15 | 허용 대상에서 다른 재질 이물질/혼합 부착물 감지 | `REJECTED` | 최종 품목 유지 | `guidance=FOREIGN_MATERIAL` |
-| 16 | 유리 | `REJECTED` | `6 / glass` | `rejection.code=GLASS` |
-| 17 | 건전지 | `REJECTED` | `7 / battery` | `rejection.code=BATTERY` |
-| 18 | 형광등 | `REJECTED` | `8 / fluorescent` | `rejection.code=FLUORESCENT` |
-| 19 | 스티로폼 | `REJECTED` | `4 / styrofoam` | `rejection.code=STYROFOAM` |
+| 3 | LLM이 단독 일반폐기물로 확정 (예: 빨대) | `GENERAL_WASTE` | 생략 | `general.code=GENERAL_WASTE`, bbox 유지, 일반함 처리 |
+| 4 | LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `GENERAL_WASTE` | 생략 | `general.code=LOW_CONFIDENCE`, bbox 유지, YOLO 품목 fallback 없음 |
+| 5 | 캔: 무게 정상·외부 이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `conditions.is_dented=true` |
+| 6 | 캔: 무게 이상/내용물 | `REJECTED` | `0 / can` | `guidance=EMPTY_CONTENTS` |
+| 7 | 캔: 미압착 | `REJECTED` | `0 / can` | `guidance=COMPRESS` |
+| 8 | PET 또는 플라스틱: 무게 정상·라벨 없음·외부 이물질 없음 (PET는 압착됨) | `ALLOWED` | `3 / plastic` | PET도 외부 `plastic/3`으로 통합 |
+| 9 | PET 또는 플라스틱: 무게 이상/내용물 | `REJECTED` | `3 / plastic` | `guidance=EMPTY_CONTENTS` |
+| 10 | PET 또는 플라스틱: 라벨 미제거 | `REJECTED` | `3 / plastic` | `guidance=REMOVE_LABEL` |
+| 11 | PET: 미압착 | `REJECTED` | `3 / plastic` | `guidance=COMPRESS` |
+| 12 | 종이: 무게 정상·외부 이물질 없음 | `ALLOWED` | `2 / paper` | `conditions={}` |
+| 13 | 종이: 무게 이상 | `REJECTED` | `2 / paper` | `guidance=WEIGHT_ANOMALY` |
+| 14 | 비닐: 무게 정상·외부 이물질 없음 | `ALLOWED` | `5 / vinyl` | 정상 비닐도 `ALLOWED` |
+| 15 | 비닐: 무게 이상 | `REJECTED` | `5 / vinyl` | `guidance=WEIGHT_ANOMALY` |
+| 16 | 허용 대상에서 다른 재질 이물질/혼합 부착물 감지 | `REJECTED` | 최종 품목 유지 | `guidance=FOREIGN_MATERIAL` |
+| 17 | 유리 | `REJECTED` | `6 / glass` | `rejection.code=GLASS` |
+| 18 | 건전지 | `REJECTED` | `7 / battery` | `rejection.code=BATTERY` |
+| 19 | 형광등 | `REJECTED` | `8 / fluorescent` | `rejection.code=FLUORESCENT` |
+| 20 | 스티로폼 | `REJECTED` | `4 / styrofoam` | `rejection.code=STYROFOAM` |
 
-`FOREIGN_MATERIAL`은 다른 재질의 부착물·혼합 이물질에만 적용합니다. 같은 재질 부속품(예: 플라스틱 빨대)은
-이 코드의 대상이 아닙니다. 표의 5~15는 한 항목에 둘 이상 적용되면 하나의 `REJECTED` 응답에 guidance 배열로 합쳐집니다.
+`FOREIGN_MATERIAL`은 재활용 주 품목에 붙은 다른 재질의 부착물·혼합 이물질에 적용합니다. 단독 빨대는
+`GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리하며, 컵에 붙은 빨대는 컵 분류를 유지한 `FOREIGN_MATERIAL`입니다.
+카페 음료컵은 빨대·컵홀더 제거 후 `plastic`으로, 단독 컵홀더는 `paper`로 판정합니다. 그 밖의 재활용
+9종에 명확히 속하지 않는 단독 생활폐기물도 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다.
+표의 6~16은 한 항목에 둘 이상 적용되면 하나의 `REJECTED` 응답에 guidance 배열로 합쳐집니다.
 
 ## 모델/외부 클래스 매핑
 
@@ -155,7 +160,7 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 ## 완전거부 및 일반분류 코드
 
 - `rejection.code`: `GLASS`, `BATTERY`, `FLUORESCENT`, `STYROFOAM`
-- `general.code`: 현재 저신뢰 시 `LOW_CONFIDENCE`; `UNCLASSIFIED`와 `VINYL`은 하위 호환 값
+- `general.code`: 확정 일반폐기물(예: 단독 빨대)은 `GENERAL_WASTE`; LLM 저신뢰·장애 보류는 `LOW_CONFIDENCE`; `UNCLASSIFIED`와 `VINYL`은 하위 호환 값
 - 정상 비닐은 `GENERAL_WASTE`가 아니라 `ALLOWED / class_id=5 / class_name=vinyl`
 
 ## 오류 응답

@@ -27,7 +27,9 @@ LLM 호출 실패, JSON 계약 불일치, `LOCAL_LLM_MIN_CONFIDENCE` 미만, 또
 }
 ```
 
-`classification`을 가진 `GENERAL_WASTE`를 가정해 Spring/하드웨어를 구현하면 안 된다.
+`classification`을 가진 `GENERAL_WASTE`를 가정해 Spring/하드웨어를 구현하면 안 된다. 단독 빨대처럼
+LLM이 일반 폐기물로 확정하면 `general.code=GENERAL_WASTE`로 일반함을 선택하고, LLM 장애·저신뢰는
+`general.code=LOW_CONFIDENCE`로 구분한다.
 이 상태는 통 선택을 확정하지 못했다는 뜻이다. `client_id`는 모든 응답과 콜백에서 원본 그대로 유지된다.
 
 ## 전체 응답 분기표
@@ -39,6 +41,7 @@ LLM 호출 실패, JSON 계약 불일치, `LOCAL_LLM_MIN_CONFIDENCE` 미만, 또
 |---|---|---|---|
 | 센서 무게가 하한 미만(기본 1g) | `NOT_DETECTED` | 생략 | 빈 장면 오탐 방지 |
 | YOLO bbox 미감지 | `NOT_DETECTED` | 생략 | `weight.anomaly=false` |
+| LLM이 단독 일반 폐기물로 확정 (예: 빨대) | `GENERAL_WASTE` | 생략 | `general.code=GENERAL_WASTE`, bbox 유지, 일반함 처리 |
 | LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `GENERAL_WASTE` | 생략 | `general.code=LOW_CONFIDENCE`, bbox 유지, YOLO fallback 없음 |
 | 캔 정상: 무게 정상·이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `is_dented=true` |
 | 캔 무게 이상/내용물 또는 미압착 | `REJECTED` | `0 / can` | `EMPTY_CONTENTS`, `COMPRESS` |

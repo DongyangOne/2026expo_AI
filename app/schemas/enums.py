@@ -30,7 +30,7 @@ class DetectionStatus(str, Enum):
     하드웨어 함: [플라스틱, 캔, 종이, 일반] + 수거거부.
     """
     ALLOWED       = "ALLOWED"        # 지정 함 투입 허용 (plastic/can/paper/vinyl) + 상태조건 충족
-    GENERAL_WASTE = "GENERAL_WASTE"  # 저신뢰 / 미분류
+    GENERAL_WASTE = "GENERAL_WASTE"  # 일반쓰레기 투입 (확정 일반폐기물 또는 저신뢰 보류)
     REJECTED      = "REJECTED"       # 거부: 조건불충족(재처리 guidance) 또는 완전거부(유리 등 rejection)
     NOT_DETECTED  = "NOT_DETECTED"   # 감지 실패 → 재시도 안내
 
@@ -54,6 +54,7 @@ class RejectionCode(str, Enum):
 
 class GeneralWasteCode(str, Enum):
     """일반쓰레기(GENERAL_WASTE) 사유 코드."""
+    GENERAL_WASTE = "GENERAL_WASTE"  # LLM이 일반 폐기물로 확정 (예: 단독 빨대)
     VINYL       = "VINYL"            # 하위 호환용 (정상 비닐은 ALLOWED)
     LOW_CONFIDENCE = "LOW_CONFIDENCE"  # 신뢰도 미달
     UNCLASSIFIED   = "UNCLASSIFIED"    # 기타 미분류

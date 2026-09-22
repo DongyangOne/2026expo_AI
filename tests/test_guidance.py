@@ -144,6 +144,11 @@ class TestMessages:
         assert g.code == GeneralWasteCode.VINYL
         assert "일반쓰레기" in g.message
 
+    def test_확정_일반쓰레기_메시지(self):
+        g = guidance.build_general(GeneralWasteCode.GENERAL_WASTE)
+        assert g.code == GeneralWasteCode.GENERAL_WASTE
+        assert "일반쓰레기" in g.message
+
     def test_guidance_메시지_매핑(self):
         # 생성된 모든 guidance 는 코드+메시지를 가짐
         g = guidance.build_guidance(WasteClass.PET, Conditions(has_label=True, is_dented=False), True)

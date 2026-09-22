@@ -9,7 +9,7 @@ import numpy as np
 
 os.environ.setdefault("API_KEY", "test-key")
 
-from app.schemas.enums import DetectionStatus, GuidanceCode, WasteClass
+from app.schemas.enums import DetectionStatus, GeneralWasteCode, GuidanceCode, WasteClass
 from app.schemas.response import Conditions
 from app.models.registry import VerifierRuntime
 from app.services import inference, pipeline
@@ -121,6 +121,34 @@ def test_primary_llm_실패는_yolo_품목으로_대체하지_않고_일반보�
     assert result.status is DetectionStatus.GENERAL_WASTE
     assert result.classification is None
     assert result.general is not None
+
+
+def test_primary_llm_단독_일반쓰레기는_일반함으로_확정(monkeypatch):
+    prediction = pipeline.local_llm.LocalLLMPrediction(
+        class_id=9,
+        class_name="general_waste",
+        confidence=0.95,
+        has_label=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    recorded = {}
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_pet_detection)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(pipeline.local_llm, "classify", lambda *_args: prediction)
+    monkeypatch.setattr(pipeline.local_llm, "record_primary", lambda **kwargs: recorded.update(kwargs))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 2.0, "loose-straw-001", _Registry()))
+
+    assert result.status is DetectionStatus.GENERAL_WASTE
+    assert result.classification is None
+    assert result.general is not None
+    assert result.general.code is GeneralWasteCode.GENERAL_WASTE
+    assert recorded["reason"] == "general_waste"
 
 
 def test_저신뢰_pet에_동일_bbox_vinyl후보와_검증기합의가_있으면_vinyl로_교정(monkeypatch):

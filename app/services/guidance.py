@@ -9,7 +9,7 @@
   - REJECTED(재처리): plastic(PET 포함)/can/paper + 조건 불충족 → guidance 안내 후 재투입
   - REJECTED(거부) : glass/battery/fluorescent/styrofoam → 수거 불가
   - ALLOWED(비닐)  : vinyl + 상태 조건 충족 → 비닐함
-  - GENERAL_WASTE  : 저신뢰 / 미분류 → 분류 불가
+  - GENERAL_WASTE  : 확정 일반폐기물 또는 저신뢰/미분류 → 일반 함
 """
 
 from app.schemas.enums import (
@@ -57,6 +57,7 @@ _REJECTION: dict[WasteClass, tuple[RejectionCode, str]] = {
 
 # 일반쓰레기
 _GENERAL_TEXT: dict[GeneralWasteCode, str] = {
+    GeneralWasteCode.GENERAL_WASTE:  "일반쓰레기로 배출해 주세요.",
     GeneralWasteCode.VINYL:          "비닐은 일반쓰레기로 배출해 주세요.",
     GeneralWasteCode.LOW_CONFIDENCE: "정확히 분류하기 어려워요. 일반쓰레기로 배출해 주세요.",
     GeneralWasteCode.UNCLASSIFIED:   "재활용 대상이 아니에요. 일반쓰레기로 배출해 주세요.",

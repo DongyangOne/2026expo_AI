@@ -29,7 +29,7 @@ _write_lock = Lock()
 
 CLASS_NAMES = (
     "can", "pet", "paper", "plastic", "styrofoam",
-    "vinyl", "glass", "battery", "fluorescent",
+    "vinyl", "glass", "battery", "fluorescent", "general_waste",
 )
 CLASS_ID_BY_NAME = {name: index for index, name in enumerate(CLASS_NAMES)}
 
@@ -50,10 +50,12 @@ _SCHEMA = {
     },
 }
 
-_PROMPT = """You classify exactly one recycling item in this cropped image.
-Choose only one material from: can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent.
-Treat an attached item made of a different material (for example a paper sleeve on a plastic cup) as foreign material.
-Do not treat same-material accessories such as a plastic straw as foreign material.
+_PROMPT = """You classify exactly one item in this cropped image for a waste-sorting bin.
+Choose only one material from: can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent, general_waste.
+Choose general_waste only when the primary item itself is ordinary non-recyclable trash, for example a loose disposable straw, used tissue, food waste, or a contaminated mixed-material item.
+Treat a cafe beverage cup as plastic after its straw and cup holder are removed. Treat a loose cup holder as paper.
+If a recyclable cup or container has a straw, cup holder, paper sleeve, or another different-material attachment, choose the recyclable main material and set has_foreign_material=true.
+Do not classify a loose straw as plastic just because it is made of plastic.
 has_label means a removable recycling label is still attached. is_dented means a can or PET bottle is compressed.
 Return only JSON matching the supplied schema; do not add explanation."""
 
