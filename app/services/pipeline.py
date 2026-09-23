@@ -244,24 +244,71 @@ async def run(
         (perf_counter() - yolo_started_at) * 1000,
     )
 
-    # ── 미감지 ──────────────────────────────────────────────────────────────────
-    if detection is None:
-        return DetectResponse(
-            client_id=client_id,
-            status=DetectionStatus.NOT_DETECTED,
-            weight=WeightInfo(value_g=weight_g),
-        )
-
-    if len(detection) == 3:
-        class_id, confidence, bbox = detection
-        candidates: list[tuple[int, float, list[float]]] = []
-    else:
-        class_id, confidence, bbox, candidates = detection
-
-    yolo_class_id = class_id
-    yolo_confidence = confidence
+    # ── 미감지 → primary LLM 원본 전체 fallback ─────────────────────────────────
+    # YOLO가 정상적으로 bbox를 제공할 때의 crop 우선 경로는 바꾸지 않는다. 다만
+    # 투명·단색 비닐처럼 bbox 자체가 없는 경우에만 원본 프레임을 LLM에 보낸다.
+    full_frame_llm_fallback = detection is None
     llm_prediction = None
-    if local_llm.primary_enabled():
+    if full_frame_llm_fallback:
+        if not local_llm.primary_enabled():
+            return DetectResponse(
+                client_id=client_id,
+                status=DetectionStatus.NOT_DETECTED,
+                weight=WeightInfo(value_g=weight_g),
+            )
+        height, width = img.shape[:2]
+        bbox = [0.0, 0.0, float(width), float(height)]
+        yolo_class_id = None
+        yolo_confidence = None
+        llm_started_at = perf_counter()
+        llm_prediction = await loop.run_in_executor(_executor, local_llm.classify, img, bbox)
+        logger.info(
+            "NAS LLM 전체프레임 fallback 시간: client_id=%s llm_ms=%.1f available=%s",
+            client_id,
+            (perf_counter() - llm_started_at) * 1000,
+            llm_prediction is not None,
+        )
+        if (
+            llm_prediction is None
+            or not llm_prediction.is_single_primary_item
+            or llm_prediction.confidence < settings.LOCAL_LLM_MIN_CONFIDENCE
+        ):
+            local_llm.record_primary(
+                bbox=bbox, yolo_class_id=None, yolo_confidence=None,
+                prediction=llm_prediction, selected=False,
+                reason=("full_frame_unavailable" if llm_prediction is None else "full_frame_ambiguous_or_low_confidence"),
+                client_id=client_id,
+            )
+            return DetectResponse(
+                client_id=client_id,
+                status=DetectionStatus.NOT_DETECTED,
+                weight=WeightInfo(value_g=weight_g),
+            )
+        class_id = llm_prediction.class_id
+        confidence = llm_prediction.confidence
+        candidates: list[tuple[int, float, list[float]]] = []
+        local_llm.record_primary(
+            bbox=bbox, yolo_class_id=None, yolo_confidence=None,
+            prediction=llm_prediction, selected=True, reason="full_frame_fallback", client_id=client_id,
+        )
+        if llm_prediction.class_name == "general_waste":
+            return DetectResponse(
+                client_id=client_id,
+                status=DetectionStatus.GENERAL_WASTE,
+                weight=WeightInfo(value_g=weight_g),
+                general=guidance.build_general(GeneralWasteCode.GENERAL_WASTE),
+                bbox=[round(v, 1) for v in bbox],
+            )
+    else:
+        if len(detection) == 3:
+            class_id, confidence, bbox = detection
+            candidates = []
+        else:
+            class_id, confidence, bbox, candidates = detection
+        yolo_class_id = class_id
+        yolo_confidence = confidence
+
+    if local_llm.primary_enabled() and not full_frame_llm_fallback:
         llm_started_at = perf_counter()
         llm_prediction = await loop.run_in_executor(_executor, local_llm.classify, img, bbox)
         logger.info(
@@ -275,6 +322,23 @@ async def run(
             and llm_prediction.is_single_primary_item
             and llm_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
         ):
+            if yolo_class_id == _VINYL_MODEL_CLASS_ID and llm_prediction.class_name == "plastic":
+                recheck_started_at = perf_counter()
+                recheck_prediction = await loop.run_in_executor(
+                    _executor, local_llm.reclassify_vinyl_plastic, img, bbox,
+                )
+                logger.info(
+                    "NAS LLM vinyl/plastic 재판정 시간: client_id=%s llm_ms=%.1f resolved=%s",
+                    client_id,
+                    (perf_counter() - recheck_started_at) * 1000,
+                    recheck_prediction.class_name if recheck_prediction is not None else None,
+                )
+                if (
+                    recheck_prediction is not None
+                    and recheck_prediction.is_single_primary_item
+                    and recheck_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
+                ):
+                    llm_prediction = recheck_prediction
             if llm_prediction.class_name == "general_waste":
                 local_llm.record_primary(
                     bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
@@ -291,7 +355,9 @@ async def run(
             confidence = llm_prediction.confidence
             local_llm.record_primary(
                 bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
-                prediction=llm_prediction, selected=True, reason="accepted", client_id=client_id,
+                prediction=llm_prediction, selected=True,
+                reason=("vinyl_plastic_recheck" if yolo_class_id == _VINYL_MODEL_CLASS_ID else "accepted"),
+                client_id=client_id,
             )
         else:
             local_llm.record_primary(
@@ -311,9 +377,9 @@ async def run(
                     bbox=[round(v, 1) for v in bbox],
                 )
             llm_prediction = None
-    else:
+    elif not full_frame_llm_fallback:
         local_llm.submit_shadow(img, bbox, yolo_class_id, yolo_confidence, client_id)
-    verifier_session = (
+    verifier_session = None if full_frame_llm_fallback else (
         registry.verifier() if hasattr(registry, "verifier") else None
     )
     vinyl_candidate = _find_vinyl_candidate(
@@ -407,21 +473,22 @@ async def run(
                 client_id,
             )
 
-    if verifier_prediction is None:
-        verifier_shadow.submit(
-            verifier_session, img, bbox, yolo_class_id, yolo_confidence, client_id
-        )
-    else:
-        verifier_shadow.submit_precomputed(
-            verifier_session,
-            img,
-            bbox,
-            yolo_class_id,
-            yolo_confidence,
-            client_id,
-            verifier_prediction,
-            correction_applied,
-        )
+    if not full_frame_llm_fallback:
+        if verifier_prediction is None:
+            verifier_shadow.submit(
+                verifier_session, img, bbox, yolo_class_id, yolo_confidence, client_id
+            )
+        else:
+            verifier_shadow.submit_precomputed(
+                verifier_session,
+                img,
+                bbox,
+                yolo_class_id,
+                yolo_confidence,
+                client_id,
+                verifier_prediction,
+                correction_applied,
+            )
     cls = _CLASS_BY_ID.get(class_id)
     bbox_rounded = [round(v, 1) for v in bbox]
     weight_info = WeightInfo(value_g=weight_g)

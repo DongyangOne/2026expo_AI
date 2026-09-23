@@ -1,7 +1,7 @@
-"""NAS Ollama Vision LLM crop classifier.
+"""NAS Ollama Vision LLM classifier used after YOLO localisation.
 
-This is deliberately a crop classifier, not a replacement detector: YOLO still
-owns object localisation and NOT_DETECTED.  A malformed, unavailable, or
+YOLO normally supplies the crop.  When YOLO finds no box, the caller may send
+the full frame as a conservative fallback.  A malformed, unavailable, or
 low-confidence LLM answer is never allowed to fail an API request.
 """
 
@@ -50,7 +50,8 @@ _SCHEMA = {
     },
 }
 
-_PROMPT = """You classify exactly one item in this cropped image for a waste-sorting bin.
+_PROMPT = """You classify exactly one item in this image for a waste-sorting bin.
+The image is normally a YOLO crop; it can be the full camera frame only when YOLO found no object.
 Choose only one material from: can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent, general_waste.
 Choose general_waste only when the primary item itself is ordinary non-recyclable trash, for example a loose disposable straw, used tissue, food waste, or a contaminated mixed-material item.
 Treat a cafe beverage cup as plastic after its straw and cup holder are removed. Treat a loose cup holder as paper.
@@ -58,6 +59,14 @@ Set has_foreign_material=true only when another material is physically attached 
 Do not infer foreign material from the surrounding scene: a hand, camera fixture, support, cable, tray, or any unrelated background visible in the crop is not foreign material unless it is attached to or inside the item.
 If a recyclable cup or container has a straw, cup holder, paper sleeve, or another different-material attachment, choose the recyclable main material and set has_foreign_material=true.
 Do not classify a loose straw as plastic just because it is made of plastic.
+has_label means a removable recycling label is still attached. is_dented means a can or PET bottle is compressed.
+Return only JSON matching the supplied schema; do not add explanation."""
+
+_VINYL_PLASTIC_PROMPT = """Recheck this one primary item only for a waste-sorting bin.
+Choose exactly one material: vinyl or plastic.
+Choose vinyl for a thin, flexible film, bag, wrapper, or pouch. Choose plastic for a rigid bottle, cup, lid, tray, or container.
+Do not use the surrounding scene as evidence. A hand, fixture, support, cable, tray, or background is not part of the item.
+Set has_foreign_material=true only if another material is physically attached to, inside, or mixed with the primary item.
 has_label means a removable recycling label is still attached. is_dented means a can or PET bottle is compressed.
 Return only JSON matching the supplied schema; do not add explanation."""
 
@@ -126,7 +135,9 @@ def _parse(content: str) -> LocalLLMPrediction:
     )
 
 
-def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
+def _classify_with_prompt(
+    img: np.ndarray, bbox: list[float], prompt: str,
+) -> LocalLLMPrediction | None:
     """Synchronously query local Ollama; callers run this outside the event loop."""
     if not enabled():
         return None
@@ -146,7 +157,7 @@ def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
         "think": False,
         "format": _SCHEMA,
         "options": {"temperature": 0, "num_predict": settings.LOCAL_LLM_MAX_TOKENS},
-        "messages": [{"role": "user", "content": _PROMPT, "images": [image]}],
+        "messages": [{"role": "user", "content": prompt, "images": [image]}],
     }
     url = settings.LOCAL_LLM_BASE_URL.rstrip("/") + "/api/chat"
     try:
@@ -156,8 +167,28 @@ def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
         payload = response.json()
         return _parse(payload["message"]["content"])
     except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("NAS local LLM crop classification skipped: %s", exc)
+        logger.warning("NAS local LLM classification skipped: %s", exc)
         return None
+
+
+def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
+    """Classify a YOLO crop or a full-frame fallback."""
+    return _classify_with_prompt(img, bbox, _PROMPT)
+
+
+def reclassify_vinyl_plastic(
+    img: np.ndarray, bbox: list[float],
+) -> LocalLLMPrediction | None:
+    """Resolve only the flexible-vinyl versus rigid-plastic ambiguity."""
+    prediction = _classify_with_prompt(img, bbox, _VINYL_PLASTIC_PROMPT)
+    if prediction is not None and prediction.class_name in {"vinyl", "plastic"}:
+        return prediction
+    if prediction is not None:
+        logger.warning(
+            "NAS local LLM vinyl/plastic recheck returned invalid material: %s",
+            prediction.class_name,
+        )
+    return None
 
 
 def submit_shadow(
@@ -193,7 +224,7 @@ def submit_shadow(
 
 
 def record_primary(
-    *, bbox: list[float], yolo_class_id: int, yolo_confidence: float,
+    *, bbox: list[float], yolo_class_id: int | None, yolo_confidence: float | None,
     prediction: LocalLLMPrediction | None, selected: bool, reason: str,
     client_id: str,
 ) -> None:
@@ -204,7 +235,10 @@ def record_primary(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "client_id": client_id,
         "bbox": [round(float(value), 1) for value in bbox],
-        "yolo": {"class_id": yolo_class_id, "confidence": round(float(yolo_confidence), 6)},
+        "yolo": (
+            {"class_id": yolo_class_id, "confidence": round(float(yolo_confidence), 6)}
+            if yolo_class_id is not None and yolo_confidence is not None else None
+        ),
         "local_llm": prediction.__dict__ if prediction else None,
         "selected": selected,
         "reason": reason,
