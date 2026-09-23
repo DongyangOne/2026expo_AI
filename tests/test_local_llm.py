@@ -59,6 +59,11 @@ def test_local_llm_defaults_bound_json_generation():
     assert settings.LOCAL_LLM_KEEP_ALIVE == "24h"
 
 
+def test_prompt_limits_foreign_material_to_the_primary_item():
+    assert "physically attached to, inside, or mixed with the primary item" in local_llm._PROMPT
+    assert "surrounding scene" in local_llm._PROMPT
+
+
 def test_crop_encoding_is_bounded(monkeypatch):
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_SIDE", 64)
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_BYTES", 100_000)

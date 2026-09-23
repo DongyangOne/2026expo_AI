@@ -54,6 +54,8 @@ _PROMPT = """You classify exactly one item in this cropped image for a waste-sor
 Choose only one material from: can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent, general_waste.
 Choose general_waste only when the primary item itself is ordinary non-recyclable trash, for example a loose disposable straw, used tissue, food waste, or a contaminated mixed-material item.
 Treat a cafe beverage cup as plastic after its straw and cup holder are removed. Treat a loose cup holder as paper.
+Set has_foreign_material=true only when another material is physically attached to, inside, or mixed with the primary item.
+Do not infer foreign material from the surrounding scene: a hand, camera fixture, support, cable, tray, or any unrelated background visible in the crop is not foreign material unless it is attached to or inside the item.
 If a recyclable cup or container has a straw, cup holder, paper sleeve, or another different-material attachment, choose the recyclable main material and set has_foreign_material=true.
 Do not classify a loose straw as plastic just because it is made of plastic.
 has_label means a removable recycling label is still attached. is_dented means a can or PET bottle is compressed.
