@@ -1,13 +1,15 @@
 # Raspberry Pi production lock.
 # These versions match the verified container that was running on 2026-09-27.
+# Use the official CPU wheel index so the Pi does not install unused CUDA libraries.
+--extra-index-url https://download.pytorch.org/whl/cpu
 -r requirements.txt
 
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 python-multipart==0.0.32
 
-torch==2.14.0
-torchvision==0.29.0
+torch==2.14.0+cpu
+torchvision==0.29.0+cpu
 ultralytics==8.4.138
 onnxruntime==1.29.0
 ncnn==1.0.20260526
