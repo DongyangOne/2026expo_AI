@@ -8,9 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir ncnn
+COPY requirements.txt requirements-pi.txt ./
+RUN pip install --no-cache-dir -r requirements-pi.txt
 
 COPY app/     ./app/
 COPY weights/ ./weights/

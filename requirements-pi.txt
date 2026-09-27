@@ -1,0 +1,22 @@
+# Raspberry Pi production lock.
+# These versions match the verified container that was running on 2026-09-27.
+-r requirements.txt
+
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+
+torch==2.14.0
+torchvision==0.29.0
+ultralytics==8.4.138
+onnxruntime==1.29.0
+ncnn==1.0.20260526
+
+opencv-python-headless==5.0.0.93
+numpy==2.4.6
+Pillow==12.3.0
+
+httpx==0.28.1
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
