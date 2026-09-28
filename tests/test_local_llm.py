@@ -70,10 +70,13 @@ def test_prompt_defines_material_by_physical_form():
     assert "thin flexible film" in local_llm._PROMPT
     assert "rigid molded polymer" in local_llm._PROMPT
     assert "Image 1 is the complete camera frame" in local_llm._PROMPT
-    assert "black lightweight foam food trays" in local_llm._PROMPT
+    assert "black lightweight molded foam food trays" in local_llm._PROMPT
     assert "groups bulb-shaped lamps together" in local_llm._PROMPT
     assert "does not make the primary item paper" in local_llm._PROMPT
     assert "dark or amber bottle is not glass" in local_llm._PROMPT
+    assert "rolled paper rim" in local_llm._PROMPT
+    assert "heat-sealed edges" in local_llm._PROMPT
+    assert "printed flexible squeeze tube" in local_llm._PROMPT
 
 
 def test_crop_encoding_is_bounded(monkeypatch):

@@ -222,12 +222,12 @@ async def run(
     img = await _read_image(upload)
 
     # ── 저울 하한 가드 ──────────────────────────────────────────────────────────
-    # 저울에 아무것도 없으면 시각 결과와 무관하게 미감지로 끝낸다. 검증기에
-    # background 클래스가 없어 빈 장면도 반드시 9종 중 하나로 분류되기 때문에,
-    # 이 경로가 없으면 빈 통을 ALLOWED로 응답할 수 있다.
-    # weight_g가 None이면 판단 근거가 없으므로 가드를 적용하지 않는다.
+    # legacy 시각 경로에서만 빈 저울 가드를 적용한다. Vision LLM primary
+    # 모드에서는 1g 미만의 얇은 종이·비닐도 유효한 품목이므로 사진을
+    # 반드시 판정한다. primary LLM은 빈 장면을 NOT_DETECTED로 반환한다.
     if (
         settings.WEIGHT_MIN_GUARD_ENABLED
+        and not local_llm.primary_enabled()
         and weight_g is not None
         and weight_g < settings.WEIGHT_MIN_G
     ):

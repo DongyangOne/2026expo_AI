@@ -52,6 +52,10 @@ def _fake_clear_plastic_detection(_registry, _img):
     return 1, 0.391, bbox, [(1, 0.391, bbox)]
 
 
+def _fake_no_detection(_registry, _img):
+    return None
+
+
 def test_vinyl_무게이상은_rejected_weight_anomaly(monkeypatch):
     monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
     monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
@@ -723,6 +727,7 @@ def test_저울이_비면_시각결과와_무관하게_미감지(monkeypatch):
     monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
     monkeypatch.setattr(inference, "run_main", _fake_vinyl_detection)
     monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: False)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         monkeypatch.setattr(pipeline, "_executor", executor)
@@ -731,6 +736,35 @@ def test_저울이_비면_시각결과와_무관하게_미감지(monkeypatch):
     assert result.status is DetectionStatus.NOT_DETECTED
     assert result.classification is None
     assert result.weight.value_g == 0.0
+
+
+def test_primary_llm은_1g_미만_얇은종이도_시각판정한다(monkeypatch):
+    """실측 운영 사진에서 0~0.7g 종이가 하한 가드로 미감지되었다."""
+    prediction = pipeline.local_llm.LocalLLMPrediction(
+        class_id=2,
+        class_name="paper",
+        confidence=0.96,
+        has_label=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_no_detection)
+    monkeypatch.setattr(inference, "run_state", lambda *_args: inference.StatePrediction(Conditions()))
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(pipeline.local_llm, "classify", lambda *_args: prediction)
+    monkeypatch.setattr(pipeline.local_llm, "record_primary", lambda **_kwargs: None)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 0.3, "thin-paper", _Registry()))
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification is not None
+    assert result.classification.class_name is WasteClass.PAPER
+    assert result.weight.value_g == 0.3
 
 
 def test_무게가_None이면_하한가드는_동작하지_않는다(monkeypatch):

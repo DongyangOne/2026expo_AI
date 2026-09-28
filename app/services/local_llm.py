@@ -62,10 +62,10 @@ Image usage:
 Choose exactly one material:
 - can: metal beverage or food can.
 - pet: a lightweight molded plastic bottle with a bottle neck, including transparent, colored, tinted, or opaque PET-style bottles. Do not use for rigid cups, lids, trays, or non-bottle containers. A dark or amber bottle is not glass merely because its color hides transparency; require clear glass cues such as a thick rigid wall/base and glass-like reflections before choosing glass.
-- paper: paper, cardboard, carton, paper cup, or a loose paper cup sleeve/holder.
-- plastic: rigid molded polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, or container. Printed paper or film wrapped around a rigid molded cup/container is a label or contaminant; it does not make the primary item paper.
-- styrofoam: expanded-polystyrene foam, including white or black lightweight foam food trays and packaging. The surface may look smooth and the foam beads may be subtle, especially on dark trays.
-- vinyl: thin flexible film, bag, wrapper, or pouch that bends, folds, wrinkles, or crumples. Never call flexible film rigid plastic merely because both are polymers.
+- paper: paper, cardboard, carton, paper cup, or a loose paper cup sleeve/holder. A matte opaque disposable drink cup with a rolled paper rim or side seam is paper unless there is clear rigid-polymer evidence.
+- plastic: rigid molded polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, squeeze tube, or container. Printed paper or film wrapped around a rigid molded cup/container is a label or contaminant; it does not make the primary item paper. A printed flexible squeeze tube is plastic, not paper.
+- styrofoam: expanded-polystyrene foam, including white or black lightweight molded foam food trays and packaging. The surface may look smooth and the foam beads may be subtle, especially on dark trays; an embossed material mark and molded ribs can be stronger evidence than visible beads.
+- vinyl: thin flexible film, bag, wrapper, or pouch that bends, folds, wrinkles, crumples, or has heat-sealed edges. Printed snack, food, or candy packaging remains vinyl when its body is a flexible film pouch or wrapper; printing does not make it paper.
 - glass: an item whose body is clearly glass, such as a thick rigid glass bottle, jar, or glass object. Do not choose glass for a lightweight molded plastic/PET bottle only because it is glossy, transparent, or amber-colored.
 - battery: household battery or battery pack.
 - fluorescent: any discarded electric lamp or light bulb handled by the bin's lamp-rejection route, including a fluorescent tube, compact fluorescent lamp, globe bulb, LED bulb, or incandescent-style bulb. This product taxonomy intentionally groups bulb-shaped lamps together even when the visible diffuser resembles glass.
@@ -73,6 +73,7 @@ Choose exactly one material:
 
 State rules:
 - A cafe cup is plastic only after its loose straw and paper sleeve/holder are removed. A loose straw is general_waste; a loose sleeve/holder is paper.
+- For the cup itself, distinguish material: an opaque matte cup with a rolled paper rim or paper seam is paper; a clearly translucent, glossy, injection-molded cup is plastic.
 - has_foreign_material=true only when a different material is physically attached to, inside, or mixed with the primary item. Background objects are not foreign material.
 - has_label=true only when a removable recycling label remains attached to a plastic/PET container.
 - is_dented=true only when a can or PET beverage bottle is visibly compressed enough for disposal.
