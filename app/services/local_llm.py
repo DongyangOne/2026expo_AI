@@ -87,6 +87,7 @@ Image 1 is the complete camera frame. Image 2, when present, is the padded YOLO 
 Choose vinyl for thin flexible film, a bag, wrapper, or pouch that bends, folds, wrinkles, or crumples.
 Choose plastic only for a rigid bottle, cup, lid, tray, tub, or container that keeps its shape.
 Judge physical flexibility and three-dimensional form, not color, transparency, printed branding, or the fact that both materials are polymers.
+This is form classification, not polymer chemistry: a loose translucent shopping or packaging bag, or a film sheet draped over any support, MUST be vinyl and never plastic; ignore the support underneath it.
 Ignore the bin tray, floor, background, shadows, hands, fixtures, and anything not attached to the target.
 Set has_foreign_material=true only if another material is physically attached to, inside, or mixed with the primary item.
 If the evidence is ambiguous, lower confidence rather than defaulting to plastic.

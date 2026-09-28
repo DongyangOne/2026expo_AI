@@ -77,6 +77,7 @@ def test_prompt_defines_material_by_physical_form():
     assert "rolled paper rim" in local_llm._PROMPT
     assert "heat-sealed edges" in local_llm._PROMPT
     assert "printed flexible squeeze tube" in local_llm._PROMPT
+    assert "film sheet draped over any support" in local_llm._VINYL_PLASTIC_PROMPT
 
 
 def test_crop_encoding_is_bounded(monkeypatch):
