@@ -109,4 +109,4 @@ def test_foreign_material_recheck_uses_only_target_crop(monkeypatch):
         crop_only=True,
     )
     assert len(images) == 1
-    assert "bin fixture or clamp" in local_llm._FOREIGN_MATERIAL_PROMPT
+    assert "Background objects are not foreign material" in local_llm._PROMPT

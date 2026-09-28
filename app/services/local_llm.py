@@ -91,13 +91,6 @@ Set has_foreign_material=true only if another material is physically attached to
 If the evidence is ambiguous, lower confidence rather than defaulting to plastic.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
-_FOREIGN_MATERIAL_PROMPT = """Recheck only whether a different-material contaminant is physically attached to, inside, or mixed with the primary {material} item in this crop.
-Keep material={material}. Use only the target crop for this recheck.
-A hand holding the item, the bin fixture or clamp, background objects, shadows, printed ink or graphics, and the item's own same-material pull tab or cap are NEVER foreign material.
-Set has_foreign_material=true only for a real different-material attachment, content, or mixture that must be removed before disposal.
-Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
-
-
 @dataclass(frozen=True)
 class LocalLLMPrediction:
     class_id: int
@@ -254,13 +247,15 @@ def recheck_foreign_material(
     Full-frame context helps material recognition but can make a fixed camera
     fixture look attached to the item.  This second pass is intentionally
     conditional and crop-only, so normal requests do not pay its latency.
+    Reusing the primary prompt avoids biasing the model toward finding a
+    contaminant merely because a recheck was requested.
     """
     if material not in CLASS_ID_BY_NAME:
         return None
     prediction = _classify_with_prompt(
         img,
         bbox,
-        _FOREIGN_MATERIAL_PROMPT.format(material=material),
+        _PROMPT,
         crop_only=True,
     )
     if prediction is not None and prediction.class_name == material:
