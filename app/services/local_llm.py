@@ -61,14 +61,14 @@ Image usage:
 
 Choose exactly one material:
 - can: metal beverage or food can.
-- pet: transparent or colored PET beverage bottle. Do not use for rigid cups, lids, trays, or non-bottle containers.
+- pet: a lightweight molded plastic bottle with a bottle neck, including transparent, colored, tinted, or opaque PET-style bottles. Do not use for rigid cups, lids, trays, or non-bottle containers. A dark or amber bottle is not glass merely because its color hides transparency; require clear glass cues such as a thick rigid wall/base and glass-like reflections before choosing glass.
 - paper: paper, cardboard, carton, paper cup, or a loose paper cup sleeve/holder.
-- plastic: rigid polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, or container.
-- styrofoam: expanded polystyrene foam with a visibly foamed/beaded structure.
+- plastic: rigid molded polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, or container. Printed paper or film wrapped around a rigid molded cup/container is a label or contaminant; it does not make the primary item paper.
+- styrofoam: expanded-polystyrene foam, including white or black lightweight foam food trays and packaging. The surface may look smooth and the foam beads may be subtle, especially on dark trays.
 - vinyl: thin flexible film, bag, wrapper, or pouch that bends, folds, wrinkles, or crumples. Never call flexible film rigid plastic merely because both are polymers.
-- glass: glass bottle, jar, or glass object.
+- glass: an item whose body is clearly glass, such as a thick rigid glass bottle, jar, or glass object. Do not choose glass for a lightweight molded plastic/PET bottle only because it is glossy, transparent, or amber-colored.
 - battery: household battery or battery pack.
-- fluorescent: fluorescent tube or fluorescent lamp/bulb; do not use for ordinary LED products.
+- fluorescent: any discarded electric lamp or light bulb handled by the bin's lamp-rejection route, including a fluorescent tube, compact fluorescent lamp, globe bulb, LED bulb, or incandescent-style bulb. This product taxonomy intentionally groups bulb-shaped lamps together even when the visible diffuser resembles glass.
 - general_waste: a loose straw, used tissue, food waste, hygiene waste, or another ordinary non-recyclable item outside the nine recyclable classes.
 
 State rules:
