@@ -95,13 +95,14 @@ Return only one JSON object matching the supplied schema. Do not add Markdown or
 
 _REJECTION_CONFLICT_PROMPT = """Re-evaluate the ONE primary disposal item because two visual classifiers disagree.
 Choose exactly one of these two materials: {yolo_material} or {llm_material}.
-Do not blindly trust either prior classifier; inspect the complete frame and padded target crop.
+Do not blindly trust either prior classifier; inspect the target crop and use manufacturing evidence, not color.
 Safety-specific visual rules:
 - fluorescent means any complete discarded electric lamp or bulb routed to lamp rejection, including globe, LED, incandescent-style, compact fluorescent, or tube lamps. A smooth round diffuser does not make a complete lamp plastic.
-- styrofoam includes lightweight molded expanded-polystyrene food trays, including smooth black trays with subtle beads, molded ribs, or embossed material marks.
-- glass requires a thick rigid glass wall or base and glass-like reflections; glossy, transparent, tinted, or amber plastic alone is not glass.
+- styrofoam includes lightweight molded expanded-polystyrene food trays, including smooth black trays with subtle beads, molded ribs, or embossed material marks. Embossed PSP, EPS, PS, or foamed-polystyrene markings are strong styrofoam evidence; PSP specifically means foamed polystyrene.
+- pet includes lightweight molded bottles with thin walls, a threaded neck or collar, molded shoulders or seams, even when opaque, tinted, or amber. Dark brown color does not imply glass.
+- glass requires decisive evidence such as a thick heavy wall or base and glass-like refraction; gloss, transparency, tint, or amber color alone is not glass.
 - battery requires visible battery-cell, terminal, pack, or battery-label evidence.
-- plastic is an ordinary rigid molded polymer item and must not be chosen for a complete lamp or molded foam tray.
+- plastic is an ordinary dense rigid molded polymer item and must not be chosen for a complete lamp or a molded foam tray with foam or PSP/EPS evidence.
 Ignore hands, the bin, fixtures, cables, floor, and background. If uncertain, lower confidence.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
@@ -259,14 +260,21 @@ def reclassify_rejection_conflict(
     yolo_material: str,
     llm_material: str,
 ) -> LocalLLMPrediction | None:
-    """Adjudicate a high-confidence YOLO rejection versus a benign LLM result."""
+    """Adjudicate a safety/material conflict between YOLO and the primary LLM."""
     if yolo_material not in CLASS_ID_BY_NAME or llm_material not in CLASS_ID_BY_NAME:
         return None
     prompt = _REJECTION_CONFLICT_PROMPT.format(
         yolo_material=yolo_material,
         llm_material=llm_material,
     )
-    prediction = _classify_with_prompt(img, bbox, prompt)
+    # These two observed hard pairs depend on surface/manufacturing detail.  The
+    # padded crop preserves the entire detected item while avoiding unrelated
+    # scene tokens and is measurably faster than resending the full frame.
+    crop_only = frozenset((yolo_material, llm_material)) in {
+        frozenset(("pet", "glass")),
+        frozenset(("styrofoam", "plastic")),
+    }
+    prediction = _classify_with_prompt(img, bbox, prompt, crop_only=crop_only)
     allowed = {yolo_material, llm_material}
     if prediction is not None and prediction.class_name in allowed:
         return prediction

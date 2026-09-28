@@ -132,8 +132,9 @@ def test_rejection_conflict_recheck_accepts_only_the_two_candidates(monkeypatch)
     )
     captured = {}
 
-    def fake_classify(_img, _bbox, prompt, **_kwargs):
+    def fake_classify(_img, _bbox, prompt, **kwargs):
         captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
         return fluorescent
 
     monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
@@ -147,3 +148,35 @@ def test_rejection_conflict_recheck_accepts_only_the_two_candidates(monkeypatch)
     assert result == fluorescent
     assert "fluorescent or plastic" in captured["prompt"]
     assert "smooth round diffuser" in captured["prompt"]
+    assert captured["kwargs"]["crop_only"] is False
+
+
+def test_pet_glass_conflict_uses_manufacturing_cues_and_crop_only(monkeypatch):
+    pet = local_llm.LocalLLMPrediction(
+        class_id=1,
+        class_name="pet",
+        confidence=0.95,
+        has_label=True,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    captured = {}
+
+    def fake_classify(_img, _bbox, prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        return pet
+
+    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
+    result = local_llm.reclassify_rejection_conflict(
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        [10.0, 10.0, 90.0, 90.0],
+        "pet",
+        "glass",
+    )
+
+    assert result == pet
+    assert "threaded neck or collar" in captured["prompt"]
+    assert "PSP specifically means foamed polystyrene" in captured["prompt"]
+    assert captured["kwargs"]["crop_only"] is True

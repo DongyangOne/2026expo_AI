@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     LOCAL_LLM_FULL_IMAGE_SIDE: int = 768
     LOCAL_LLM_MAX_IMAGE_SIDE: int = 640
     LOCAL_LLM_MAX_IMAGE_BYTES: int = 1_500_000
+    # A very light item that YOLO already localised as vinyl can use the
+    # constrained vinyl/plastic Vision LLM prompt immediately.  This retains
+    # LLM authority while avoiding a redundant generic pass on thin bags.
+    LOCAL_LLM_VINYL_SPECIALIST_MAX_WEIGHT_G: float = 5.0
+    LOCAL_LLM_VINYL_SPECIALIST_MIN_YOLO_CONFIDENCE: float = 0.50
 
     @field_validator("LOCAL_LLM_MODE")
     @classmethod
