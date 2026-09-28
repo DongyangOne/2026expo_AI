@@ -53,6 +53,8 @@ _PLASTIC_CLASS_ID = 3
 _PET_MODEL_CLASS_ID = 1
 _CAN_MODEL_CLASS_ID = 0
 _VINYL_MODEL_CLASS_ID = 5
+_REJECTION_MODEL_CLASS_IDS = {4, 6, 7, 8}
+_REJECTION_RECHECK_YOLO_CONFIDENCE = 0.85
 
 
 def _bbox_iou(first: list[float], second: list[float]) -> float:
@@ -323,6 +325,7 @@ async def run(
             and llm_prediction.is_single_primary_item
             and llm_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
         ):
+            rejection_conflict_resolved = False
             if yolo_class_id == _VINYL_MODEL_CLASS_ID and llm_prediction.class_name == "plastic":
                 recheck_started_at = perf_counter()
                 recheck_prediction = await loop.run_in_executor(
@@ -340,6 +343,34 @@ async def run(
                     and recheck_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
                 ):
                     llm_prediction = recheck_prediction
+            if (
+                yolo_class_id in _REJECTION_MODEL_CLASS_IDS
+                and yolo_confidence >= _REJECTION_RECHECK_YOLO_CONFIDENCE
+                and llm_prediction.class_id not in _REJECTION_MODEL_CLASS_IDS
+            ):
+                yolo_material = _CLASS_BY_ID[yolo_class_id].value
+                conflict_started_at = perf_counter()
+                conflict_prediction = await loop.run_in_executor(
+                    _executor,
+                    local_llm.reclassify_rejection_conflict,
+                    img,
+                    bbox,
+                    yolo_material,
+                    llm_prediction.class_name,
+                )
+                logger.info(
+                    "NAS LLM rejection conflict 재판정 시간: client_id=%s llm_ms=%.1f resolved=%s",
+                    client_id,
+                    (perf_counter() - conflict_started_at) * 1000,
+                    conflict_prediction.class_name if conflict_prediction is not None else None,
+                )
+                if (
+                    conflict_prediction is not None
+                    and conflict_prediction.is_single_primary_item
+                    and conflict_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
+                ):
+                    llm_prediction = conflict_prediction
+                    rejection_conflict_resolved = True
             if llm_prediction.has_foreign_material:
                 foreign_started_at = perf_counter()
                 foreign_recheck = await loop.run_in_executor(
@@ -384,7 +415,15 @@ async def run(
             local_llm.record_primary(
                 bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
                 prediction=llm_prediction, selected=True,
-                reason=("vinyl_plastic_recheck" if yolo_class_id == _VINYL_MODEL_CLASS_ID else "accepted"),
+                reason=(
+                    "rejection_conflict_recheck"
+                    if rejection_conflict_resolved
+                    else (
+                        "vinyl_plastic_recheck"
+                        if yolo_class_id == _VINYL_MODEL_CLASS_ID
+                        else "accepted"
+                    )
+                ),
                 client_id=client_id,
             )
         else:

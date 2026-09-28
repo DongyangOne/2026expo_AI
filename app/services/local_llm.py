@@ -92,6 +92,18 @@ Set has_foreign_material=true only if another material is physically attached to
 If the evidence is ambiguous, lower confidence rather than defaulting to plastic.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
+_REJECTION_CONFLICT_PROMPT = """Re-evaluate the ONE primary disposal item because two visual classifiers disagree.
+Choose exactly one of these two materials: {yolo_material} or {llm_material}.
+Do not blindly trust either prior classifier; inspect the complete frame and padded target crop.
+Safety-specific visual rules:
+- fluorescent means any complete discarded electric lamp or bulb routed to lamp rejection, including globe, LED, incandescent-style, compact fluorescent, or tube lamps. A smooth round diffuser does not make a complete lamp plastic.
+- styrofoam includes lightweight molded expanded-polystyrene food trays, including smooth black trays with subtle beads, molded ribs, or embossed material marks.
+- glass requires a thick rigid glass wall or base and glass-like reflections; glossy, transparent, tinted, or amber plastic alone is not glass.
+- battery requires visible battery-cell, terminal, pack, or battery-label evidence.
+- plastic is an ordinary rigid molded polymer item and must not be chosen for a complete lamp or molded foam tray.
+Ignore hands, the bin, fixtures, cables, floor, and background. If uncertain, lower confidence.
+Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
 @dataclass(frozen=True)
 class LocalLLMPrediction:
     class_id: int
@@ -235,6 +247,31 @@ def reclassify_vinyl_plastic(
     if prediction is not None:
         logger.warning(
             "NAS local LLM vinyl/plastic recheck returned invalid material: %s",
+            prediction.class_name,
+        )
+    return None
+
+
+def reclassify_rejection_conflict(
+    img: np.ndarray,
+    bbox: list[float],
+    yolo_material: str,
+    llm_material: str,
+) -> LocalLLMPrediction | None:
+    """Adjudicate a high-confidence YOLO rejection versus a benign LLM result."""
+    if yolo_material not in CLASS_ID_BY_NAME or llm_material not in CLASS_ID_BY_NAME:
+        return None
+    prompt = _REJECTION_CONFLICT_PROMPT.format(
+        yolo_material=yolo_material,
+        llm_material=llm_material,
+    )
+    prediction = _classify_with_prompt(img, bbox, prompt)
+    allowed = {yolo_material, llm_material}
+    if prediction is not None and prediction.class_name in allowed:
+        return prediction
+    if prediction is not None:
+        logger.warning(
+            "NAS local LLM rejection-conflict recheck returned invalid material: %s",
             prediction.class_name,
         )
     return None

@@ -117,3 +117,32 @@ def test_foreign_material_recheck_uses_only_target_crop(monkeypatch):
     )
     assert len(images) == 1
     assert "Background objects are not foreign material" in local_llm._PROMPT
+
+
+def test_rejection_conflict_recheck_accepts_only_the_two_candidates(monkeypatch):
+    fluorescent = local_llm.LocalLLMPrediction(
+        class_id=8,
+        class_name="fluorescent",
+        confidence=0.96,
+        has_label=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    captured = {}
+
+    def fake_classify(_img, _bbox, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return fluorescent
+
+    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
+    result = local_llm.reclassify_rejection_conflict(
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        [0.0, 0.0, 100.0, 100.0],
+        "fluorescent",
+        "plastic",
+    )
+
+    assert result == fluorescent
+    assert "fluorescent or plastic" in captured["prompt"]
+    assert "smooth round diffuser" in captured["prompt"]
