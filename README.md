@@ -61,6 +61,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 Swagger: `http://localhost:8000/docs`
 OpenAPI JSON: `http://localhost:8000/openapi.json`
+운영 구성·검증 수치·시연 게이트: [AI 구성·정확도 기준](docs/ACCURACY_AND_ARCHITECTURE.md)
 
 ## 필수 환경 변수
 
