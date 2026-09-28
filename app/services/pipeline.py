@@ -22,6 +22,7 @@
 
 import asyncio
 import logging
+from dataclasses import replace
 from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -339,6 +340,33 @@ async def run(
                     and recheck_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
                 ):
                     llm_prediction = recheck_prediction
+            if llm_prediction.has_foreign_material:
+                foreign_started_at = perf_counter()
+                foreign_recheck = await loop.run_in_executor(
+                    _executor,
+                    local_llm.recheck_foreign_material,
+                    img,
+                    bbox,
+                    llm_prediction.class_name,
+                )
+                logger.info(
+                    "NAS LLM 외부 이물질 crop 재판정 시간: client_id=%s llm_ms=%.1f resolved=%s",
+                    client_id,
+                    (perf_counter() - foreign_started_at) * 1000,
+                    (
+                        foreign_recheck.has_foreign_material
+                        if foreign_recheck is not None else None
+                    ),
+                )
+                if (
+                    foreign_recheck is not None
+                    and foreign_recheck.is_single_primary_item
+                    and foreign_recheck.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
+                ):
+                    llm_prediction = replace(
+                        llm_prediction,
+                        has_foreign_material=foreign_recheck.has_foreign_material,
+                    )
             if llm_prediction.class_name == "general_waste":
                 local_llm.record_primary(
                     bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,

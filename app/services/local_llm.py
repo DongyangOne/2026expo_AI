@@ -91,6 +91,12 @@ Set has_foreign_material=true only if another material is physically attached to
 If the evidence is ambiguous, lower confidence rather than defaulting to plastic.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
+_FOREIGN_MATERIAL_PROMPT = """Recheck only whether a different-material contaminant is physically attached to, inside, or mixed with the primary {material} item in this crop.
+Keep material={material}. Use only the target crop for this recheck.
+A hand holding the item, the bin fixture or clamp, background objects, shadows, printed ink or graphics, and the item's own same-material pull tab or cap are NEVER foreign material.
+Set has_foreign_material=true only for a real different-material attachment, content, or mixture that must be removed before disposal.
+Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
 
 @dataclass(frozen=True)
 class LocalLLMPrediction:
@@ -139,11 +145,18 @@ def _crop_as_jpeg(img: np.ndarray, bbox: list[float]) -> str | None:
     return _encode_as_jpeg(img[y1:y2, x1:x2], settings.LOCAL_LLM_MAX_IMAGE_SIDE)
 
 
-def _images_as_jpeg(img: np.ndarray, bbox: list[float]) -> list[str]:
+def _images_as_jpeg(
+    img: np.ndarray, bbox: list[float], *, crop_only: bool = False,
+) -> list[str]:
     """Return full-frame context followed by the target crop when it is distinct."""
-    full_frame = _encode_as_jpeg(img, settings.LOCAL_LLM_FULL_IMAGE_SIDE)
     crop = _crop_as_jpeg(img, bbox)
-    if full_frame is None or crop is None:
+    if crop is None:
+        return []
+    if crop_only:
+        return [crop]
+
+    full_frame = _encode_as_jpeg(img, settings.LOCAL_LLM_FULL_IMAGE_SIDE)
+    if full_frame is None:
         return []
 
     height, width = img.shape[:2]
@@ -178,12 +191,12 @@ def _parse(content: str) -> LocalLLMPrediction:
 
 
 def _classify_with_prompt(
-    img: np.ndarray, bbox: list[float], prompt: str,
+    img: np.ndarray, bbox: list[float], prompt: str, *, crop_only: bool = False,
 ) -> LocalLLMPrediction | None:
     """Synchronously query local Ollama; callers run this outside the event loop."""
     if not enabled():
         return None
-    images = _images_as_jpeg(img, bbox)
+    images = _images_as_jpeg(img, bbox, crop_only=crop_only)
     if not images:
         return None
     headers = {"Content-Type": "application/json"}
@@ -228,6 +241,34 @@ def reclassify_vinyl_plastic(
     if prediction is not None:
         logger.warning(
             "NAS local LLM vinyl/plastic recheck returned invalid material: %s",
+            prediction.class_name,
+        )
+    return None
+
+
+def recheck_foreign_material(
+    img: np.ndarray, bbox: list[float], material: str,
+) -> LocalLLMPrediction | None:
+    """Recheck a possible contaminant using only the target crop.
+
+    Full-frame context helps material recognition but can make a fixed camera
+    fixture look attached to the item.  This second pass is intentionally
+    conditional and crop-only, so normal requests do not pay its latency.
+    """
+    if material not in CLASS_ID_BY_NAME:
+        return None
+    prediction = _classify_with_prompt(
+        img,
+        bbox,
+        _FOREIGN_MATERIAL_PROMPT.format(material=material),
+        crop_only=True,
+    )
+    if prediction is not None and prediction.class_name == material:
+        return prediction
+    if prediction is not None:
+        logger.warning(
+            "NAS local LLM foreign-material recheck changed material: %s -> %s",
+            material,
             prediction.class_name,
         )
     return None

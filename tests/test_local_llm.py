@@ -97,3 +97,16 @@ def test_full_frame_fallback_is_not_duplicated(monkeypatch):
         np.zeros((200, 300, 3), dtype=np.uint8), [0, 0, 300, 200],
     )
     assert len(images) == 1
+
+
+def test_foreign_material_recheck_uses_only_target_crop(monkeypatch):
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_FULL_IMAGE_SIDE", 64)
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_SIDE", 64)
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_BYTES", 100_000)
+    images = local_llm._images_as_jpeg(
+        np.zeros((200, 300, 3), dtype=np.uint8),
+        [50, 40, 250, 180],
+        crop_only=True,
+    )
+    assert len(images) == 1
+    assert "bin fixture or clamp" in local_llm._FOREIGN_MATERIAL_PROMPT
