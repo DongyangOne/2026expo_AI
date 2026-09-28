@@ -70,10 +70,14 @@ LOCAL_LLM_MODE=primary
 # API-key 인증이 적용된 공개 TLS gateway. Ollama 원 포트는 공개하지 않는다.
 LOCAL_LLM_BASE_URL=https://llm.naco.kro.kr
 LOCAL_LLM_API_KEY=replace-me
-LOCAL_LLM_MODEL=qwen3.5:9b-q4_K_M
+LOCAL_LLM_MODEL=minicpm-v4.5:8b
 LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false
 SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result
 ```
+
+YOLO는 대상 위치를 찾고, Vision LLM은 영문 분류 기준과 함께 전체 프레임(형태·장면) 및
+패딩된 crop(재질·세부)을 입력받아 최종 품목과 상태를 판정합니다. YOLO 미감지 시에는
+전체 프레임 한 장으로 보수적으로 재판정합니다.
 
 전체 설정 예시는 [.env.example](.env.example)에 있습니다. 실제 API key와 gateway 인증값은
 Git에 넣지 않습니다.

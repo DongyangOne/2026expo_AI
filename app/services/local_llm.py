@@ -50,25 +50,46 @@ _SCHEMA = {
     },
 }
 
-_PROMPT = """You classify exactly one item in this image for a waste-sorting bin.
-The image is normally a YOLO crop; it can be the full camera frame only when YOLO found no object.
-Choose only one material from: can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent, general_waste.
-Choose general_waste only when the primary item itself is ordinary non-recyclable trash, for example a loose disposable straw, used tissue, food waste, or a contaminated mixed-material item.
-Treat a cafe beverage cup as plastic after its straw and cup holder are removed. Treat a loose cup holder as paper.
-Set has_foreign_material=true only when another material is physically attached to, inside, or mixed with the primary item.
-Do not infer foreign material from the surrounding scene: a hand, camera fixture, support, cable, tray, or any unrelated background visible in the crop is not foreign material unless it is attached to or inside the item.
-If a recyclable cup or container has a straw, cup holder, paper sleeve, or another different-material attachment, choose the recyclable main material and set has_foreign_material=true.
-Do not classify a loose straw as plastic just because it is made of plastic.
-has_label means a removable recycling label is still attached. is_dented means a can or PET bottle is compressed.
-Return only JSON matching the supplied schema; do not add explanation."""
+_PROMPT = """Act as the final visual inspector for a Korean smart waste-sorting bin.
+Classify the ONE primary disposal item by its physical material and form, not by the product printed on it.
 
-_VINYL_PLASTIC_PROMPT = """Recheck this one primary item only for a waste-sorting bin.
-Choose exactly one material: vinyl or plastic.
-Choose vinyl for a thin, flexible film, bag, wrapper, or pouch. Choose plastic for a rigid bottle, cup, lid, tray, or container.
-Do not use the surrounding scene as evidence. A hand, fixture, support, cable, tray, or background is not part of the item.
+Image usage:
+- Image 1 is the complete camera frame and provides overall shape and scene context.
+- Image 2, when present, is the padded YOLO crop and provides surface and material detail.
+- The crop is authoritative for which item to inspect. Use the full frame only to recover its complete shape and context.
+- Ignore the bin tray, floor, background, shadows, hands, fixtures, cables, and objects that are not attached to the primary item.
+
+Choose exactly one material:
+- can: metal beverage or food can.
+- pet: transparent or colored PET beverage bottle. Do not use for rigid cups, lids, trays, or non-bottle containers.
+- paper: paper, cardboard, carton, paper cup, or a loose paper cup sleeve/holder.
+- plastic: rigid polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, or container.
+- styrofoam: expanded polystyrene foam with a visibly foamed/beaded structure.
+- vinyl: thin flexible film, bag, wrapper, or pouch that bends, folds, wrinkles, or crumples. Never call flexible film rigid plastic merely because both are polymers.
+- glass: glass bottle, jar, or glass object.
+- battery: household battery or battery pack.
+- fluorescent: fluorescent tube or fluorescent lamp/bulb; do not use for ordinary LED products.
+- general_waste: a loose straw, used tissue, food waste, hygiene waste, or another ordinary non-recyclable item outside the nine recyclable classes.
+
+State rules:
+- A cafe cup is plastic only after its loose straw and paper sleeve/holder are removed. A loose straw is general_waste; a loose sleeve/holder is paper.
+- has_foreign_material=true only when a different material is physically attached to, inside, or mixed with the primary item. Background objects are not foreign material.
+- has_label=true only when a removable recycling label remains attached to a plastic/PET container.
+- is_dented=true only when a can or PET beverage bottle is visibly compressed enough for disposal.
+- is_single_primary_item=false when multiple separate disposal items are presented together.
+- If visual evidence is genuinely ambiguous, lower confidence instead of defaulting to plastic or paper.
+
+Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
+_VINYL_PLASTIC_PROMPT = """Re-evaluate only the primary disposal item as either vinyl or plastic.
+Image 1 is the complete camera frame. Image 2, when present, is the padded YOLO crop and identifies the target item.
+Choose vinyl for thin flexible film, a bag, wrapper, or pouch that bends, folds, wrinkles, or crumples.
+Choose plastic only for a rigid bottle, cup, lid, tray, tub, or container that keeps its shape.
+Judge physical flexibility and three-dimensional form, not color, transparency, printed branding, or the fact that both materials are polymers.
+Ignore the bin tray, floor, background, shadows, hands, fixtures, and anything not attached to the target.
 Set has_foreign_material=true only if another material is physically attached to, inside, or mixed with the primary item.
-has_label means a removable recycling label is still attached. is_dented means a can or PET bottle is compressed.
-Return only JSON matching the supplied schema; do not add explanation."""
+If the evidence is ambiguous, lower confidence rather than defaulting to plastic.
+Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
 
 @dataclass(frozen=True)
@@ -93,24 +114,45 @@ def primary_enabled() -> bool:
     return enabled() and settings.LOCAL_LLM_MODE == "primary"
 
 
+def _encode_as_jpeg(img: np.ndarray, max_side: int) -> str | None:
+    if img.size == 0:
+        return None
+    longest = max(img.shape[:2])
+    if longest > max_side:
+        scale = max_side / longest
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    for quality in (90, 80, 70, 60):
+        ok, encoded = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if ok and len(encoded) <= settings.LOCAL_LLM_MAX_IMAGE_BYTES:
+            return base64.b64encode(encoded.tobytes()).decode("ascii")
+    return None
+
+
 def _crop_as_jpeg(img: np.ndarray, bbox: list[float]) -> str | None:
     height, width = img.shape[:2]
     x1, y1, x2, y2 = bbox
     box_w, box_h = x2 - x1, y2 - y1
-    x1 = max(0, int(x1 - box_w * 0.08)); y1 = max(0, int(y1 - box_h * 0.08))
-    x2 = min(width, int(x2 + box_w * 0.08)); y2 = min(height, int(y2 + box_h * 0.08))
+    x1 = max(0, int(x1 - box_w * 0.10)); y1 = max(0, int(y1 - box_h * 0.10))
+    x2 = min(width, int(x2 + box_w * 0.10)); y2 = min(height, int(y2 + box_h * 0.10))
     if x2 <= x1 or y2 <= y1:
         return None
-    crop = img[y1:y2, x1:x2]
-    longest = max(crop.shape[:2])
-    if longest > settings.LOCAL_LLM_MAX_IMAGE_SIDE:
-        scale = settings.LOCAL_LLM_MAX_IMAGE_SIDE / longest
-        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    for quality in (90, 80, 70, 60):
-        ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if ok and len(encoded) <= settings.LOCAL_LLM_MAX_IMAGE_BYTES:
-            return base64.b64encode(encoded.tobytes()).decode("ascii")
-    return None
+    return _encode_as_jpeg(img[y1:y2, x1:x2], settings.LOCAL_LLM_MAX_IMAGE_SIDE)
+
+
+def _images_as_jpeg(img: np.ndarray, bbox: list[float]) -> list[str]:
+    """Return full-frame context followed by the target crop when it is distinct."""
+    full_frame = _encode_as_jpeg(img, settings.LOCAL_LLM_FULL_IMAGE_SIDE)
+    crop = _crop_as_jpeg(img, bbox)
+    if full_frame is None or crop is None:
+        return []
+
+    height, width = img.shape[:2]
+    x1, y1, x2, y2 = bbox
+    covers_frame = (
+        x1 <= width * 0.02 and y1 <= height * 0.02
+        and x2 >= width * 0.98 and y2 >= height * 0.98
+    )
+    return [full_frame] if covers_frame else [full_frame, crop]
 
 
 def _parse(content: str) -> LocalLLMPrediction:
@@ -141,8 +183,8 @@ def _classify_with_prompt(
     """Synchronously query local Ollama; callers run this outside the event loop."""
     if not enabled():
         return None
-    image = _crop_as_jpeg(img, bbox)
-    if image is None:
+    images = _images_as_jpeg(img, bbox)
+    if not images:
         return None
     headers = {"Content-Type": "application/json"}
     if settings.LOCAL_LLM_API_KEY:
@@ -157,7 +199,7 @@ def _classify_with_prompt(
         "think": False,
         "format": _SCHEMA,
         "options": {"temperature": 0, "num_predict": settings.LOCAL_LLM_MAX_TOKENS},
-        "messages": [{"role": "user", "content": prompt, "images": [image]}],
+        "messages": [{"role": "user", "content": prompt, "images": images}],
     }
     url = settings.LOCAL_LLM_BASE_URL.rstrip("/") + "/api/chat"
     try:

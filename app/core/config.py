@@ -68,21 +68,22 @@ class Settings(BaseSettings):
     LOCAL_LLM_MODE: str = "disabled"  # disabled | shadow | primary
     LOCAL_LLM_BASE_URL: str | None = None
     LOCAL_LLM_API_KEY: str | None = None
-    LOCAL_LLM_MODEL: str = "qwen3.5:9b-q4_K_M"
+    LOCAL_LLM_MODEL: str = "minicpm-v4.5:8b"
     LOCAL_LLM_TIMEOUT_SEC: float = 20.0
     # 모델 cold start가 하드웨어 요청 timeout으로 보이지 않게 NAS 메모리에 유지한다.
     # Ollama API keep_alive 형식(예: "24h", "0")을 그대로 전달한다.
     LOCAL_LLM_KEEP_ALIVE: str = "24h"
     # Vision 모델의 숨은 추론/장문 생성을 막아 shadow 요청이 장시간 점유하지 않게 한다.
-    # 현재 JSON 계약은 일반적으로 80 토큰 이내에 완결된다.
-    LOCAL_LLM_MAX_TOKENS: int = 80
+    # 현재 JSON 계약은 일반적으로 96 토큰 이내에 완결된다.
+    LOCAL_LLM_MAX_TOKENS: int = 96
     LOCAL_LLM_MIN_CONFIDENCE: float = 0.80
     # primary에서는 LLM이 실패·저신뢰·복수 물체라면 기존 YOLO 품목을 답으로 쓰지 않는다.
     # true는 과도기 호환용이며, 기본값 false는 fail-closed GENERAL_WASTE를 반환한다.
     LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO: bool = False
     LOCAL_LLM_SHADOW_LOG_PATH: str = "logs/local_llm_shadow.jsonl"
-    # 448px은 실제 Pi/NAS warm probe에서 640px보다 빠르면서 같은 분류 결과를 유지했다.
-    LOCAL_LLM_MAX_IMAGE_SIDE: int = 448
+    # 새 카메라 환경에서는 전체 프레임(형태/장면)과 crop(재질/세부)을 함께 제공한다.
+    LOCAL_LLM_FULL_IMAGE_SIDE: int = 768
+    LOCAL_LLM_MAX_IMAGE_SIDE: int = 640
     LOCAL_LLM_MAX_IMAGE_BYTES: int = 1_500_000
 
     @field_validator("LOCAL_LLM_MODE")
