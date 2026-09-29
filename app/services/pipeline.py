@@ -56,6 +56,16 @@ _VINYL_MODEL_CLASS_ID = 5
 _GLASS_MODEL_CLASS_ID = 6
 _REJECTION_MODEL_CLASS_IDS = {4, 6, 7, 8}
 _REJECTION_RECHECK_YOLO_CONFIDENCE = 0.85
+_BOUNDED_CONFLICT_PAIRS = {
+    frozenset(("can", "plastic")),
+    frozenset(("plastic", "paper")),
+    frozenset(("plastic", "styrofoam")),
+    frozenset(("vinyl", "paper")),
+    frozenset(("pet", "glass")),
+    frozenset(("glass", "plastic")),
+    frozenset(("fluorescent", "glass")),
+    frozenset(("fluorescent", "plastic")),
+}
 
 
 def _use_vinyl_specialist(
@@ -80,6 +90,12 @@ def _needs_material_conflict_recheck(
     """Return true only for high-confidence, safety-relevant disagreements."""
     if yolo_confidence < _REJECTION_RECHECK_YOLO_CONFIDENCE:
         return False
+    yolo_class = _CLASS_BY_ID.get(yolo_class_id)
+    llm_class = _CLASS_BY_ID.get(llm_class_id)
+    if yolo_class is not None and llm_class is not None:
+        pair = frozenset((yolo_class.value, llm_class.value))
+        if pair in _BOUNDED_CONFLICT_PAIRS:
+            return True
     if yolo_class_id in _REJECTION_MODEL_CLASS_IDS:
         return llm_class_id not in _REJECTION_MODEL_CLASS_IDS
     # A high-confidence bottle proposal being called glass is the observed
@@ -295,7 +311,9 @@ async def run(
         yolo_class_id = None
         yolo_confidence = None
         llm_started_at = perf_counter()
-        llm_prediction = await loop.run_in_executor(_executor, local_llm.classify, img, bbox)
+        llm_prediction = await loop.run_in_executor(
+            _executor, local_llm.classify, img, bbox, weight_g, None, None,
+        )
         logger.info(
             "NAS LLM 전체프레임 fallback 시간: client_id=%s llm_ms=%.1f available=%s",
             client_id,
@@ -351,7 +369,16 @@ async def run(
             local_llm.reclassify_vinyl_plastic
             if vinyl_specialist_used else local_llm.classify
         )
-        llm_prediction = await loop.run_in_executor(_executor, llm_classifier, img, bbox)
+        yolo_material = _CLASS_BY_ID[yolo_class_id].value
+        llm_prediction = await loop.run_in_executor(
+            _executor,
+            llm_classifier,
+            img,
+            bbox,
+            weight_g,
+            yolo_material,
+            yolo_confidence,
+        )
         logger.info(
             "NAS LLM 분류 시간: client_id=%s llm_ms=%.1f available=%s specialist=%s",
             client_id,
@@ -372,7 +399,13 @@ async def run(
             ):
                 recheck_started_at = perf_counter()
                 recheck_prediction = await loop.run_in_executor(
-                    _executor, local_llm.reclassify_vinyl_plastic, img, bbox,
+                    _executor,
+                    local_llm.reclassify_vinyl_plastic,
+                    img,
+                    bbox,
+                    weight_g,
+                    yolo_material,
+                    yolo_confidence,
                 )
                 logger.info(
                     "NAS LLM vinyl/plastic 재판정 시간: client_id=%s llm_ms=%.1f resolved=%s",
@@ -389,7 +422,6 @@ async def run(
             if _needs_material_conflict_recheck(
                 yolo_class_id, yolo_confidence, llm_prediction.class_id,
             ):
-                yolo_material = _CLASS_BY_ID[yolo_class_id].value
                 conflict_started_at = perf_counter()
                 conflict_prediction = await loop.run_in_executor(
                     _executor,
@@ -398,6 +430,8 @@ async def run(
                     bbox,
                     yolo_material,
                     llm_prediction.class_name,
+                    weight_g,
+                    yolo_confidence,
                 )
                 logger.info(
                     "NAS LLM material conflict 재판정 시간: client_id=%s llm_ms=%.1f resolved=%s",

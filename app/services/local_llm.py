@@ -59,6 +59,12 @@ Image usage:
 - The crop is authoritative for which item to inspect. Use the full frame only to recover its complete shape and context.
 - Ignore the bin tray, floor, background, shadows, hands, fixtures, cables, and objects that are not attached to the primary item.
 
+Decision order:
+1. Identify the complete object's form first: bottle, cup, tray, wrapper, can, battery, or lamp.
+2. Inspect observable material cues: wall thickness, molded seams, rolled or crimped rim, foam cells, paper fibers, film wrinkles, heat seals, glass refraction, and electrical base or socket.
+3. Use sensor and detector context only as supporting evidence. Never copy a detector proposal blindly.
+4. Choose the class that best explains the complete object, not just its most visually prominent surface.
+
 Choose exactly one material:
 - can: metal beverage or food can.
 - pet: a lightweight molded plastic bottle with a bottle neck, including transparent, colored, tinted, or opaque PET-style bottles. Do not use for rigid cups, lids, trays, or non-bottle containers. A dark or amber bottle is not glass merely because its color hides transparency; require clear glass cues such as a thick rigid wall/base and glass-like reflections before choosing glass.
@@ -96,6 +102,8 @@ Return only one JSON object matching the supplied schema. Do not add Markdown or
 _REJECTION_CONFLICT_PROMPT = """Re-evaluate the ONE primary disposal item because two visual classifiers disagree.
 Choose exactly one of these two materials: {yolo_material} or {llm_material}.
 Do not blindly trust either prior classifier; inspect the target crop and use manufacturing evidence, not color.
+Pair-specific evidence:
+{pair_rules}
 Safety-specific visual rules:
 - fluorescent means any complete discarded electric lamp or bulb routed to lamp rejection, including globe, LED, incandescent-style, compact fluorescent, or tube lamps. A smooth round diffuser does not make a complete lamp plastic.
 - styrofoam includes lightweight molded expanded-polystyrene food trays, including smooth black trays with subtle beads, molded ribs, or embossed material marks. Embossed PSP, EPS, PS, or foamed-polystyrene markings are strong styrofoam evidence; PSP specifically means foamed polystyrene.
@@ -105,6 +113,71 @@ Safety-specific visual rules:
 - plastic is an ordinary dense rigid molded polymer item and must not be chosen for a complete lamp or a molded foam tray with foam or PSP/EPS evidence.
 Ignore hands, the bin, fixtures, cables, floor, and background. If uncertain, lower confidence.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
+_PAIR_RULES = {
+    frozenset(("can", "plastic")): (
+        "A metal can or tin has a rolled/crimped metal rim, stamped lid or base, "
+        "metal seam, or metallic reflection. A shallow printed food tin remains can "
+        "even when only its circular lid is prominent. Plastic has a molded polymer rim."
+    ),
+    frozenset(("plastic", "paper")): (
+        "Plastic cups and containers have a continuous molded wall, injection-molded rim, "
+        "polymer sheen, or one-piece base. Paper has a rolled paper lip, glued side seam, "
+        "fibrous/torn edge, or layered cardboard construction. Printing alone proves neither."
+    ),
+    frozenset(("plastic", "styrofoam")): (
+        "Styrofoam/PSP/EPS is visibly foamed: porous or cellular texture, thick lightweight "
+        "walls, bead structure, foam fracture, or an explicit PSP/EPS/foamed-PS mark. "
+        "A smooth thin dense molded tray without foam evidence is plastic, even when white or black."
+    ),
+    frozenset(("vinyl", "paper")): (
+        "Vinyl film shows heat-sealed edges, crinkles, flexible folds, stretched highlights, "
+        "or a thin laminated wrapper body. Paper shows fibers, a tear edge, stiffness, creases "
+        "that hold shape, or a paper seam. Printed graphics do not make flexible film paper."
+    ),
+    frozenset(("glass", "plastic")): (
+        "Glass needs a thick rigid base or wall, glass refraction, sharp specular highlights, "
+        "or a heavy bottle/jar construction. Plastic needs thin molded walls, squeeze deformation, "
+        "a polymer seam, or lightweight bottle construction. Use measured weight only as support."
+    ),
+    frozenset(("pet", "glass")): (
+        "PET has thin molded walls, a lightweight threaded neck/collar, shoulder seams, or squeeze "
+        "deformation. Glass has a thick rigid base/wall and glass refraction. Dark tint alone is not glass."
+    ),
+    frozenset(("fluorescent", "glass")): (
+        "Any complete electric bulb or lamp with a screw/bayonet base, socket, electrodes, tube, "
+        "or lamp housing is fluorescent in this product taxonomy. Its glass envelope is only a component."
+    ),
+    frozenset(("fluorescent", "plastic")): (
+        "Any complete electric bulb or lamp with an electrical base, socket, LED housing, tube, "
+        "or diffuser is fluorescent in this product taxonomy, even when its diffuser is plastic."
+    ),
+}
+
+
+def _with_runtime_context(
+    prompt: str,
+    weight_g: float | None = None,
+    yolo_material: str | None = None,
+    yolo_confidence: float | None = None,
+) -> str:
+    """Attach non-authoritative sensor/detector hints to an internal LLM prompt."""
+    context = [
+        "Runtime evidence (supporting hints, never ground truth):",
+        (
+            f"- Measured scale weight: {weight_g:.2f} g. The value may include residue or "
+            "contents; use it only when it is physically consistent with the visible object's size."
+            if weight_g is not None
+            else "- Measured scale weight: unavailable."
+        ),
+        (
+            f"- YOLO proposal: {yolo_material} at confidence {yolo_confidence:.4f}. "
+            "YOLO mainly localizes the target and may be wrong on a new camera domain."
+            if yolo_material is not None and yolo_confidence is not None
+            else "- YOLO proposal: unavailable; judge the full visible item."
+        ),
+    ]
+    return prompt + "\n\n" + "\n".join(context)
 
 @dataclass(frozen=True)
 class LocalLLMPrediction:
@@ -234,16 +307,32 @@ def _classify_with_prompt(
         return None
 
 
-def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
+def classify(
+    img: np.ndarray,
+    bbox: list[float],
+    weight_g: float | None = None,
+    yolo_material: str | None = None,
+    yolo_confidence: float | None = None,
+) -> LocalLLMPrediction | None:
     """Classify a YOLO crop or a full-frame fallback."""
-    return _classify_with_prompt(img, bbox, _PROMPT)
+    prompt = _with_runtime_context(
+        _PROMPT, weight_g, yolo_material, yolo_confidence,
+    )
+    return _classify_with_prompt(img, bbox, prompt)
 
 
 def reclassify_vinyl_plastic(
-    img: np.ndarray, bbox: list[float],
+    img: np.ndarray,
+    bbox: list[float],
+    weight_g: float | None = None,
+    yolo_material: str | None = None,
+    yolo_confidence: float | None = None,
 ) -> LocalLLMPrediction | None:
     """Resolve only the flexible-vinyl versus rigid-plastic ambiguity."""
-    prediction = _classify_with_prompt(img, bbox, _VINYL_PLASTIC_PROMPT)
+    prompt = _with_runtime_context(
+        _VINYL_PLASTIC_PROMPT, weight_g, yolo_material, yolo_confidence,
+    )
+    prediction = _classify_with_prompt(img, bbox, prompt)
     if prediction is not None and prediction.class_name in {"vinyl", "plastic"}:
         return prediction
     if prediction is not None:
@@ -259,13 +348,22 @@ def reclassify_rejection_conflict(
     bbox: list[float],
     yolo_material: str,
     llm_material: str,
+    weight_g: float | None = None,
+    yolo_confidence: float | None = None,
 ) -> LocalLLMPrediction | None:
-    """Adjudicate a safety/material conflict between YOLO and the primary LLM."""
+    """Adjudicate a bounded material conflict while keeping the LLM authoritative."""
     if yolo_material not in CLASS_ID_BY_NAME or llm_material not in CLASS_ID_BY_NAME:
         return None
     prompt = _REJECTION_CONFLICT_PROMPT.format(
         yolo_material=yolo_material,
         llm_material=llm_material,
+        pair_rules=_PAIR_RULES.get(
+            frozenset((yolo_material, llm_material)),
+            "Compare the complete object's physical construction and choose only the better-supported candidate.",
+        ),
+    )
+    prompt = _with_runtime_context(
+        prompt, weight_g, yolo_material, yolo_confidence,
     )
     # These two observed hard pairs depend on surface/manufacturing detail.  The
     # padded crop preserves the entire detected item while avoiding unrelated

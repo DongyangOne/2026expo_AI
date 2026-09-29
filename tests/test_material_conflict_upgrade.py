@@ -34,10 +34,13 @@ def _prediction(class_id: int, class_name: str):
     )
 
 
-def test_only_high_confidence_pet_glass_reverse_conflict_is_rechecked():
+def test_high_confidence_bounded_material_conflicts_are_rechecked():
     assert pipeline._needs_material_conflict_recheck(1, 0.96, 6)
     assert not pipeline._needs_material_conflict_recheck(1, 0.84, 6)
-    assert not pipeline._needs_material_conflict_recheck(3, 0.96, 6)
+    assert pipeline._needs_material_conflict_recheck(3, 0.96, 6)
+    assert pipeline._needs_material_conflict_recheck(3, 0.96, 4)
+    assert pipeline._needs_material_conflict_recheck(5, 0.96, 2)
+    assert pipeline._needs_material_conflict_recheck(8, 0.96, 6)
     assert pipeline._needs_material_conflict_recheck(4, 0.91, 3)
 
 

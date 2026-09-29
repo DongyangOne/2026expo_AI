@@ -80,6 +80,34 @@ def test_prompt_defines_material_by_physical_form():
     assert "film sheet draped over any support" in local_llm._VINYL_PLASTIC_PROMPT
 
 
+def test_runtime_context_marks_weight_and_yolo_as_non_authoritative():
+    prompt = local_llm._with_runtime_context(
+        "base prompt", weight_g=12.5, yolo_material="paper", yolo_confidence=0.9732,
+    )
+    assert "Measured scale weight: 12.50 g" in prompt
+    assert "YOLO proposal: paper at confidence 0.9732" in prompt
+    assert "may be wrong on a new camera domain" in prompt
+
+
+def test_classify_passes_runtime_context_to_primary_prompt(monkeypatch):
+    captured = {}
+
+    def fake_classify(_img, _bbox, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return None
+
+    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
+    local_llm.classify(
+        np.zeros((40, 40, 3), dtype=np.uint8),
+        [0.0, 0.0, 40.0, 40.0],
+        7.25,
+        "vinyl",
+        0.91,
+    )
+    assert "Measured scale weight: 7.25 g" in captured["prompt"]
+    assert "YOLO proposal: vinyl at confidence 0.9100" in captured["prompt"]
+
+
 def test_crop_encoding_is_bounded(monkeypatch):
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_SIDE", 64)
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_BYTES", 100_000)
@@ -180,3 +208,35 @@ def test_pet_glass_conflict_uses_manufacturing_cues_and_crop_only(monkeypatch):
     assert "threaded neck or collar" in captured["prompt"]
     assert "PSP specifically means foamed polystyrene" in captured["prompt"]
     assert captured["kwargs"]["crop_only"] is True
+
+
+def test_vinyl_paper_conflict_includes_pair_rules_and_runtime_context(monkeypatch):
+    vinyl = local_llm.LocalLLMPrediction(
+        class_id=5,
+        class_name="vinyl",
+        confidence=0.94,
+        has_label=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    captured = {}
+
+    def fake_classify(_img, _bbox, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return vinyl
+
+    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
+    result = local_llm.reclassify_rejection_conflict(
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        [5.0, 5.0, 95.0, 95.0],
+        "vinyl",
+        "paper",
+        weight_g=2.3,
+        yolo_confidence=0.97,
+    )
+
+    assert result == vinyl
+    assert "heat-sealed edges" in captured["prompt"]
+    assert "Measured scale weight: 2.30 g" in captured["prompt"]
+    assert "YOLO proposal: vinyl at confidence 0.9700" in captured["prompt"]
