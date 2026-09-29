@@ -89,25 +89,6 @@ def test_runtime_context_marks_weight_and_yolo_as_non_authoritative():
     assert "may be wrong on a new camera domain" in prompt
 
 
-def test_classify_passes_runtime_context_to_primary_prompt(monkeypatch):
-    captured = {}
-
-    def fake_classify(_img, _bbox, prompt, **_kwargs):
-        captured["prompt"] = prompt
-        return None
-
-    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
-    local_llm.classify(
-        np.zeros((40, 40, 3), dtype=np.uint8),
-        [0.0, 0.0, 40.0, 40.0],
-        7.25,
-        "vinyl",
-        0.91,
-    )
-    assert "Measured scale weight: 7.25 g" in captured["prompt"]
-    assert "YOLO proposal: vinyl at confidence 0.9100" in captured["prompt"]
-
-
 def test_crop_encoding_is_bounded(monkeypatch):
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_SIDE", 64)
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_BYTES", 100_000)
