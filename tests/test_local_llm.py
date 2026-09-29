@@ -274,7 +274,8 @@ def test_plastic_conflict_uses_larger_detail_crop(monkeypatch, llm_material):
     )
     captured = {}
 
-    def fake_classify(_img, _bbox, _prompt, **kwargs):
+    def fake_classify(_img, _bbox, prompt, **kwargs):
+        captured["prompt"] = prompt
         captured.update(kwargs)
         return plastic
 
@@ -288,6 +289,8 @@ def test_plastic_conflict_uses_larger_detail_crop(monkeypatch, llm_material):
 
     assert result == plastic
     assert captured["crop_max_side"] == 896
+    assert "dense rigid injection-molded or thermoformed" in captured["prompt"]
+    assert captured["crop_only"] is False
 
 
 def test_http_client_is_reused(monkeypatch):

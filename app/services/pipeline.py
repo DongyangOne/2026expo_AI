@@ -56,6 +56,7 @@ _VINYL_MODEL_CLASS_ID = 5
 _GLASS_MODEL_CLASS_ID = 6
 _REJECTION_MODEL_CLASS_IDS = {4, 6, 7, 8}
 _REJECTION_RECHECK_YOLO_CONFIDENCE = 0.85
+_PLASTIC_RECHECK_YOLO_CONFIDENCE = 0.95
 _BOUNDED_CONFLICT_PAIRS = {
     frozenset(("can", "plastic")),
     frozenset(("plastic", "paper")),
@@ -94,6 +95,11 @@ def _needs_material_conflict_recheck(
     llm_class = _CLASS_BY_ID.get(llm_class_id)
     if yolo_class is not None and llm_class is not None:
         pair = frozenset((yolo_class.value, llm_class.value))
+        if (
+            yolo_class is WasteClass.PLASTIC
+            and llm_class in {WasteClass.PAPER, WasteClass.STYROFOAM}
+        ):
+            return yolo_confidence >= _PLASTIC_RECHECK_YOLO_CONFIDENCE
         if pair in _BOUNDED_CONFLICT_PAIRS:
             return True
     if yolo_class_id in _REJECTION_MODEL_CLASS_IDS:

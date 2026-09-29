@@ -106,6 +106,17 @@ Set has_foreign_material=true only if another material is physically attached to
 If the evidence is ambiguous, lower confidence rather than defaulting to plastic.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
+_PLASTIC_MATERIAL_PROMPT = """Act as a material specialist for one disposal item.
+Choose exactly one: plastic, paper, or styrofoam.
+
+Use physical construction rather than color or product type:
+- plastic includes dense rigid injection-molded or thermoformed cups, tubs, divided food trays, inserts, bottles, plant pots, and packaging. Thin rigid walls, continuous molded rims, ribs, cavities, seams, and PP/PET/PE/PS recycling marks support plastic. A white opaque object is not paper or foam merely because it is white.
+- styrofoam means expanded or foamed polystyrene. Require visible bead/cell/porous texture, a foam fracture, unusually thick lightweight foam walls, or an EPS/PSP/foamed-PS mark. A smooth dense molded tray or insert without foam evidence is plastic.
+- paper requires fibrous, layered, folded, rolled-rim, glued-seam, cardboard, or torn-paper evidence. Printing or a matte white surface alone does not make an item paper.
+
+Image 1 is the full frame; Image 2, when present, is the target crop. Ignore the ground and background. If uncertain, lower confidence rather than guessing from color.
+Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
 _REJECTION_CONFLICT_PROMPT = """Re-evaluate the ONE primary disposal item because two visual classifiers disagree.
 Choose exactly one of these two materials: {yolo_material} or {llm_material}.
 Do not blindly trust either prior classifier; inspect the target crop and use manufacturing evidence, not color.
@@ -378,7 +389,15 @@ def reclassify_rejection_conflict(
     if yolo_material not in CLASS_ID_BY_NAME or llm_material not in CLASS_ID_BY_NAME:
         return None
     pair = frozenset((yolo_material, llm_material))
-    if (yolo_material, llm_material) in _FULL_FRAME_REASONING_DIRECTIONS:
+    plastic_detail_recheck = (
+        yolo_material == "plastic" and llm_material in {"paper", "styrofoam"}
+    )
+    if plastic_detail_recheck:
+        # This replaces the existing second pass rather than adding a third call.
+        # It is selected only behind the high-confidence detector gate in pipeline.py.
+        prompt = _PLASTIC_MATERIAL_PROMPT
+        crop_only = False
+    elif (yolo_material, llm_material) in _FULL_FRAME_REASONING_DIRECTIONS:
         # These pairs need the complete silhouette and the richer taxonomy.
         # Keep this prompt out of the normal path because applying it globally
         # over-calls paper/foam on rigid plastic trays.
@@ -400,9 +419,6 @@ def reclassify_rejection_conflict(
             pair == frozenset(("styrofoam", "plastic"))
             or (yolo_material, llm_material) == ("pet", "glass")
         )
-    plastic_detail_recheck = (
-        yolo_material == "plastic" and llm_material in {"paper", "styrofoam"}
-    )
     prediction = _classify_with_prompt(
         img,
         bbox,

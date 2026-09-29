@@ -42,6 +42,9 @@ def test_high_confidence_bounded_material_conflicts_are_rechecked():
     assert pipeline._needs_material_conflict_recheck(5, 0.96, 2)
     assert pipeline._needs_material_conflict_recheck(8, 0.96, 6)
     assert pipeline._needs_material_conflict_recheck(4, 0.91, 3)
+    assert not pipeline._needs_material_conflict_recheck(3, 0.94, 2)
+    assert not pipeline._needs_material_conflict_recheck(3, 0.94, 4)
+    assert pipeline._needs_material_conflict_recheck(2, 0.99, 3)
 
 
 def test_vinyl_specialist_requires_light_weight_and_detector_support(monkeypatch):
