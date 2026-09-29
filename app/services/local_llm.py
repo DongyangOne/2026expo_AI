@@ -26,6 +26,8 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 _shadow_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-llm-shadow")
 _write_lock = Lock()
+_client_lock = Lock()
+_http_client: httpx.Client | None = None
 
 CLASS_NAMES = (
     "can", "pet", "paper", "plastic", "styrofoam",
@@ -227,7 +229,9 @@ def _encode_as_jpeg(img: np.ndarray, max_side: int) -> str | None:
     return None
 
 
-def _crop_as_jpeg(img: np.ndarray, bbox: list[float]) -> str | None:
+def _crop_as_jpeg(
+    img: np.ndarray, bbox: list[float], *, max_side: int | None = None,
+) -> str | None:
     height, width = img.shape[:2]
     x1, y1, x2, y2 = bbox
     box_w, box_h = x2 - x1, y2 - y1
@@ -235,14 +239,21 @@ def _crop_as_jpeg(img: np.ndarray, bbox: list[float]) -> str | None:
     x2 = min(width, int(x2 + box_w * 0.10)); y2 = min(height, int(y2 + box_h * 0.10))
     if x2 <= x1 or y2 <= y1:
         return None
-    return _encode_as_jpeg(img[y1:y2, x1:x2], settings.LOCAL_LLM_MAX_IMAGE_SIDE)
+    return _encode_as_jpeg(
+        img[y1:y2, x1:x2],
+        max_side or settings.LOCAL_LLM_MAX_IMAGE_SIDE,
+    )
 
 
 def _images_as_jpeg(
-    img: np.ndarray, bbox: list[float], *, crop_only: bool = False,
+    img: np.ndarray,
+    bbox: list[float],
+    *,
+    crop_only: bool = False,
+    crop_max_side: int | None = None,
 ) -> list[str]:
     """Return full-frame context followed by the target crop when it is distinct."""
-    crop = _crop_as_jpeg(img, bbox)
+    crop = _crop_as_jpeg(img, bbox, max_side=crop_max_side)
     if crop is None:
         return []
     if crop_only:
@@ -283,13 +294,30 @@ def _parse(content: str) -> LocalLLMPrediction:
     )
 
 
+def _get_http_client() -> httpx.Client:
+    """Return one process-wide connection pool for the NAS gateway."""
+    global _http_client
+    if _http_client is None:
+        with _client_lock:
+            if _http_client is None:
+                _http_client = httpx.Client(timeout=settings.LOCAL_LLM_TIMEOUT_SEC)
+    return _http_client
+
+
 def _classify_with_prompt(
-    img: np.ndarray, bbox: list[float], prompt: str, *, crop_only: bool = False,
+    img: np.ndarray,
+    bbox: list[float],
+    prompt: str,
+    *,
+    crop_only: bool = False,
+    crop_max_side: int | None = None,
 ) -> LocalLLMPrediction | None:
     """Synchronously query local Ollama; callers run this outside the event loop."""
     if not enabled():
         return None
-    images = _images_as_jpeg(img, bbox, crop_only=crop_only)
+    images = _images_as_jpeg(
+        img, bbox, crop_only=crop_only, crop_max_side=crop_max_side,
+    )
     if not images:
         return None
     headers = {"Content-Type": "application/json"}
@@ -309,9 +337,8 @@ def _classify_with_prompt(
     }
     url = settings.LOCAL_LLM_BASE_URL.rstrip("/") + "/api/chat"
     try:
-        with httpx.Client(timeout=settings.LOCAL_LLM_TIMEOUT_SEC) as client:
-            response = client.post(url, headers=headers, json=body)
-            response.raise_for_status()
+        response = _get_http_client().post(url, headers=headers, json=body)
+        response.raise_for_status()
         payload = response.json()
         return _parse(payload["message"]["content"])
     except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -373,7 +400,19 @@ def reclassify_rejection_conflict(
             pair == frozenset(("styrofoam", "plastic"))
             or (yolo_material, llm_material) == ("pet", "glass")
         )
-    prediction = _classify_with_prompt(img, bbox, prompt, crop_only=crop_only)
+    plastic_detail_recheck = (
+        yolo_material == "plastic" and llm_material in {"paper", "styrofoam"}
+    )
+    prediction = _classify_with_prompt(
+        img,
+        bbox,
+        prompt,
+        crop_only=crop_only,
+        crop_max_side=(
+            settings.LOCAL_LLM_PLASTIC_RECHECK_IMAGE_SIDE
+            if plastic_detail_recheck else None
+        ),
+    )
     allowed = {yolo_material, llm_material}
     if prediction is not None and prediction.class_name in allowed:
         return prediction
@@ -479,4 +518,9 @@ def record_primary(
 
 
 def shutdown() -> None:
+    global _http_client
     _shadow_executor.shutdown(wait=True)
+    with _client_lock:
+        if _http_client is not None:
+            _http_client.close()
+            _http_client = None

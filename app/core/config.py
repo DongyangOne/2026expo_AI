@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     # 새 카메라 환경에서는 전체 프레임(형태/장면)과 crop(재질/세부)을 함께 제공한다.
     LOCAL_LLM_FULL_IMAGE_SIDE: int = 768
     LOCAL_LLM_MAX_IMAGE_SIDE: int = 640
+    # Only bounded plastic-vs-paper/foam rechecks use this larger detail crop.
+    # Keeping it out of the primary path avoids adding latency to every request.
+    LOCAL_LLM_PLASTIC_RECHECK_IMAGE_SIDE: int = 896
     LOCAL_LLM_MAX_IMAGE_BYTES: int = 1_500_000
     # A very light item that YOLO already localised as vinyl can use the
     # constrained vinyl/plastic Vision LLM prompt immediately.  This retains

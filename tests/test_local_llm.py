@@ -58,6 +58,7 @@ def test_local_llm_defaults_bound_json_generation():
     assert settings.LOCAL_LLM_MAX_TOKENS == 96
     assert settings.LOCAL_LLM_FULL_IMAGE_SIDE == 768
     assert settings.LOCAL_LLM_MAX_IMAGE_SIDE == 640
+    assert settings.LOCAL_LLM_PLASTIC_RECHECK_IMAGE_SIDE == 896
     assert settings.LOCAL_LLM_KEEP_ALIVE == "24h"
 
 
@@ -258,3 +259,46 @@ def test_vinyl_paper_conflict_uses_full_form_reasoning(monkeypatch):
     assert "Decision order:" in captured["prompt"]
     assert "Measured scale weight" not in captured["prompt"]
     assert captured["kwargs"]["crop_only"] is False
+
+
+@pytest.mark.parametrize("llm_material", ["paper", "styrofoam"])
+def test_plastic_conflict_uses_larger_detail_crop(monkeypatch, llm_material):
+    plastic = local_llm.LocalLLMPrediction(
+        class_id=3,
+        class_name="plastic",
+        confidence=0.95,
+        has_label=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    captured = {}
+
+    def fake_classify(_img, _bbox, _prompt, **kwargs):
+        captured.update(kwargs)
+        return plastic
+
+    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
+    result = local_llm.reclassify_rejection_conflict(
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        [10.0, 10.0, 90.0, 90.0],
+        "plastic",
+        llm_material,
+    )
+
+    assert result == plastic
+    assert captured["crop_max_side"] == 896
+
+
+def test_http_client_is_reused(monkeypatch):
+    created = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr(local_llm.httpx, "Client", FakeClient)
+    monkeypatch.setattr(local_llm, "_http_client", None)
+
+    assert local_llm._get_http_client() is local_llm._get_http_client()
+    assert created == [{"timeout": local_llm.settings.LOCAL_LLM_TIMEOUT_SEC}]
