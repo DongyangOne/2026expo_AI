@@ -59,12 +59,6 @@ Image usage:
 - The crop is authoritative for which item to inspect. Use the full frame only to recover its complete shape and context.
 - Ignore the bin tray, floor, background, shadows, hands, fixtures, cables, and objects that are not attached to the primary item.
 
-Decision order:
-1. Identify the complete object's form first: bottle, cup, tray, wrapper, can, battery, or lamp.
-2. Inspect observable material cues: wall thickness, molded seams, rolled or crimped rim, foam cells, paper fibers, film wrinkles, heat seals, glass refraction, and electrical base or socket.
-3. Use sensor and detector context only as supporting evidence. Never copy a detector proposal blindly.
-4. Choose the class that best explains the complete object, not just its most visually prominent surface.
-
 Choose exactly one material:
 - can: metal beverage or food can.
 - pet: a lightweight molded plastic bottle with a bottle neck, including transparent, colored, tinted, or opaque PET-style bottles. Do not use for rigid cups, lids, trays, or non-bottle containers. A dark or amber bottle is not glass merely because its color hides transparency; require clear glass cues such as a thick rigid wall/base and glass-like reflections before choosing glass.
@@ -87,6 +81,17 @@ State rules:
 - If visual evidence is genuinely ambiguous, lower confidence instead of defaulting to plastic or paper.
 
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
+_FORM_REASONING_GUIDANCE = """Decision order:
+1. Identify the complete object's form first: bottle, cup, tray, wrapper, can, battery, or lamp.
+2. Inspect observable material cues: wall thickness, molded seams, rolled or crimped rim, foam cells, paper fibers, film wrinkles, heat seals, glass refraction, and electrical base or socket.
+3. Choose the class that best explains the complete object, not just its most visually prominent surface.
+"""
+
+_FORM_REASONING_PROMPT = _PROMPT.replace(
+    "Choose exactly one material:",
+    _FORM_REASONING_GUIDANCE + "\nChoose exactly one material:",
+)
 
 _VINYL_PLASTIC_PROMPT = """Re-evaluate only the primary disposal item as either vinyl or plastic.
 Image 1 is the complete camera frame. Image 2, when present, is the padded YOLO crop and identifies the target item.
@@ -152,6 +157,13 @@ _PAIR_RULES = {
         "Any complete electric bulb or lamp with an electrical base, socket, LED housing, tube, "
         "or diffuser is fluorescent in this product taxonomy, even when its diffuser is plastic."
     ),
+}
+
+_FULL_FRAME_REASONING_DIRECTIONS = {
+    ("glass", "pet"),
+    ("glass", "plastic"),
+    ("vinyl", "paper"),
+    ("styrofoam", "paper"),
 }
 
 
@@ -338,24 +350,29 @@ def reclassify_rejection_conflict(
     """Adjudicate a bounded material conflict while keeping the LLM authoritative."""
     if yolo_material not in CLASS_ID_BY_NAME or llm_material not in CLASS_ID_BY_NAME:
         return None
-    prompt = _REJECTION_CONFLICT_PROMPT.format(
-        yolo_material=yolo_material,
-        llm_material=llm_material,
-        pair_rules=_PAIR_RULES.get(
-            frozenset((yolo_material, llm_material)),
-            "Compare the complete object's physical construction and choose only the better-supported candidate.",
-        ),
-    )
-    prompt = _with_runtime_context(
-        prompt, weight_g, yolo_material, yolo_confidence,
-    )
-    # These two observed hard pairs depend on surface/manufacturing detail.  The
-    # padded crop preserves the entire detected item while avoiding unrelated
-    # scene tokens and is measurably faster than resending the full frame.
-    crop_only = frozenset((yolo_material, llm_material)) in {
-        frozenset(("pet", "glass")),
-        frozenset(("styrofoam", "plastic")),
-    }
+    pair = frozenset((yolo_material, llm_material))
+    if (yolo_material, llm_material) in _FULL_FRAME_REASONING_DIRECTIONS:
+        # These pairs need the complete silhouette and the richer taxonomy.
+        # Keep this prompt out of the normal path because applying it globally
+        # over-calls paper/foam on rigid plastic trays.
+        prompt = _FORM_REASONING_PROMPT
+        crop_only = False
+    else:
+        prompt = _REJECTION_CONFLICT_PROMPT.format(
+            yolo_material=yolo_material,
+            llm_material=llm_material,
+            pair_rules=_PAIR_RULES.get(
+                pair,
+                "Compare the complete object's physical construction and choose only the better-supported candidate.",
+            ),
+        )
+        prompt = _with_runtime_context(
+            prompt, weight_g, yolo_material, yolo_confidence,
+        )
+        crop_only = (
+            pair == frozenset(("styrofoam", "plastic"))
+            or (yolo_material, llm_material) == ("pet", "glass")
+        )
     prediction = _classify_with_prompt(img, bbox, prompt, crop_only=crop_only)
     allowed = {yolo_material, llm_material}
     if prediction is not None and prediction.class_name in allowed:

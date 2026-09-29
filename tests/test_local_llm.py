@@ -78,6 +78,8 @@ def test_prompt_defines_material_by_physical_form():
     assert "heat-sealed edges" in local_llm._PROMPT
     assert "printed flexible squeeze tube" in local_llm._PROMPT
     assert "film sheet draped over any support" in local_llm._VINYL_PLASTIC_PROMPT
+    assert "Decision order:" not in local_llm._PROMPT
+    assert "Decision order:" in local_llm._FORM_REASONING_PROMPT
 
 
 def test_runtime_context_marks_weight_and_yolo_as_non_authoritative():
@@ -160,7 +162,7 @@ def test_rejection_conflict_recheck_accepts_only_the_two_candidates(monkeypatch)
     assert captured["kwargs"]["crop_only"] is False
 
 
-def test_pet_glass_conflict_uses_manufacturing_cues_and_crop_only(monkeypatch):
+def test_pet_glass_conflict_keeps_crop_only_direction(monkeypatch):
     pet = local_llm.LocalLLMPrediction(
         class_id=1,
         class_name="pet",
@@ -187,11 +189,44 @@ def test_pet_glass_conflict_uses_manufacturing_cues_and_crop_only(monkeypatch):
 
     assert result == pet
     assert "threaded neck or collar" in captured["prompt"]
-    assert "PSP specifically means foamed polystyrene" in captured["prompt"]
+    assert "Decision order:" not in captured["prompt"]
     assert captured["kwargs"]["crop_only"] is True
 
 
-def test_vinyl_paper_conflict_includes_pair_rules_and_runtime_context(monkeypatch):
+def test_glass_pet_conflict_uses_full_form_reasoning(monkeypatch):
+    glass = local_llm.LocalLLMPrediction(
+        class_id=6,
+        class_name="glass",
+        confidence=0.95,
+        has_label=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    captured = {}
+
+    def fake_classify(_img, _bbox, prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        return glass
+
+    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
+    result = local_llm.reclassify_rejection_conflict(
+        np.zeros((100, 100, 3), dtype=np.uint8),
+        [10.0, 10.0, 90.0, 90.0],
+        "glass",
+        "pet",
+        weight_g=20.0,
+        yolo_confidence=0.97,
+    )
+
+    assert result == glass
+    assert "dark or amber bottle is not glass" in captured["prompt"]
+    assert "Decision order:" in captured["prompt"]
+    assert captured["kwargs"]["crop_only"] is False
+
+
+def test_vinyl_paper_conflict_uses_full_form_reasoning(monkeypatch):
     vinyl = local_llm.LocalLLMPrediction(
         class_id=5,
         class_name="vinyl",
@@ -205,6 +240,7 @@ def test_vinyl_paper_conflict_includes_pair_rules_and_runtime_context(monkeypatc
 
     def fake_classify(_img, _bbox, prompt, **_kwargs):
         captured["prompt"] = prompt
+        captured["kwargs"] = _kwargs
         return vinyl
 
     monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify)
@@ -219,5 +255,6 @@ def test_vinyl_paper_conflict_includes_pair_rules_and_runtime_context(monkeypatc
 
     assert result == vinyl
     assert "heat-sealed edges" in captured["prompt"]
-    assert "Measured scale weight: 2.30 g" in captured["prompt"]
-    assert "YOLO proposal: vinyl at confidence 0.9700" in captured["prompt"]
+    assert "Decision order:" in captured["prompt"]
+    assert "Measured scale weight" not in captured["prompt"]
+    assert captured["kwargs"]["crop_only"] is False
