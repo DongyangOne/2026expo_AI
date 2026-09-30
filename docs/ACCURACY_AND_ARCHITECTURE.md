@@ -1,54 +1,160 @@
-# AI 구성·정확도 기준
+# EXPO AI 구성 및 평가 결과
 
-기준일: 2026-09-29
+기준일: 2026-09-30
 
 ## 운영 구성
 
-1. Pi 카메라와 무게 센서가 `POST /api/v1/detect`로 이미지·무게·`client_id`를 보낸다.
-2. Pi의 `yolo26m_best_ncnn_model`이 단일 투입 물체의 bbox와 9종 후보를 만든다.
-3. NAS Ollama `minicpm-v4.5:8b`가 전체 프레임과 패딩 crop을 같이 보고 최종 품목·라벨·압착·이물질을 판정한다.
-4. YOLO 미감지는 원본 전체 프레임 LLM fallback으로 복구한다.
-5. `vinyl`/`plastic` 충돌과 고신뢰 재질 혼동 쌍은 제한된 2차 Vision LLM 재판정을 사용한다. YOLO·무게 문맥은 이 2차 판정에만 참고 정보로 전달하며 1차 LLM 판정에는 주입하지 않는다.
-6. 규칙 엔진이 무게와 상태를 결합해 `ALLOWED`, `REJECTED`, `GENERAL_WASTE`, `NOT_DETECTED`를 확정한다.
-7. 같은 JSON을 하드웨어에 즉시 응답하고 Spring callback으로 백그라운드 전송한다.
+| 위치 | 모델 | 역할 |
+|---|---|---|
+| Raspberry Pi 5 | `yolo26m_best_ncnn_model` | 물체 위치(`bbox`) 검출, 9종 후보와 신뢰도 생성 |
+| QNAP NAS Ollama | `minicpm-v4.5:8b` | 최종 품목, 라벨, 압착, 외부 이물질 판정 |
+| Raspberry Pi 5 | `multihead.onnx` | 라벨·압착 상태의 기본값 생성 |
+| Raspberry Pi 5 | `verifier_qwen35_mnv3_v1.onnx` | crop 재검증, 저신뢰 보조 판정, 상태 헤드 및 비교 로그 |
 
-`multihead.onnx`와 `verifier_qwen35_mnv3_v1.onnx`는 호환·shadow 경로에 남아 있지만, `LOCAL_LLM_MODE=primary`의 최종 품목 결정 권한은 Vision LLM에 있다.
+운영 모드는 `LOCAL_LLM_MODE=primary`다. 최종 품목은 NAS Vision LLM이 결정하며,
+YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·형식 오류·저신뢰·복수 물체
+판정 시 YOLO 품목으로 대체하지 않고 `GENERAL_WASTE / LOW_CONFIDENCE`를 반환한다.
 
-## 현재 검증 수치
+## 처리 순서
 
-| 평가 | 규모 | 결과 | 해석 |
-|---|---:|---:|---|
-| AIHub 9종 고정 회귀 평가 | 클래스당 30장, 270장 | 255/270, 94.44% | 동일 manifest 재실행; 커밋 `c5347ee`의 배포된 Pi production pipeline → NAS LLM |
-| AIHub 고정 평가 위험 거부품 | 유리·건전지·형광등·스티로폼 120장 | 114/120, 95.00% recall | 기존 86.67%에서 개선되어 최소 게이트 충족 |
-| AIHub 고정 평가 미감지 | 270장 | 0/270, 0.00% | 실행 오류도 0건 |
-| AIHub 고정 평가 응답 시간 | 270요청 | 평균 3.53초, 중앙값 3.16초, p95 5.63초 | 연결 재사용 반영 후 재측정; 최대 7.62초, Spring callback과 HTTP 직렬화는 제외 |
-| AIHub 9종 균형 교차 샘플 | 클래스당 5장, 45장 | 43/45, 95.56% | 현재 Pi API와 NAS LLM을 통과한 end-to-end 편의 샘플 |
-| AIHub 위험 거부품 | 유리·건전지·형광등·스티로폼 20장 | 19/20, 95.00% recall | 고신뢰 YOLO-선행 LLM 충돌 재판정 포함 |
-| 실제 신규 카메라 품목 | 품목 22장 | 22/22, 100% | 2026-09-23 운영 캡처 재생; 클래스 분포는 불균형 |
-| 실제 신규 카메라 미감지 | 품목 22장 | 0/22, 0% | 1g 미만 종이·비닐도 LLM 판정하도록 수정한 후 수치 |
-| 빈 장면 | 1장 | 1/1 `NOT_DETECTED` | 빈 프레임 거부 회귀 확인 |
-| 실제 카메라 응답 시간 | 23요청 | 평균 3.73초, p95 4.85초 | 재판정이 발생한 투명 비닐 2장은 6.88·8.59초 |
-| AIHub 교차 샘플 응답 시간 | 45요청 | 평균 3.38초, p95 3.67초 | 보통 요청은 3초대, 충돌 재판정만 추가 지연 |
-| 구 AIHub 전용 MNV4 | validation 14,728장 | 96.98% | 구 동일 도메인 모델 수치이며 현재 primary 운영 정확도가 아님 |
+1. 하드웨어가 이미지, `client_id`, 선택 항목인 `weight_g`를 `POST /api/v1/detect`로 보낸다.
+2. Pi의 YOLO26m NCNN 모델이 9종 후보와 bbox를 만든다.
+3. bbox가 있으면 전체 프레임과 10% 여백을 둔 crop을 NAS Vision LLM에 전달한다.
+4. bbox가 없으면 원본 전체 프레임을 Vision LLM에 전달한다.
+5. Vision LLM이 품목과 `has_label`, `is_dented`, `has_foreign_material`,
+   `is_single_primary_item`을 JSON으로 반환한다.
+6. 필요한 경우에만 비닐/플라스틱 또는 재질 충돌 2차 판정을 실행한다.
+7. 무게와 상태 규칙을 적용해 `ALLOWED`, `REJECTED`, `GENERAL_WASTE`,
+   `NOT_DETECTED` 중 하나를 결정한다.
+8. 같은 JSON을 하드웨어에 반환하고 Spring callback으로 백그라운드 전송한다.
 
-AIHub 물질 스냅샷은 총 148,706장(`train` 125,457, `val` 23,249)이다. 270장 고정 평가는 기존 45장과 내용 해시가 겹치지 않도록 클래스별 30장을 결정론적으로 뽑았다. 기준 결과는 [기존 AIHub 270장 평가](evaluations/AIHUB_270_2832A2C.md), 선택적 충돌 판정 결과는 [이전 회귀 평가](evaluations/AIHUB_270_AF27C3E.md), 연결 재사용·플라스틱 상세 crop 적용 후 결과는 [최신 재측정](evaluations/AIHUB_270_C5347EE.md)에 있다. 이는 AIHub 교차 도메인 평가이며 신규 카메라 독립 blind 승인을 대신하지 않는다.
+## 모델 입력과 추론 설정
 
-현재 클래스별 recall은 캔 100%, PET 100%, 종이 100%, 플라스틱 76.67%, 스티로폼 90%, 비닐 93.33%, 유리 93.33%, 건전지 100%, 형광등 96.67%다. PET는 외부 계약에서 `plastic / class_id=3`으로 통합해 정답 처리했다. 위험품 합산은 최소 게이트에 도달했지만 플라스틱 recall은 여전히 다음 개선의 최우선 대상이다.
+### YOLO26m
 
-## 시연 게이트
+- 입력 크기: 640px
+- bbox 생성 임계값: `DETECT_CONF=0.25`
+- NMS IoU: `0.70`
+- 내부 클래스: `can`, `pet`, `paper`, `plastic`, `styrofoam`, `vinyl`,
+  `glass`, `battery`, `fluorescent`
+- 내부 `pet / class_id=1`은 외부 응답에서 `plastic / class_id=3`으로 변환한다.
 
-| 지표 | 최소 기준 | 운영 목표 |
+### MiniCPM-V 4.5 8B
+
+- 전체 프레임: 최대 768px
+- bbox crop: 10% 여백, 최대 640px
+- 플라스틱 상세 재판정 crop: 최대 896px
+- 최소 인정 신뢰도: `0.80`
+- `temperature=0`, `think=false`, 최대 출력 96 tokens
+- 모델 상주 시간: 24시간
+- 출력 형식: 품목, 신뢰도, 라벨, 압착, 외부 이물질, 단일 주 물체 여부를 포함한 JSON
+
+## 선택적 2차 판정
+
+일반 요청은 Vision LLM을 한 번 호출한다. 다음 조건에서만 두 번째 판정을 실행한다.
+
+| 조건 | 2차 판정 |
+|---|---|
+| YOLO가 `vinyl`, 1차 LLM이 `plastic` | 얇은 필름·봉투와 단단한 용기를 구분하는 전용 판정 |
+| YOLO `vinyl` 신뢰도 0.50 이상, 무게 5g 이하 | 첫 호출부터 vinyl/plastic 전용 판정 사용 |
+| 고신뢰 YOLO와 LLM이 지정 재질 쌍에서 충돌 | 두 후보만 비교하는 재질 판정 |
+| YOLO `plastic` 신뢰도 0.95 이상, LLM이 `paper` 또는 `styrofoam` | 896px crop을 포함한 플라스틱 재질 판정 |
+| LLM이 외부 이물질을 감지 | 배경과 고정 장치를 제외하기 위한 crop 전용 재확인 |
+
+재질 충돌 판정 대상은 캔/플라스틱, 플라스틱/종이, 플라스틱/스티로폼,
+비닐/종이, PET/유리, 유리/플라스틱, 형광등/유리, 형광등/플라스틱이다.
+
+## 분류 및 상태 규칙
+
+| 품목 | 정상 처리 | 상태 이상 |
+|---|---|---|
+| 캔 | `ALLOWED` | 무게 이상 `EMPTY_CONTENTS`, 미압착 `COMPRESS` |
+| PET병 | 외부 `plastic/3`, 조건 충족 시 `ALLOWED` | `EMPTY_CONTENTS`, `REMOVE_LABEL`, `COMPRESS` |
+| 플라스틱 | `ALLOWED` | `EMPTY_CONTENTS`, `REMOVE_LABEL` |
+| 종이 | `ALLOWED` | `WEIGHT_ANOMALY` |
+| 비닐 | `ALLOWED` | `WEIGHT_ANOMALY` |
+| 유리 | `REJECTED` | `rejection.code=GLASS` |
+| 건전지 | `REJECTED` | `rejection.code=BATTERY` |
+| 형광등·전구 | `REJECTED` | `rejection.code=FLUORESCENT` |
+| 스티로폼 | `REJECTED` | `rejection.code=STYROFOAM` |
+
+허용 품목에 다른 재질이 붙거나 섞여 있으면 `FOREIGN_MATERIAL`을 반환한다.
+여러 조건이 동시에 발생하면 `guidance` 배열에 함께 포함한다.
+
+카페 컵은 빨대와 컵홀더를 제거한 상태에서 재질에 따라 분류한다. 단독 빨대는
+`GENERAL_WASTE`, 단독 컵홀더는 `paper`다. 컵에 빨대나 컵홀더가 붙어 있으면
+컵 품목을 유지하고 `FOREIGN_MATERIAL`을 반환한다.
+
+## 무게 판정
+
+bbox 면적 비율로 물체 크기를 S/M/L로 나누고 품목별 빈 무게에 15g 여유를 더해
+무게 이상을 계산한다. `weight_g`가 없으면 무게 검사를 생략한다.
+
+`primary` 모드에서는 1g 미만의 종이·비닐도 이미지로 판정한다. 1g 하한 가드는
+Vision LLM을 사용하지 않는 기존 추론 경로에만 적용된다.
+
+## 응답과 기록
+
+- `X-Process-Time-Ms`: 이미지 수신부터 최종 AI 판정까지의 시간
+- Pi 로그: YOLO, NAS LLM, 2차 판정, Spring callback 시간을 각각 기록
+- `logs/results.jsonl`: 최종 응답
+- `logs/callbacks.jsonl`: Spring 전송 결과와 재시도 기록
+- `logs/captures/`: 원본 이미지와 요청·판정 JSON
+- capture 기본 보존 기간 90일, 최대 용량 10GB
+- Spring callback은 최대 3회 시도하며 하드웨어 응답과 별도로 실행
+
+## 평가 결과
+
+### AIHub 9종 고정 세트
+
+평가 이미지는 클래스별 30장, 총 270장이다. 입력 무게는 20g으로 고정했고
+Pi의 `pipeline.run`에서 NCNN YOLO와 NAS Vision LLM까지 실행했다. Spring callback은
+평가에서 제외했다.
+
+| 지표 | 결과 |
+|---|---:|
+| 전체 정확도 | 259/270, 95.93% |
+| 위험 거부품 recall | 114/120, 95.00% |
+| 미감지 | 0/270 |
+| 실행 오류 | 0/270 |
+| 평균 응답 시간 | 3.56초 |
+| 중앙값 | 3.17초 |
+| p95 | 6.19초 |
+| 최대 | 7.60초 |
+
+| 클래스 | 정답/전체 | recall |
 |---|---:|---:|
-| 9종 balanced accuracy | 90% | 95% 이상 |
-| 캔·플라스틱·종이·비닐 recall | 각 90% | 각 95% 이상 |
-| 유리·건전지·형광등·스티로폼 거부 recall | 95% | 98% 이상 |
-| 실제 품목 `NOT_DETECTED` | 5% 이하 | 2% 이하 |
-| p95 응답 시간 | 6초 이하 | 4초 이하 |
+| 캔 | 30/30 | 100.00% |
+| PET | 30/30 | 100.00% |
+| 종이 | 30/30 | 100.00% |
+| 플라스틱 | 27/30 | 90.00% |
+| 스티로폼 | 27/30 | 90.00% |
+| 비닐 | 28/30 | 93.33% |
+| 유리 | 28/30 | 93.33% |
+| 건전지 | 30/30 | 100.00% |
+| 형광등 | 29/30 | 96.67% |
 
-현재 고정 평가는 balanced accuracy·위험품 합산 recall·미감지·최소 p95 응답시간 기준을 충족했지만, 플라스틱 recall은 여전히 기준에 미달한다. 따라서 배포 승인 수치로 과장하지 않는다. 최종 승인은 신규 카메라에서 촬영한 독립 9종 균형 세트로 한다. 프롬프트 조정에 사용한 23장과 AIHub 45장·270장은 회귀·교차 점검용이지 최종 blind 증거가 아니다.
+위 표는 2026-09-30 현재 배포 코드의 플라스틱 재질 판정을 포함한 재평가 결과다.
 
-## 남은 검증
+### 신규 카메라 운영 캡처
 
-- 신규 카메라 9종을 클래스당 최소 30장, 총 270장 이상으로 추가 수집해 blind 평가한다.
-- 라벨 유무·압착 유무·이물질·내용물 무게 이상은 별도 균형 상태 세트로 recall을 측정한다.
-- 운영 로그는 자동 정답이 아니며, 오분류 확정 샘플만 다음 평가·학습 후보로 사용한다.
+| 평가 | 결과 |
+|---|---:|
+| 품목 분류 | 22/22 |
+| 품목 미감지 | 0/22 |
+| 빈 장면 | 1/1 `NOT_DETECTED` |
+| 23요청 평균 응답 시간 | 3.73초 |
+| 23요청 p95 | 4.85초 |
+
+운영 캡처 22장은 클래스별 수량이 동일하지 않은 실제 요청 표본이다.
+
+## 평가 자료
+
+- [기준 270장 평가](evaluations/AIHUB_270_2832A2C.md)
+- [선택적 재질 충돌 판정 평가](evaluations/AIHUB_270_AF27C3E.md)
+- [연결 재사용·상세 crop 적용 평가](evaluations/AIHUB_270_C5347EE.md)
+- [2026-09-30 현재 배포 코드 재평가](evaluations/AIHUB_270_CURRENT_20260930.md)
+- [평가 manifest](evaluations/artifacts/aihub_270_2832a2c/manifest.csv)
+
+다음 평가는 새 카메라로 9종을 클래스별 30장씩 촬영하고, 라벨·압착·이물질·내용물은
+각 상태별 이미지 세트로 나누어 측정한다.

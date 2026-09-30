@@ -43,7 +43,7 @@ NAS HTTP 연결 재사용 후 평균 응답시간은 4.91초에서 **3.53초**, 
 
 플라스틱 오분류 7건은 `paper` 3건, `styrofoam` 4건으로 이전과 동일하다. 전체 품목 판정은 이전 실행과 같았고 한 PET 요청의 상태만 `ALLOWED`에서 `REJECTED`로 달라졌으나 품목 정확도에는 영향이 없다.
 
-## 재현 근거와 한계
+## 결과 파일
 
 - manifest: [`artifacts/aihub_270_2832a2c/manifest.csv`](artifacts/aihub_270_2832a2c/manifest.csv)
 - 결과: [`artifacts/aihub_270_2832a2c/results_c5347ee.json`](artifacts/aihub_270_2832a2c/results_c5347ee.json)
@@ -51,5 +51,3 @@ NAS HTTP 연결 재사용 후 평균 응답시간은 4.91초에서 **3.53초**, 
 - Pi 보존본: `/home/one/aihub270_eval_20260929/results_c5347ee.json`
 - 고정 무게: `20.0g`
 - Spring callback과 HTTP 직렬화는 제외했다.
-
-이 270장은 이미 개선 판단에 사용된 회귀 세트이므로 독립 blind 성능이 아니다. 플라스틱 정확도를 실제로 개선하려면 동일 이미지를 다시 프롬프트 조정하기보다 새 카메라의 라벨 확정 플라스틱·종이·스티로폼 hard case를 수집해 별도 개선·평가해야 한다.

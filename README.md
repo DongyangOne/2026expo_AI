@@ -7,6 +7,20 @@
 - 규칙 엔진: 무게·상태 조건을 조합해 `ALLOWED`·`REJECTED`·`GENERAL_WASTE` 결정
 - Spring 콜백: 하드웨어 즉시 응답과 같은 JSON을 백그라운드 전송
 
+## 운영 모델
+
+| 위치 | 모델 | 역할 |
+|---|---|---|
+| Pi5 | `yolo26m_best_ncnn_model` | bbox, 9종 후보, 신뢰도 생성 |
+| NAS Ollama | `minicpm-v4.5:8b` | 최종 품목·라벨·압착·외부 이물질 판정 |
+| Pi5 | `multihead.onnx` | 라벨·압착 상태 기본값 |
+| Pi5 | `verifier_qwen35_mnv3_v1.onnx` | crop 보조 판정과 비교 로그 |
+
+일반 요청은 전체 프레임과 YOLO crop을 Vision LLM에 함께 전달합니다. YOLO 미감지 시에는
+전체 프레임으로 다시 판정하고, 비닐/플라스틱 또는 고신뢰 재질 충돌에만 제한적으로 2차 판정을
+실행합니다. 세부 흐름과 평가 수치는 [EXPO AI 구성 및 평가 결과](docs/ACCURACY_AND_ARCHITECTURE.md)에
+정리돼 있습니다.
+
 ## API
 
 `POST /api/v1/detect` (`multipart/form-data`)
@@ -32,7 +46,7 @@
 PET는 외부 계약에서 항상 `class_id=3`, `class_name=plastic`으로 통합합니다.
 
 `LOCAL_LLM_MODE=primary`에서 LLM이 장애·JSON 오류·저신뢰·복수 물체를 반환하면 YOLO 품목으로
-대체하지 않습니다. 기본 설정 `LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false`에서는
+대체하지 않습니다. 운영 설정 `LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false`에서는
 `GENERAL_WASTE / LOW_CONFIDENCE`로 fail-closed 처리합니다. 단독 빨대처럼 LLM이 일반폐기물로
 확정한 물체는 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다. 재활용품에 붙은 빨대·종이띠 등
 다른 재질 부착물은 최종 품목을 유지한 `REJECTED / FOREIGN_MATERIAL`입니다.
@@ -78,7 +92,7 @@ SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result
 
 YOLO는 대상 위치를 찾고, Vision LLM은 영문 분류 기준과 함께 전체 프레임(형태·장면) 및
 패딩된 crop(재질·세부)을 입력받아 최종 품목과 상태를 판정합니다. YOLO 미감지 시에는
-전체 프레임 한 장으로 보수적으로 재판정합니다.
+전체 프레임으로 판정합니다.
 
 전체 설정 예시는 [.env.example](.env.example)에 있습니다. 실제 API key와 gateway 인증값은
 Git에 넣지 않습니다.
@@ -108,8 +122,8 @@ Git에 넣지 않습니다.
 ## 로그와 캡처
 
 `LOG_RESULTS=true`이면 `logs/results.jsonl`에 결과를 기록합니다. `CAPTURE_REQUESTS=true`이면
-`logs/captures/`에 원본 이미지와 판정 JSON을 저장합니다. 이 데이터는 재학습 후보일 뿐 자동 정답이나
-자동 배포 근거가 아닙니다.
+`logs/captures/`에 원본 이미지와 판정 JSON을 저장합니다. 저장된 이미지는 검수 후 평가·학습 데이터로
+사용할 수 있습니다.
 
 ## 검증과 배포
 

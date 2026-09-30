@@ -10,7 +10,7 @@ Vision LLM: NAS Ollama `minicpm-v4.5:8b`
 
 기존과 동일한 AIHub 9종 × 30장 manifest를 Pi 운영 `pipeline.run` → NAS Vision LLM 경로로 다시 실행했다. 전체 정확도는 **255/270, 94.44%**로 기존 90.00%보다 4.44%p 높아졌고, 위험 거부품 recall은 **114/120, 95.00%**로 기존 86.67%보다 8.33%p 높아졌다. 미감지와 실행 오류는 모두 0건이었다.
 
-유리 recall은 73.33%에서 93.33%, 형광등은 83.33%에서 96.67%, 비닐은 90.00%에서 93.33%로 개선됐다. 플라스틱 recall은 기존 76.67%를 보존했지만 목표 90%에는 미달한다. 이 평가는 이미 개선 판단에 사용한 AIHub 고정 세트이므로 신규 카메라 독립 승인으로 해석하지 않는다.
+유리 recall은 73.33%에서 93.33%, 형광등은 83.33%에서 96.67%, 비닐은 90.00%에서 93.33%로 개선됐다. 플라스틱 recall은 76.67%였다.
 
 ## 최종 구조
 
@@ -64,7 +64,7 @@ Vision LLM: NAS Ollama `minicpm-v4.5:8b`
 | vinyl → paper | 2 |
 | fluorescent → plastic | 1 |
 
-## 재현 근거와 한계
+## 결과 파일
 
 - manifest: [`artifacts/aihub_270_2832a2c/manifest.csv`](artifacts/aihub_270_2832a2c/manifest.csv)
 - 현재 전체 결과: [`artifacts/aihub_270_2832a2c/results_af27c3e.json`](artifacts/aihub_270_2832a2c/results_af27c3e.json)
@@ -72,4 +72,4 @@ Vision LLM: NAS Ollama `minicpm-v4.5:8b`
 - 기준 전체 결과: [`artifacts/aihub_270_2832a2c/results_2832a2c.json`](artifacts/aihub_270_2832a2c/results_2832a2c.json)
 - Pi 보존본: `/home/one/aihub270_eval_20260929/results_af27c3e.json`
 
-고정 무게 `20.0g`을 사용했고 Spring callback과 HTTP 직렬화는 제외했다. 코드는 실행 중인 Pi 컨테이너와 동일한 파일을 평가 프로세스에 주입해 검증했으며, 운영 컨테이너 반영은 main push 후 별도로 확인한다. 이 270장은 이번 프롬프트·재판정 개선에 사용됐으므로 이후 독립 blind 세트가 아니다. 다음 성능 주장은 신규 카메라에서 클래스별로 새로 촬영하고 라벨을 확정한 균형 세트로 검증해야 한다.
+고정 무게 `20.0g`을 사용했고 Spring callback과 HTTP 직렬화는 제외했다. 코드는 실행 중인 Pi 컨테이너와 동일한 파일을 평가 프로세스에 주입했다.

@@ -75,6 +75,7 @@ Spring DTO에만 있는 `image_url`은 AI 서버가 전송하지 않습니다.
 
 `conditions.has_foreign_material`은 Spring 계약에 없으므로 반환하지 않습니다.
 PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라벨과 압착을 검사합니다.
+상태 필드는 해당 판별 모델이 탑재된 경우에만 검사하며, 대상 품목이 아니면 필드를 생략합니다.
 
 ### `weight`
 
@@ -105,7 +106,7 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 
 | 우선순위 | 판정 조건 | status | class_id / class_name | 추가 필드·코드 |
 |---:|---|---|---|---|
-| 1 | `weight_g`가 설정된 하한 미만(기본 1g) | `NOT_DETECTED` | 생략 | 빈 물체 오탐 방지. `weight.anomaly=false` |
+| 1 | Vision LLM 비활성 경로에서 `weight_g`가 설정된 하한 미만(기본 1g) | `NOT_DETECTED` | 생략 | 빈 물체 오탐 방지. primary 모드의 얇은 종이·비닐은 이미지 판정 계속 |
 | 2 | YOLO bbox 미감지 + 전체프레임 LLM 단일 품목 확정 | 최종 품목 기준 | LLM 결과 | bbox=원본 전체 범위. LLM이 일반폐기물을 확정하면 `GENERAL_WASTE` |
 | 3 | YOLO bbox 미감지 + LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `NOT_DETECTED` | 생략 | `weight.anomaly=false` |
 | 4 | LLM이 단독 일반폐기물로 확정 (예: 빨대) | `GENERAL_WASTE` | 생략 | `general.code=GENERAL_WASTE`, bbox 유지, 일반함 처리 |
