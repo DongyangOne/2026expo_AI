@@ -8,6 +8,14 @@ KERNEL_DIR=/share/CACHEDEV1_DATA/.qpkg/NvKernelDriver/kernel-open
 TRAIN_NAME=${1:?training container name is required}
 OLLAMA_NAMES=${2:-naco-ollama}
 OUTPUT_DIR=${3:-}
+PRODUCTION_GPU_LOCK=${NACO_PRODUCTION_GPU_LOCK:-/share/Container/naco_ai/watchdog/production_gpu.lock}
+
+# Production Ollama and GPU-reset training cannot safely share this QNAP GPU.
+# Fail closed instead of detaching the GPU from a live production service.
+if [ -e "$PRODUCTION_GPU_LOCK" ]; then
+  echo "[watch] production GPU lock is active; refusing GPU reset: $PRODUCTION_GPU_LOCK" >&2
+  exit 125
+fi
 
 echo "[watch] $(date '+%F %T') waiting for $TRAIN_NAME"
 while [ "$($DOCKER inspect -f '{{.State.Running}}' "$TRAIN_NAME" 2>/dev/null)" = "true" ]; do

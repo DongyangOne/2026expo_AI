@@ -60,6 +60,7 @@ server {
     listen 8080;
     server_name _;
     client_max_body_size 3m;
+    resolver 127.0.0.11 valid=10s ipv6=off;
 
     location = /healthz {
         add_header Content-Type text/plain;
@@ -68,11 +69,12 @@ server {
 
     location /api/ {
         if ($naco_llm_authorized = 0) { return 401; }
+        set $ollama_upstream http://naco-ollama:11434;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Request-ID $request_id;
-        proxy_pass http://naco-ollama:11434;
+        proxy_pass $ollama_upstream;
     }
 }
 EOF

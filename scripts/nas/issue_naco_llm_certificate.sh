@@ -55,30 +55,58 @@ server {
     listen 443 ssl;
     server_name llm.naco.kro.kr;
     client_max_body_size 3m;
+    resolver 127.0.0.11 valid=10s ipv6=off;
     ssl_certificate /etc/letsencrypt/live/llm.naco.kro.kr/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/llm.naco.kro.kr/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     location = /healthz { add_header Content-Type text/plain; return 200 "ok\n"; }
     location /api/ {
         if ($naco_llm_authorized = 0) { return 401; }
+        set $ollama_upstream http://naco-ollama:11434;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Request-ID $request_id;
-        proxy_pass http://naco-ollama:11434;
+        proxy_pass $ollama_upstream;
     }
 }
 EOF
 
+cat > "$ROOT/nginx/startup.sh" <<'EOF'
+#!/bin/sh
+set -eu
+envsubst '${NACO_LLM_API_KEY}' \
+  < /etc/nginx/templates/default.conf.template \
+  > /etc/nginx/conf.d/default.conf
+public_iface="$(ip -o addr show | awk -v ip="$NACO_PUBLIC_IP" '$4 ~ ("^" ip "/") { print $2; exit }')"
+announce_ip() {
+  if [ -n "$public_iface" ]; then
+    arping -U -c 5 -I "$public_iface" -s "$NACO_PUBLIC_IP" 223.194.166.1 >/dev/null 2>&1 || true
+  fi
+}
+announce_ip
+(while :; do sleep 300; announce_ip; done) &
+exec nginx -g 'daemon off;'
+EOF
+chmod 755 "$ROOT/nginx/startup.sh"
+
 "$DOCKER_BIN" rm -f "$CONTAINER" >/dev/null 2>&1 || true
 "$DOCKER_BIN" run -d --name "$CONTAINER" --restart unless-stopped \
   --network "$STATIC_NETWORK" --ip "$PUBLIC_IP" \
+  -e "NACO_PUBLIC_IP=$PUBLIC_IP" \
   --env-file "$KEY_FILE" \
   -v "$ROOT/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro" \
+  -v "$ROOT/nginx/startup.sh:/startup.sh:ro" \
   -v "$ROOT/certbot/www:/var/www/certbot:ro" \
   -v "$ROOT/certbot/conf:/etc/letsencrypt:ro" \
-  "$NGINX_IMAGE" nginx -g 'daemon off;' >/dev/null
+  --entrypoint /bin/sh "$NGINX_IMAGE" /startup.sh >/dev/null
 "$DOCKER_BIN" network connect "$INTERNAL_NETWORK" "$CONTAINER"
+"$DOCKER_BIN" exec "$CONTAINER" /bin/sh -c '
+  public_iface="$(ip -o addr show | awk -v ip="$NACO_PUBLIC_IP" '\''$4 ~ ("^" ip "/") { print $2; exit }'\'')"
+  if [ -n "$public_iface" ]; then
+    arping -U -c 5 -I "$public_iface" -s "$NACO_PUBLIC_IP" 223.194.166.1 >/dev/null 2>&1 || true
+  fi
+' || true
 "$DOCKER_BIN" inspect -f '{{.State.Running}}' "$CONTAINER" | grep -qx true
 "$DOCKER_BIN" rm -f "$RENEWER" >/dev/null 2>&1 || true
 "$DOCKER_BIN" run -d --name "$RENEWER" --restart unless-stopped \
