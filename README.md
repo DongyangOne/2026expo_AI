@@ -83,6 +83,28 @@ YOLO는 대상 위치를 찾고, Vision LLM은 영문 분류 기준과 함께 �
 전체 설정 예시는 [.env.example](.env.example)에 있습니다. 실제 API key와 gateway 인증값은
 Git에 넣지 않습니다.
 
+## 상태 확인
+
+`GET /health`는 Pi의 YOLO·보조 모델뿐 아니라 NAS Vision LLM gateway와 운영 모델 상태도
+함께 확인합니다. `LOCAL_LLM_MODE=primary`에서 LLM이 응답하지 않거나 설정 모델이 없으면
+최상위 `status`는 `ok`가 아니라 `degraded`입니다. 인증 키와 내부 URL은 응답에 노출하지 않습니다.
+
+```json
+{
+  "status": "ok",
+  "models": {"main": true, "state": true, "verifier": true},
+  "llm": {
+    "enabled": true,
+    "required": true,
+    "status": "ok",
+    "reachable": true,
+    "model": "minicpm-v4.5:8b",
+    "model_available": true,
+    "latency_ms": 18.4
+  }
+}
+```
+
 ## 로그와 캡처
 
 `LOG_RESULTS=true`이면 `logs/results.jsonl`에 결과를 기록합니다. `CAPTURE_REQUESTS=true`이면

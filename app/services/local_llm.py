@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -224,6 +225,51 @@ def enabled() -> bool:
 
 def primary_enabled() -> bool:
     return enabled() and settings.LOCAL_LLM_MODE == "primary"
+
+
+def health_status() -> dict[str, Any]:
+    """Check the NAS gateway without exposing its URL or credentials."""
+    base = {
+        "enabled": enabled(),
+        "required": primary_enabled(),
+        "status": "disabled",
+        "reachable": False,
+        "model": settings.LOCAL_LLM_MODEL,
+        "model_available": False,
+        "latency_ms": None,
+    }
+    if not enabled():
+        return base
+
+    headers: dict[str, str] = {}
+    if settings.LOCAL_LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {settings.LOCAL_LLM_API_KEY}"
+    started = time.perf_counter()
+    try:
+        response = _get_http_client().get(
+            settings.LOCAL_LLM_BASE_URL.rstrip("/") + "/api/tags",
+            headers=headers,
+            timeout=3.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("models", [])
+        names = {
+            str(item.get("name", ""))
+            for item in models
+            if isinstance(item, dict)
+        }
+        model_available = settings.LOCAL_LLM_MODEL in names
+        base.update({
+            "status": "ok" if model_available else "model_missing",
+            "reachable": True,
+            "model_available": model_available,
+        })
+    except (httpx.HTTPError, TypeError, ValueError, json.JSONDecodeError):
+        base["status"] = "unavailable"
+    finally:
+        base["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    return base
 
 
 def _encode_as_jpeg(img: np.ndarray, max_side: int) -> str | None:

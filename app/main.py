@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -8,8 +9,9 @@ from fastapi.responses import JSONResponse
 from app.api.v1 import detect
 from app.core.config import settings
 from app.models.registry import ModelRegistry
+from app.schemas.health import HealthResponse
 from app.schemas.response import ErrorResponse
-from app.services import pipeline
+from app.services import local_llm, pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,12 +82,23 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 
 # ── 시스템 엔드포인트 ─────────────────────────────────────────────────────────────
-@app.get("/health", tags=["system"], summary="서버 및 모델 상태 확인")
-async def health_check(request: Request) -> dict:
+@app.get(
+    "/health",
+    tags=["system"],
+    summary="Pi 서버·YOLO·NAS LLM 상태 확인",
+    response_model=HealthResponse,
+)
+async def health_check(request: Request) -> HealthResponse:
     registry = getattr(request.app.state, "registry", None)
-    return {
-        "status": "ok",
-        "models": registry.status() if registry else {
-            "main": False, "state": False, "verifier": False,
-        },
+    model_status = registry.status() if registry else {
+        "main": False, "state": False, "verifier": False,
     }
+    llm_status = await asyncio.to_thread(local_llm.health_status)
+    healthy = bool(model_status.get("main")) and (
+        not llm_status["required"] or llm_status["status"] == "ok"
+    )
+    return HealthResponse(
+        status="ok" if healthy else "degraded",
+        models=model_status,
+        llm=llm_status,
+    )
