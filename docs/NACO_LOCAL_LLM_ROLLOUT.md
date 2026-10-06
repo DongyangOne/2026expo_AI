@@ -6,8 +6,8 @@
 
 1. YOLO는 물체의 bbox와 `NOT_DETECTED`만 결정한다.
 2. bbox crop을 NAS의 API-key 보호 Vision LLM에 보낸다.
-3. LLM은 9개 품목, `has_label`, `is_dented`, `has_foreign_material`, 단일 주 물체 여부를
-   엄격한 JSON으로 반환한다.
+3. LLM은 9개 품목, 내부 압착 대상 여부 `compression_required`, `has_label`, `is_dented`,
+   `has_foreign_material`, 단일 주 물체 여부를 엄격한 JSON으로 반환한다.
 4. AI 서버는 무게와 조건을 조합해 `ALLOWED`·`REJECTED`·`GENERAL_WASTE`를 결정하고,
    즉시 응답과 Spring 콜백에 같은 JSON을 보낸다.
 
@@ -45,8 +45,8 @@ LLM이 일반 폐기물로 확정하면 `general.code=GENERAL_WASTE`로 일반�
 | LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `GENERAL_WASTE` | 생략 | `general.code=LOW_CONFIDENCE`, bbox 유지, YOLO fallback 없음 |
 | 캔 정상: 무게 정상·이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `is_dented=true` |
 | 캔 무게 이상/내용물 또는 미압착 | `REJECTED` | `0 / can` | `EMPTY_CONTENTS`, `COMPRESS` |
-| PET/플라스틱 정상: 무게 정상·라벨 없음·이물질 없음; PET는 압착됨 | `ALLOWED` | `3 / plastic` | PET도 `plastic/3`으로 통합 |
-| PET/플라스틱 무게 이상·라벨 미제거·PET 미압착 | `REJECTED` | `3 / plastic` | `EMPTY_CONTENTS`, `REMOVE_LABEL`, `COMPRESS` |
+| PET/플라스틱 정상: 무게 정상·라벨 없음·이물질 없음; 압착 대상이면 압착됨 | `ALLOWED` | `3 / plastic` | PET도 `plastic/3`으로 통합 |
+| PET/플라스틱 무게 이상·라벨 미제거·압착 대상 미압착 | `REJECTED` | `3 / plastic` | `EMPTY_CONTENTS`, `REMOVE_LABEL`, `COMPRESS` |
 | 종이 정상: 무게 정상·이물질 없음 | `ALLOWED` | `2 / paper` | `conditions={}` |
 | 종이 무게 이상 | `REJECTED` | `2 / paper` | `WEIGHT_ANOMALY` |
 | 비닐 정상: 무게 정상·이물질 없음 | `ALLOWED` | `5 / vinyl` | 비닐도 정상 시 `ALLOWED` |
@@ -59,8 +59,9 @@ LLM이 일반 폐기물로 확정하면 `general.code=GENERAL_WASTE`로 일반�
 
 ## 상태와 안내 코드
 
-`conditions`에는 Spring 계약상 `has_label`, `is_dented`만 포함한다. 외부 이물질은 별도
-필드가 아니라 `guidance[].code`로 전달한다.
+`conditions`에는 Spring 계약상 `has_label`, `is_dented`만 포함한다. 내부
+`compression_required`는 Spring에 보내지 않는다. 압착 비대상 플라스틱은 `is_dented`도 생략한다.
+외부 이물질은 별도 필드가 아니라 `guidance[].code`로 전달한다.
 
 | 조건 | guidance code |
 |---|---|
@@ -68,10 +69,14 @@ LLM이 일반 폐기물로 확정하면 `general.code=GENERAL_WASTE`로 일반�
 | 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
 | 다른 재질의 부착물·혼합 이물질 | `FOREIGN_MATERIAL` |
 | 플라스틱(PET 포함) 라벨 미제거 | `REMOVE_LABEL` |
-| PET병·캔 미압착 | `COMPRESS` |
+| PET병·캔 또는 손으로 안전하게 압착 가능한 얇은 플라스틱 병·용기의 미압착 | `COMPRESS` |
 
-같은 재질 부속품(예: 플라스틱 빨대)은 `FOREIGN_MATERIAL`로 보지 않는다. 서로 다른 재질의
-테이크아웃 컵 종이 슬리브 같은 부착물은 이물질이다. 여러 위반이면 guidance 배열에 함께 넣는다.
+카페 테이크아웃 컵, 일반 컵, 뚜껑, 트레이, 두꺼운 밀폐용기, 작은 플라스틱 부품 및
+단단하거나 깨질 수 있는 플라스틱에는 압착을 요구하지 않는다.
+
+단독 빨대는 재질과 관계없이 `GENERAL_WASTE`다. 컵에 꽂힌 빨대는 컵과 같은 플라스틱이어도
+제거 후 다시 투입해야 하는 `FOREIGN_MATERIAL`이다. 테이크아웃 컵 종이 슬리브 같은 부착물도
+동일하게 이물질로 처리한다. 여러 위반이면 guidance 배열에 함께 넣는다.
 
 유리·건전지·형광등·스티로폼은 재처리 안내가 아니라 `REJECTED`와 각각
 `GLASS`·`BATTERY`·`FLUORESCENT`·`STYROFOAM` rejection code로 반환한다.

@@ -114,22 +114,23 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | 6 | 캔: 무게 정상·외부 이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `conditions.is_dented=true` |
 | 7 | 캔: 무게 이상/내용물 | `REJECTED` | `0 / can` | `guidance=EMPTY_CONTENTS` |
 | 8 | 캔: 미압착 | `REJECTED` | `0 / can` | `guidance=COMPRESS` |
-| 9 | PET 또는 플라스틱: 무게 정상·라벨 없음·외부 이물질 없음 (PET는 압착됨) | `ALLOWED` | `3 / plastic` | PET도 외부 `plastic/3`으로 통합 |
+| 9 | PET 또는 플라스틱: 무게 정상·라벨 없음·외부 이물질 없음 (압착 대상이면 압착됨) | `ALLOWED` | `3 / plastic` | PET도 외부 `plastic/3`으로 통합 |
 | 10 | PET 또는 플라스틱: 무게 이상/내용물 | `REJECTED` | `3 / plastic` | `guidance=EMPTY_CONTENTS` |
 | 11 | PET 또는 플라스틱: 라벨 미제거 | `REJECTED` | `3 / plastic` | `guidance=REMOVE_LABEL` |
-| 12 | PET: 미압착 | `REJECTED` | `3 / plastic` | `guidance=COMPRESS` |
+| 12 | PET 또는 손압착이 필요한 얇은 플라스틱 병·용기: 미압착 | `REJECTED` | `3 / plastic` | `guidance=COMPRESS` |
 | 13 | 종이: 무게 정상·외부 이물질 없음 | `ALLOWED` | `2 / paper` | `conditions={}` |
 | 14 | 종이: 무게 이상 | `REJECTED` | `2 / paper` | `guidance=WEIGHT_ANOMALY` |
 | 15 | 비닐: 무게 정상·외부 이물질 없음 | `ALLOWED` | `5 / vinyl` | 정상 비닐도 `ALLOWED` |
 | 16 | 비닐: 무게 이상 | `REJECTED` | `5 / vinyl` | `guidance=WEIGHT_ANOMALY` |
-| 17 | 허용 대상에서 다른 재질 이물질/혼합 부착물 감지 | `REJECTED` | 최종 품목 유지 | `guidance=FOREIGN_MATERIAL` |
+| 17 | 허용 대상에서 제거해야 하는 빨대·슬리브 또는 다른 재질 이물질/혼합 부착물 감지 | `REJECTED` | 최종 품목 유지 | `guidance=FOREIGN_MATERIAL` |
 | 18 | 유리 | `REJECTED` | `6 / glass` | `rejection.code=GLASS` |
 | 19 | 건전지 | `REJECTED` | `7 / battery` | `rejection.code=BATTERY` |
 | 20 | 형광등 | `REJECTED` | `8 / fluorescent` | `rejection.code=FLUORESCENT` |
 | 21 | 스티로폼 | `REJECTED` | `4 / styrofoam` | `rejection.code=STYROFOAM` |
 
-`FOREIGN_MATERIAL`은 재활용 주 품목에 붙은 다른 재질의 부착물·혼합 이물질에 적용합니다. 단독 빨대는
-`GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리하며, 컵에 붙은 빨대는 컵 분류를 유지한 `FOREIGN_MATERIAL`입니다.
+`FOREIGN_MATERIAL`은 재활용 주 품목에 붙은 제거 대상 빨대·슬리브 또는 다른 재질의 부착물·혼합
+이물질에 적용합니다. 단독 빨대는 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리하며, 컵에 붙은
+빨대는 컵과 같은 플라스틱이어도 컵 분류를 유지한 `FOREIGN_MATERIAL`입니다.
 카페 음료컵은 빨대·컵홀더 제거 후 `plastic`으로, 단독 컵홀더는 `paper`로 판정합니다. 그 밖의 재활용
 9종에 명확히 속하지 않는 단독 생활폐기물도 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다.
 표의 6~16은 한 항목에 둘 이상 적용되면 하나의 `REJECTED` 응답에 guidance 배열로 합쳐집니다.
@@ -157,8 +158,8 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | `EMPTY_CONTENTS` | 내부 PET·플라스틱·캔의 무게 이상 또는 내용물 존재 추정 |
 | `WEIGHT_ANOMALY` | 종이·비닐의 무게 이상 |
 | `REMOVE_LABEL` | 내부 PET·플라스틱에 라벨이 있음 |
-| `COMPRESS` | 내부 PET·캔이 미압착 상태 |
-| `FOREIGN_MATERIAL` | 로컬 Vision LLM이 다른 재질의 부착물·혼합 이물질을 감지함. 같은 재질 부속품(예: 플라스틱 빨대)은 이물질로 보지 않음 |
+| `COMPRESS` | 내부 PET·캔 또는 손으로 안전하게 압착 가능한 얇은 플라스틱 병·용기가 미압착 상태 |
+| `FOREIGN_MATERIAL` | 로컬 Vision LLM이 제거 대상 빨대·슬리브 또는 다른 재질의 부착물·혼합 이물질을 감지함. 컵에 꽂힌 플라스틱 빨대도 포함 |
 
 ## 완전거부 및 일반분류 코드
 

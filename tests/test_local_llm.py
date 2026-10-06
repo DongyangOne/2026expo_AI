@@ -14,18 +14,31 @@ from app.services import local_llm
 def test_parse_accepts_exact_vision_contract():
     answer = json.dumps({
         "material": "vinyl", "confidence": 0.91, "has_label": False,
-        "is_dented": False, "has_foreign_material": False,
+        "compression_required": False, "is_dented": False,
+        "has_foreign_material": False,
         "is_single_primary_item": True,
     })
     result = local_llm._parse(answer)
     assert result.class_id == 5
     assert result.class_name == "vinyl"
+    assert result.compression_required is False
+
+
+def test_parse_requires_compression_required_decision():
+    answer = json.dumps({
+        "material": "plastic", "confidence": 0.91, "has_label": False,
+        "is_dented": False, "has_foreign_material": False,
+        "is_single_primary_item": True,
+    })
+    with pytest.raises(ValueError):
+        local_llm._parse(answer)
 
 
 def test_parse_accepts_llm_only_general_waste_class():
     answer = json.dumps({
         "material": "general_waste", "confidence": 0.91, "has_label": False,
-        "is_dented": False, "has_foreign_material": False,
+        "compression_required": False, "is_dented": False,
+        "has_foreign_material": False,
         "is_single_primary_item": True,
     })
     result = local_llm._parse(answer)
@@ -36,7 +49,8 @@ def test_parse_accepts_llm_only_general_waste_class():
 def test_parse_rejects_extra_or_invalid_fields():
     invalid = json.dumps({
         "material": "vinyl", "confidence": 0.91, "has_label": False,
-        "is_dented": False, "has_foreign_material": False,
+        "compression_required": False, "is_dented": False,
+        "has_foreign_material": False,
         "is_single_primary_item": True, "explanation": "extra",
     })
     try:

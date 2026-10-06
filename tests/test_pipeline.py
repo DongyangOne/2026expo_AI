@@ -39,6 +39,10 @@ def _fake_pet_detection(_registry, _img):
     return 1, 0.94, [10.0, 10.0, 90.0, 90.0]
 
 
+def _fake_plastic_detection(_registry, _img):
+    return 3, 0.94, [10.0, 10.0, 90.0, 90.0]
+
+
 def _fake_ambiguous_vinyl_detection(_registry, _img):
     bbox = [10.0, 10.0, 90.0, 90.0]
     return 1, 0.307, bbox, [
@@ -125,6 +129,72 @@ def test_primary_llm_실패는_yolo_품목으로_대체하지_않고_일반보�
     assert result.status is DetectionStatus.GENERAL_WASTE
     assert result.classification is None
     assert result.general is not None
+
+
+def test_손압착가능한_plastic이_미압착이면_compress로_rejected(monkeypatch):
+    prediction = pipeline.local_llm.LocalLLMPrediction(
+        class_id=3,
+        class_name="plastic",
+        confidence=0.96,
+        has_label=False,
+        compression_required=True,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_plastic_detection)
+    monkeypatch.setattr(
+        inference, "run_state",
+        lambda *_args: inference.StatePrediction(Conditions()),
+    )
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(pipeline.local_llm, "classify", lambda *_args: prediction)
+    monkeypatch.setattr(pipeline.local_llm, "record_primary", lambda **_kwargs: None)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "plastic-compress-required", _Registry())
+        )
+
+    assert result.status is DetectionStatus.REJECTED
+    assert result.conditions.is_dented is False
+    assert [item.code for item in result.guidance] == [GuidanceCode.COMPRESS]
+
+
+def test_손압착불가한_plastic은_압착조건없이_allowed(monkeypatch):
+    prediction = pipeline.local_llm.LocalLLMPrediction(
+        class_id=3,
+        class_name="plastic",
+        confidence=0.96,
+        has_label=False,
+        compression_required=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(inference, "run_main", _fake_plastic_detection)
+    monkeypatch.setattr(
+        inference, "run_state",
+        lambda *_args: inference.StatePrediction(Conditions()),
+    )
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(pipeline.local_llm, "classify", lambda *_args: prediction)
+    monkeypatch.setattr(pipeline.local_llm, "record_primary", lambda **_kwargs: None)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.0, "rigid-plastic-no-compress", _Registry())
+        )
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.conditions.is_dented is None
+    assert result.guidance == []
 
 
 def test_primary_llm_단독_일반쓰레기는_일반함으로_확정(monkeypatch):

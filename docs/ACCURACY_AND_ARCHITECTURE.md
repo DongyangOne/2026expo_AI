@@ -21,8 +21,8 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 2. Pi의 YOLO26m NCNN 모델이 9종 후보와 bbox를 만든다.
 3. bbox가 있으면 전체 프레임과 10% 여백을 둔 crop을 NAS Vision LLM에 전달한다.
 4. bbox가 없으면 원본 전체 프레임을 Vision LLM에 전달한다.
-5. Vision LLM이 품목과 `has_label`, `is_dented`, `has_foreign_material`,
-   `is_single_primary_item`을 JSON으로 반환한다.
+5. Vision LLM이 품목과 내부 압착 대상 여부 `compression_required`, `has_label`,
+   `is_dented`, `has_foreign_material`, `is_single_primary_item`을 JSON으로 반환한다.
 6. 필요한 경우에만 비닐/플라스틱 또는 재질 충돌 2차 판정을 실행한다.
 7. 무게와 상태 규칙을 적용해 `ALLOWED`, `REJECTED`, `GENERAL_WASTE`,
    `NOT_DETECTED` 중 하나를 결정한다.
@@ -47,7 +47,8 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 - 최소 인정 신뢰도: `0.80`
 - `temperature=0`, `think=false`, 최대 출력 96 tokens
 - 모델 상주 시간: 24시간
-- 출력 형식: 품목, 신뢰도, 라벨, 압착, 외부 이물질, 단일 주 물체 여부를 포함한 JSON
+- 출력 형식: 품목, 신뢰도, 내부 압착 대상 여부, 라벨, 압착, 외부 이물질,
+  단일 주 물체 여부를 포함한 JSON
 
 ## 선택적 2차 판정
 
@@ -70,7 +71,7 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 |---|---|---|
 | 캔 | `ALLOWED` | 무게 이상 `EMPTY_CONTENTS`, 미압착 `COMPRESS` |
 | PET병 | 외부 `plastic/3`, 조건 충족 시 `ALLOWED` | `EMPTY_CONTENTS`, `REMOVE_LABEL`, `COMPRESS` |
-| 플라스틱 | `ALLOWED` | `EMPTY_CONTENTS`, `REMOVE_LABEL` |
+| 플라스틱 | 압착 비대상이거나 압착 대상이 압착된 경우 `ALLOWED` | `EMPTY_CONTENTS`, `REMOVE_LABEL`, 압착 대상 미압착 `COMPRESS` |
 | 종이 | `ALLOWED` | `WEIGHT_ANOMALY` |
 | 비닐 | `ALLOWED` | `WEIGHT_ANOMALY` |
 | 유리 | `REJECTED` | `rejection.code=GLASS` |
@@ -80,6 +81,11 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 
 허용 품목에 다른 재질이 붙거나 섞여 있으면 `FOREIGN_MATERIAL`을 반환한다.
 여러 조건이 동시에 발생하면 `guidance` 배열에 함께 포함한다.
+
+일반 플라스틱은 손으로 안전하게 부피를 줄일 수 있는 얇고 속이 빈 병·용기에만 압착을
+요구한다. 카페 테이크아웃 컵, 일반 컵, 뚜껑, 트레이, 두꺼운 밀폐용기, 작은 부품 및
+단단하거나 깨질 수 있는 플라스틱은 압착 대상에서 제외한다. `compression_required`는 내부
+LLM 계약에만 있고 Spring에는 보내지 않으며, 비대상 품목은 `conditions.is_dented`도 생략한다.
 
 카페 컵은 빨대와 컵홀더를 제거한 상태에서 재질에 따라 분류한다. 단독 빨대는
 `GENERAL_WASTE`, 단독 컵홀더는 `paper`다. 컵에 빨대나 컵홀더가 붙어 있으면

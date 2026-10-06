@@ -205,11 +205,19 @@ def _apply_local_llm_conditions(
     """Primary-mode LLM may replace only condition heads meaningful for the item."""
     if prediction is None:
         return conditions
+    if model_class_id in {_PET_MODEL_CLASS_ID, _CAN_MODEL_CLASS_ID}:
+        is_dented = prediction.is_dented
+    elif model_class_id == _PLASTIC_CLASS_ID and prediction.compression_required:
+        is_dented = prediction.is_dented
+    elif model_class_id == _PLASTIC_CLASS_ID:
+        is_dented = None
+    else:
+        is_dented = conditions.is_dented
+
     return Conditions(
         has_label=(prediction.has_label if model_class_id in {_PET_MODEL_CLASS_ID, _PLASTIC_CLASS_ID}
                    else conditions.has_label),
-        is_dented=(prediction.is_dented if model_class_id in {_PET_MODEL_CLASS_ID, _CAN_MODEL_CLASS_ID}
-                   else conditions.is_dented),
+        is_dented=is_dented,
     )
 
 

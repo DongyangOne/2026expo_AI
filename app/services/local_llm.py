@@ -40,13 +40,14 @@ _SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "material", "confidence", "has_label", "is_dented",
+        "material", "confidence", "has_label", "compression_required", "is_dented",
         "has_foreign_material", "is_single_primary_item",
     ],
     "properties": {
         "material": {"type": "string", "enum": list(CLASS_NAMES)},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "has_label": {"type": "boolean"},
+        "compression_required": {"type": "boolean"},
         "is_dented": {"type": "boolean"},
         "has_foreign_material": {"type": "boolean"},
         "is_single_primary_item": {"type": "boolean"},
@@ -77,9 +78,11 @@ Choose exactly one material:
 State rules:
 - A cafe cup is plastic only after its loose straw and paper sleeve/holder are removed. A loose straw is general_waste; a loose sleeve/holder is paper.
 - For the cup itself, distinguish material: an opaque matte cup with a rolled paper rim or paper seam is paper; a clearly translucent, glossy, injection-molded cup is plastic.
-- has_foreign_material=true only when a different material is physically attached to, inside, or mixed with the primary item. Background objects are not foreign material.
+- has_foreign_material=true when a removable straw or sleeve is attached, or when a different material is physically attached to, inside, or mixed with the primary item. A plastic straw attached to a plastic cup is still removable foreign material. Background objects are not foreign material.
 - has_label=true only when a removable recycling label remains attached to a plastic/PET container.
-- is_dented=true only when a can or PET beverage bottle is visibly compressed enough for disposal.
+- compression_required=true for every can and PET beverage bottle. For ordinary plastic, use true only for a thin-walled hollow plastic bottle or container that a person can safely flatten by hand.
+- compression_required=false for cafe takeaway cups, disposable drink cups, rigid cups, lids, trays, tubs, thick storage containers, small plastic parts, and hard or brittle plastic that is difficult or unsafe to flatten by hand.
+- is_dented=true only when compression_required=true and the item is visibly flattened or crushed enough to reduce its volume. Otherwise set it to false.
 - is_single_primary_item=false when multiple separate disposal items are presented together.
 - If visual evidence is genuinely ambiguous, lower confidence instead of defaulting to plastic or paper.
 
@@ -103,7 +106,9 @@ Choose plastic only for a rigid bottle, cup, lid, tray, tub, or container that k
 Judge physical flexibility and three-dimensional form, not color, transparency, printed branding, or the fact that both materials are polymers.
 This is form classification, not polymer chemistry: a loose translucent shopping or packaging bag, or a film sheet draped over any support, MUST be vinyl and never plastic; ignore the support underneath it.
 Ignore the bin tray, floor, background, shadows, hands, fixtures, and anything not attached to the target.
-Set has_foreign_material=true only if another material is physically attached to, inside, or mixed with the primary item.
+Set has_foreign_material=true if a removable straw or sleeve is attached to the item, or if another material is physically attached to, inside, or mixed with it. A plastic straw attached to a plastic cup still counts as removable foreign material.
+Set compression_required=true only for a thin-walled hollow plastic bottle or container that can safely be flattened by hand. Cafe takeaway cups, rigid cups, lids, trays, tubs, and hard or brittle plastic are not compression-required.
+Set is_dented=true only when compression_required=true and the item is visibly flattened enough to reduce its volume.
 If the evidence is ambiguous, lower confidence rather than defaulting to plastic.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
@@ -115,7 +120,8 @@ Use physical construction rather than color or product type:
 - styrofoam means expanded or foamed polystyrene. Require visible bead/cell/porous texture, a foam fracture, unusually thick lightweight foam walls, or an EPS/PSP/foamed-PS mark. A smooth dense molded tray or insert without foam evidence is plastic.
 - paper requires fibrous, layered, folded, rolled-rim, glued-seam, cardboard, or torn-paper evidence. Printing or a matte white surface alone does not make an item paper.
 
-Image 1 is the full frame; Image 2, when present, is the target crop. Ignore the ground and background. If uncertain, lower confidence rather than guessing from color.
+Image 1 is the full frame; Image 2, when present, is the target crop. Ignore the ground and background. A removable straw or sleeve attached to the item counts as foreign material even when the straw and cup are both plastic. If uncertain, lower confidence rather than guessing from color.
+Set compression_required=true only for a thin-walled hollow plastic bottle or container that can safely be flattened by hand. Cafe takeaway cups, rigid cups, lids, trays, tubs, and hard or brittle plastic are not compression-required. Set is_dented=true only when compression_required=true and the item is visibly flattened enough to reduce its volume.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
 _REJECTION_CONFLICT_PROMPT = """Re-evaluate the ONE primary disposal item because two visual classifiers disagree.
@@ -130,7 +136,8 @@ Safety-specific visual rules:
 - glass requires decisive evidence such as a thick heavy wall or base and glass-like refraction; gloss, transparency, tint, or amber color alone is not glass.
 - battery requires visible battery-cell, terminal, pack, or battery-label evidence.
 - plastic is an ordinary dense rigid molded polymer item and must not be chosen for a complete lamp or a molded foam tray with foam or PSP/EPS evidence.
-Ignore hands, the bin, fixtures, cables, floor, and background. If uncertain, lower confidence.
+Set compression_required=true for can and PET. For plastic, use true only for a thin-walled hollow bottle or container that can safely be flattened by hand; cafe takeaway cups, rigid cups, lids, trays, tubs, and hard or brittle plastic use false. Other materials also use false. Set is_dented=true only when compression_required=true and the item is visibly flattened enough to reduce its volume.
+Ignore hands, the bin, fixtures, cables, floor, and background. A removable straw or sleeve attached to the target counts as foreign material even when it is made from the same material as the target. If uncertain, lower confidence.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
 _PAIR_RULES = {
@@ -214,6 +221,7 @@ class LocalLLMPrediction:
     is_dented: bool
     has_foreign_material: bool
     is_single_primary_item: bool
+    compression_required: bool = False
 
 
 def enabled() -> bool:
@@ -339,12 +347,16 @@ def _parse(content: str) -> LocalLLMPrediction:
         raise ValueError("LLM material/confidence invalid")
     if not 0 <= float(confidence) <= 1:
         raise ValueError("LLM confidence out of range")
-    flags = ("has_label", "is_dented", "has_foreign_material", "is_single_primary_item")
+    flags = (
+        "has_label", "compression_required", "is_dented",
+        "has_foreign_material", "is_single_primary_item",
+    )
     if any(type(parsed[name]) is not bool for name in flags):
         raise ValueError("LLM boolean contract invalid")
     return LocalLLMPrediction(
         class_id=CLASS_ID_BY_NAME[material], class_name=material,
         confidence=float(confidence), has_label=parsed["has_label"],
+        compression_required=parsed["compression_required"],
         is_dented=parsed["is_dented"],
         has_foreign_material=parsed["has_foreign_material"],
         is_single_primary_item=parsed["is_single_primary_item"],

@@ -45,7 +45,7 @@ class Classification(BaseModel):
 class Conditions(BaseModel):
     """Spring ``ConditionsDto``와 동일한 객체 상태."""
     has_label: bool | SkipJsonSchema[None] = Field(None, description="내부 PET·플라스틱의 라벨 부착 여부. 비대상 또는 미검사 시 필드 생략")
-    is_dented: bool | SkipJsonSchema[None] = Field(None, description="내부 PET·캔의 압착 여부. 비대상 또는 미검사 시 필드 생략")
+    is_dented: bool | SkipJsonSchema[None] = Field(None, description="캔·PET병 및 손압착이 필요한 얇은 플라스틱 병·용기의 압착 여부. 컵·트레이·두꺼운 플라스틱 등 비대상 또는 미검사 시 필드 생략")
 
 
 class WeightInfo(BaseModel):
@@ -104,7 +104,7 @@ class DetectResponse(BaseModel):
                     "guidance": [
                         {"code": "EMPTY_CONTENTS", "message": "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 내용물을 비우고 다시 넣어 주세요."},
                         {"code": "REMOVE_LABEL", "message": "라벨을 제거하고 다시 넣어 주세요."},
-                        {"code": "COMPRESS", "message": "플라스틱 병·캔은 납작하게 압착해서 다시 넣어 주세요."}
+                        {"code": "COMPRESS", "message": "압착이 필요한 플라스틱 병·캔은 납작하게 눌러 다시 넣어 주세요."}
                     ],
                     "bbox": [120.0, 80.0, 410.0, 560.0],
                 },

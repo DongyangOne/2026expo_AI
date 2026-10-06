@@ -61,10 +61,14 @@ PET는 외부 계약에서 항상 `class_id=3`, `class_name=plastic`으로 통�
 | 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
 | 다른 재질의 부착물·혼합 이물질 | `FOREIGN_MATERIAL` |
 | 플라스틱(PET 포함) 라벨 미제거 | `REMOVE_LABEL` |
-| PET병·캔 미압착 | `COMPRESS` |
+| PET병·캔 또는 손으로 안전하게 압착 가능한 얇은 플라스틱 병·용기의 미압착 | `COMPRESS` |
 | 유리·건전지·형광등·스티로폼 | `GLASS`·`BATTERY`·`FLUORESCENT`·`STYROFOAM` rejection code |
 
-같은 재질 부속품(예: 플라스틱 빨대)은 `FOREIGN_MATERIAL` 대상이 아닙니다.
+단독 빨대는 재질과 관계없이 `GENERAL_WASTE`입니다. 컵에 꽂힌 빨대는 컵과 같은 플라스틱이어도
+제거 후 다시 투입해야 하는 `FOREIGN_MATERIAL`입니다.
+카페 테이크아웃 컵, 일반 컵, 뚜껑, 트레이, 두꺼운 밀폐용기 및 단단하거나 깨질 수 있는
+플라스틱은 압착 대상이 아닙니다. 내부 LLM의 `compression_required`가 참인 품목에만
+`conditions.is_dented`와 `COMPRESS` 규칙을 적용하며, 이 내부 필드는 Spring 응답에 추가하지 않습니다.
 
 ## 실행
 

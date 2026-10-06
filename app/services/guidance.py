@@ -41,7 +41,7 @@ _GUIDANCE_TEXT: dict[GuidanceCode, str] = {
     GuidanceCode.WEIGHT_ANOMALY:  "무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요.",
     GuidanceCode.FOREIGN_MATERIAL: "외부 이물질을 제거하고 다시 넣어 주세요.",
     GuidanceCode.REMOVE_LABEL:    "라벨을 제거하고 다시 넣어 주세요.",
-    GuidanceCode.COMPRESS:        "플라스틱 병·캔은 납작하게 압착해서 다시 넣어 주세요.",
+    GuidanceCode.COMPRESS:        "압착이 필요한 플라스틱 병·캔은 납작하게 눌러 다시 넣어 주세요.",
 }
 
 _EMPTY_CONTENTS_CLASSES = {WasteClass.PET, WasteClass.PLASTIC, WasteClass.CAN}
@@ -101,7 +101,7 @@ def build_guidance(
         codes.append(GuidanceCode.FOREIGN_MATERIAL)
     if conditions.has_label is True:                          # 페트·플라스틱 라벨 부착
         codes.append(GuidanceCode.REMOVE_LABEL)
-    if cls in (WasteClass.PET, WasteClass.CAN) and conditions.is_dented is False:  # 미압착
+    if cls in (WasteClass.PET, WasteClass.PLASTIC, WasteClass.CAN) and conditions.is_dented is False:  # 미압착
         codes.append(GuidanceCode.COMPRESS)
 
     return [Guidance(code=c, message=_GUIDANCE_TEXT[c]) for c in codes]

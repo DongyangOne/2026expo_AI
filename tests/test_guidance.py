@@ -24,6 +24,14 @@ class TestConditionsMet:
         g = guidance.build_guidance(WasteClass.PLASTIC, Conditions(has_label=False), False)
         assert g == []
 
+    def test_압착대상_plastic_압착완료(self):
+        g = guidance.build_guidance(
+            WasteClass.PLASTIC,
+            Conditions(has_label=False, is_dented=True),
+            False,
+        )
+        assert g == []
+
     def test_paper_충족(self):
         g = guidance.build_guidance(WasteClass.PAPER, Conditions(), False)
         assert g == []
@@ -62,6 +70,14 @@ class TestConditionsUnmet:
     def test_plastic_라벨만(self):
         g = guidance.build_guidance(WasteClass.PLASTIC, Conditions(has_label=True), False)
         assert _codes(g) == [GuidanceCode.REMOVE_LABEL]
+
+    def test_압착대상_plastic_미압착(self):
+        g = guidance.build_guidance(
+            WasteClass.PLASTIC,
+            Conditions(has_label=False, is_dented=False),
+            False,
+        )
+        assert _codes(g) == [GuidanceCode.COMPRESS]
 
     def test_paper_무게만(self):
         g = guidance.build_guidance(WasteClass.PAPER, Conditions(), True)
