@@ -250,6 +250,8 @@ def health_status() -> dict[str, Any]:
         "reachable": False,
         "model": settings.LOCAL_LLM_MODEL,
         "model_available": False,
+        "accelerator": "unknown",
+        "size_vram_bytes": None,
         "latency_ms": None,
     }
     if not enabled():
@@ -260,8 +262,10 @@ def health_status() -> dict[str, Any]:
         headers["Authorization"] = f"Bearer {settings.LOCAL_LLM_API_KEY}"
     started = time.perf_counter()
     try:
-        response = _get_http_client().get(
-            settings.LOCAL_LLM_BASE_URL.rstrip("/") + "/api/tags",
+        client = _get_http_client()
+        url = settings.LOCAL_LLM_BASE_URL.rstrip("/")
+        response = client.get(
+            url + "/api/tags",
             headers=headers,
             timeout=3.0,
         )
@@ -275,10 +279,32 @@ def health_status() -> dict[str, Any]:
         }
         model_available = settings.LOCAL_LLM_MODEL in names
         base.update({
-            "status": "ok" if model_available else "model_missing",
+            "status": "model_not_loaded" if model_available else "model_missing",
             "reachable": True,
             "model_available": model_available,
         })
+        if model_available:
+            running_response = client.get(
+                url + "/api/ps",
+                headers=headers,
+                timeout=3.0,
+            )
+            running_response.raise_for_status()
+            running_models = running_response.json().get("models", [])
+            running_model = next((
+                item for item in running_models
+                if isinstance(item, dict)
+                and str(item.get("name", "")) == settings.LOCAL_LLM_MODEL
+            ), None)
+            if running_model is None:
+                base["accelerator"] = "not_loaded"
+            else:
+                size_vram = running_model.get("size_vram")
+                if type(size_vram) is not int or size_vram < 0:
+                    raise ValueError("invalid Ollama size_vram")
+                base["size_vram_bytes"] = size_vram
+                base["accelerator"] = "gpu" if size_vram > 0 else "cpu"
+                base["status"] = "ok" if size_vram > 0 else "cpu_fallback"
     except (httpx.HTTPError, TypeError, ValueError, json.JSONDecodeError):
         base["status"] = "unavailable"
     finally:

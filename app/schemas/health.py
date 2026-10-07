@@ -12,12 +12,21 @@ class ModelHealth(BaseModel):
 class LLMHealth(BaseModel):
     enabled: bool = Field(..., description="NAS Vision LLM 기능 활성화 여부")
     required: bool = Field(..., description="현재 분류에서 LLM이 필수(primary)인지 여부")
-    status: Literal["ok", "disabled", "unavailable", "model_missing"] = Field(
+    status: Literal[
+        "ok", "disabled", "unavailable", "model_missing",
+        "model_not_loaded", "cpu_fallback",
+    ] = Field(
         ..., description="NAS LLM gateway와 운영 모델 상태"
     )
     reachable: bool = Field(..., description="NAS Ollama API 응답 가능 여부")
     model: str = Field(..., description="운영에 설정된 Vision LLM 모델명")
     model_available: bool = Field(..., description="설정한 모델이 NAS 모델 목록에 존재하는지 여부")
+    accelerator: Literal["gpu", "cpu", "not_loaded", "unknown"] = Field(
+        ..., description="현재 운영 모델의 실제 실행 장치"
+    )
+    size_vram_bytes: int | None = Field(
+        None, description="Ollama가 보고한 운영 모델의 VRAM 적재량(byte)"
+    )
     latency_ms: float | None = Field(None, description="NAS 상태 확인 왕복 시간(ms)")
 
 

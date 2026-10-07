@@ -9,12 +9,16 @@ CONTAINER="${OLLAMA_CONTAINER:-naco-ollama}"
 INTERVAL="${WATCH_INTERVAL_SECONDS:-30}"
 START_GRACE="${START_GRACE_SECONDS:-45}"
 UNHEALTHY_LIMIT="${UNHEALTHY_LIMIT:-3}"
+RUNTIME_CHECK_INTERVAL="${RUNTIME_CHECK_INTERVAL_SECONDS:-60}"
+GPU_RESTART_COOLDOWN="${GPU_RESTART_COOLDOWN_SECONDS:-900}"
 OLLAMA_URL="${OLLAMA_URL:-http://naco-ollama:11434}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-minicpm-v4.5:8b}"
 API="http://localhost"
 failures=0
 last_state=""
 needs_warmup=1
+last_runtime_check=0
+GPU_RESTART_MARKER="/control/last_gpu_restart_epoch"
 
 log() {
   printf '%s %s\n' "$(date -Iseconds)" "$*"
@@ -38,6 +42,47 @@ warm_model() {
   curl --silent --show-error --fail --max-time 180 \
     -H 'Content-Type: application/json' \
     -d "$payload" "$OLLAMA_URL/api/generate" >/dev/null
+}
+
+model_runtime_state() {
+  if ! payload="$(curl --silent --show-error --fail --max-time 10 \
+    "$OLLAMA_URL/api/ps" 2>/dev/null)"; then
+    printf '%s\n' unavailable
+    return
+  fi
+  if ! printf '%s' "$payload" | grep -Fq "\"name\":\"$OLLAMA_MODEL\""; then
+    printf '%s\n' not_loaded
+  elif printf '%s' "$payload" | grep -Eq '"size_vram":[1-9][0-9]*'; then
+    printf '%s\n' gpu
+  elif printf '%s' "$payload" | grep -Eq '"size_vram":0([,}])'; then
+    printf '%s\n' cpu
+  else
+    printf '%s\n' unknown
+  fi
+}
+
+restart_for_cpu_fallback() {
+  now="$(date +%s)"
+  previous=0
+  if [ -r "$GPU_RESTART_MARKER" ]; then
+    previous="$(cat "$GPU_RESTART_MARKER" 2>/dev/null || printf '0')"
+  fi
+  case "$previous" in
+    ''|*[!0-9]*) previous=0 ;;
+  esac
+  if [ $((now - previous)) -lt "$GPU_RESTART_COOLDOWN" ]; then
+    log "model is on CPU; restart suppressed by ${GPU_RESTART_COOLDOWN}s cooldown"
+    return 1
+  fi
+
+  printf '%s\n' "$now" >"$GPU_RESTART_MARKER"
+  code="$(post_container_action 'restart?t=30' 2>/dev/null || printf '000')"
+  log "model is on CPU instead of GPU; bounded restart requested http=$code"
+  failures=0
+  last_state="restarting"
+  needs_warmup=1
+  last_runtime_check="$now"
+  return 0
 }
 
 log "watchdog started container=$CONTAINER interval=${INTERVAL}s"
@@ -92,10 +137,41 @@ while :; do
     fi
     if [ "$needs_warmup" -eq 1 ]; then
       if warm_model; then
-        log "model warmed model=$OLLAMA_MODEL keep_alive=24h"
-        needs_warmup=0
+        runtime="$(model_runtime_state)"
+        if [ "$runtime" = "gpu" ]; then
+          log "model warmed on GPU model=$OLLAMA_MODEL keep_alive=24h"
+          needs_warmup=0
+          last_runtime_check="$(date +%s)"
+        elif [ "$runtime" = "cpu" ]; then
+          if restart_for_cpu_fallback; then
+            sleep "$START_GRACE"
+            continue
+          fi
+        else
+          log "model warmup runtime=$runtime; will retry"
+        fi
       else
         log "model warmup failed; will retry"
+      fi
+    else
+      now="$(date +%s)"
+      if [ $((now - last_runtime_check)) -ge "$RUNTIME_CHECK_INTERVAL" ]; then
+        runtime="$(model_runtime_state)"
+        last_runtime_check="$now"
+        case "$runtime" in
+          gpu) ;;
+          not_loaded)
+            log "model is not loaded; scheduling warmup"
+            needs_warmup=1
+            ;;
+          cpu)
+            if restart_for_cpu_fallback; then
+              sleep "$START_GRACE"
+              continue
+            fi
+            ;;
+          *) log "model runtime check=$runtime; no destructive recovery attempted" ;;
+        esac
       fi
     fi
   fi

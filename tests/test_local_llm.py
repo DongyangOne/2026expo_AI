@@ -325,3 +325,73 @@ def test_http_client_is_reused(monkeypatch):
 
     assert local_llm._get_http_client() is local_llm._get_http_client()
     assert created == [{"timeout": local_llm.settings.LOCAL_LLM_TIMEOUT_SEC}]
+
+
+class _HealthResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _HealthClient:
+    def __init__(self, payloads):
+        self._payloads = iter(payloads)
+
+    def get(self, *_args, **_kwargs):
+        return _HealthResponse(next(self._payloads))
+
+
+def test_health_status_reports_gpu_residency(monkeypatch):
+    monkeypatch.setattr(local_llm, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MODEL", "minicpm-v4.5:8b")
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_BASE_URL", "https://naco.example")
+    monkeypatch.setattr(local_llm, "_get_http_client", lambda: _HealthClient([
+        {"models": [{"name": "minicpm-v4.5:8b"}]},
+        {"models": [{"name": "minicpm-v4.5:8b", "size_vram": 6818260582}]},
+    ]))
+
+    status = local_llm.health_status()
+
+    assert status["status"] == "ok"
+    assert status["accelerator"] == "gpu"
+    assert status["size_vram_bytes"] == 6818260582
+
+
+def test_health_status_rejects_loaded_cpu_fallback(monkeypatch):
+    monkeypatch.setattr(local_llm, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MODEL", "minicpm-v4.5:8b")
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_BASE_URL", "https://naco.example")
+    monkeypatch.setattr(local_llm, "_get_http_client", lambda: _HealthClient([
+        {"models": [{"name": "minicpm-v4.5:8b"}]},
+        {"models": [{"name": "minicpm-v4.5:8b", "size_vram": 0}]},
+    ]))
+
+    status = local_llm.health_status()
+
+    assert status["status"] == "cpu_fallback"
+    assert status["accelerator"] == "cpu"
+    assert status["size_vram_bytes"] == 0
+
+
+def test_health_status_reports_model_not_loaded(monkeypatch):
+    monkeypatch.setattr(local_llm, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MODEL", "minicpm-v4.5:8b")
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_BASE_URL", "https://naco.example")
+    monkeypatch.setattr(local_llm, "_get_http_client", lambda: _HealthClient([
+        {"models": [{"name": "minicpm-v4.5:8b"}]},
+        {"models": []},
+    ]))
+
+    status = local_llm.health_status()
+
+    assert status["status"] == "model_not_loaded"
+    assert status["accelerator"] == "not_loaded"
+    assert status["size_vram_bytes"] is None
