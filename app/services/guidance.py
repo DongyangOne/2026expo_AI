@@ -44,6 +44,19 @@ _GUIDANCE_TEXT: dict[GuidanceCode, str] = {
     GuidanceCode.COMPRESS:        "압착이 필요한 플라스틱 병·캔은 납작하게 눌러 다시 넣어 주세요.",
 }
 
+# Spring은 guidance 배열 전체의 문구를 표시하지만 첫 번째 코드를 대표 코드와
+# 안내 영상 선택에 사용한다. 모든 불충족 조건을 보내되 이 순서를 계약으로 고정한다.
+GUIDANCE_PRIORITY: tuple[GuidanceCode, ...] = (
+    GuidanceCode.EMPTY_CONTENTS,
+    GuidanceCode.WEIGHT_ANOMALY,
+    GuidanceCode.FOREIGN_MATERIAL,
+    GuidanceCode.REMOVE_LABEL,
+    GuidanceCode.COMPRESS,
+)
+_GUIDANCE_PRIORITY_INDEX = {
+    code: index for index, code in enumerate(GUIDANCE_PRIORITY)
+}
+
 _EMPTY_CONTENTS_CLASSES = {WasteClass.PET, WasteClass.PLASTIC, WasteClass.CAN}
 _WEIGHT_ANOMALY_CLASSES = {WasteClass.PAPER, WasteClass.VINYL}
 
@@ -104,7 +117,8 @@ def build_guidance(
     if cls in (WasteClass.PET, WasteClass.PLASTIC, WasteClass.CAN) and conditions.is_dented is False:  # 미압착
         codes.append(GuidanceCode.COMPRESS)
 
-    return [Guidance(code=c, message=_GUIDANCE_TEXT[c]) for c in codes]
+    ordered_codes = sorted(codes, key=_GUIDANCE_PRIORITY_INDEX.__getitem__)
+    return [Guidance(code=c, message=_GUIDANCE_TEXT[c]) for c in ordered_codes]
 
 
 def build_rejection(cls: WasteClass) -> Rejection:

@@ -44,6 +44,15 @@ class TestConditionsMet:
 
 # ── build_guidance: 조건 불충족 → 재처리 안내(REJECTED) ─────────────────────────
 class TestConditionsUnmet:
+    def test_다중안내_대표코드_우선순위_계약(self):
+        assert guidance.GUIDANCE_PRIORITY == (
+            GuidanceCode.EMPTY_CONTENTS,
+            GuidanceCode.WEIGHT_ANOMALY,
+            GuidanceCode.FOREIGN_MATERIAL,
+            GuidanceCode.REMOVE_LABEL,
+            GuidanceCode.COMPRESS,
+        )
+
     def test_pet_세조건_불충족_우선순위(self):
         # 무게 → 라벨 → 압착 순
         g = guidance.build_guidance(WasteClass.PET, Conditions(has_label=True, is_dented=False), True)

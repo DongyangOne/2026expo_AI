@@ -70,6 +70,10 @@ PET는 외부 계약에서 항상 `class_id=3`, `class_name=plastic`으로 통�
 플라스틱은 압착 대상이 아닙니다. 내부 LLM의 `compression_required`가 참인 품목에만
 `conditions.is_dented`와 `COMPRESS` 규칙을 적용하며, 이 내부 필드는 Spring 응답에 추가하지 않습니다.
 
+여러 재처리 조건이 동시에 감지되면 하나만 고르지 않고 `guidance[]`에 모두 보냅니다. 배열은
+`EMPTY_CONTENTS`/`WEIGHT_ANOMALY` → `FOREIGN_MATERIAL` → `REMOVE_LABEL` → `COMPRESS`
+순으로 고정하며, Spring은 첫 항목을 대표 코드와 안내 영상으로 사용하고 전체 메시지는 모두 표시합니다.
+
 ## 실행
 
 ```bash

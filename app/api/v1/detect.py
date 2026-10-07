@@ -183,6 +183,11 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 동일 JSON을 하드웨어에 즉시 반환하고 Spring
 `POST /api/v1/feedback-detail/result`로 백그라운드 전송합니다.
 Spring 콜백 실패는 하드웨어에 이미 반환한 HTTP 응답을 바꾸지 않습니다.
+
+여러 조건이 동시에 불충족이면 `guidance`에 모두 포함하며 배열 순서는
+무게·내용물(`EMPTY_CONTENTS` 또는 `WEIGHT_ANOMALY`) → 외부 이물질
+(`FOREIGN_MATERIAL`) → 라벨(`REMOVE_LABEL`) → 압착(`COMPRESS`)입니다.
+Spring은 첫 번째 항목을 대표 코드·안내 영상으로 사용하고 전체 메시지를 표시합니다.
 """.strip()
 
 
