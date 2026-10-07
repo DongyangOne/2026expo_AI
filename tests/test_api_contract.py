@@ -29,6 +29,8 @@ def test_ai_response_contract_exposes_agreed_guidance_and_conditions():
     assert schemas["GuidanceCode"]["enum"] == [
         "EMPTY_CONTENTS",
         "WEIGHT_ANOMALY",
+        "REMOVE_STRAW",
+        "REMOVE_CUP_HOLDER",
         "FOREIGN_MATERIAL",
         "REMOVE_LABEL",
         "COMPRESS",
@@ -67,6 +69,8 @@ def test_detect_swagger_documents_complete_request_and_response_contract():
     for code in (
         "EMPTY_CONTENTS",
         "WEIGHT_ANOMALY",
+        "REMOVE_STRAW",
+        "REMOVE_CUP_HOLDER",
         "FOREIGN_MATERIAL",
         "REMOVE_LABEL",
         "COMPRESS",

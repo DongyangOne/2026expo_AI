@@ -48,7 +48,8 @@ PET는 외부 계약에서 항상 `class_id=3`, `class_name=plastic`으로 통�
 `LOCAL_LLM_MODE=primary`에서 LLM이 장애·JSON 오류·저신뢰·복수 물체를 반환하면 YOLO 품목으로
 대체하지 않습니다. 운영 설정 `LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false`에서는
 `GENERAL_WASTE / LOW_CONFIDENCE`로 fail-closed 처리합니다. 단독 빨대처럼 LLM이 일반폐기물로
-확정한 물체는 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다. 재활용품에 붙은 빨대·종이띠 등
+확정한 물체는 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다. 재활용품에 붙은 빨대는
+`REJECTED / REMOVE_STRAW`, 종이 컵홀더는 `REJECTED / REMOVE_CUP_HOLDER`이며, 그 밖의
 다른 재질 부착물은 최종 품목을 유지한 `REJECTED / FOREIGN_MATERIAL`입니다.
 카페 음료컵은 빨대·컵홀더를 제거한 뒤 `plastic`, 단독 컵홀더는 `paper`, 단독 빨대와 그 밖의
 비재활용 생활폐기물은 `GENERAL_WASTE / GENERAL_WASTE`입니다.
@@ -59,19 +60,22 @@ PET는 외부 계약에서 항상 `class_id=3`, `class_name=plastic`으로 통�
 |---|---|
 | 플라스틱(PET 포함)·캔 무게 이상 또는 내용물 존재 추정 | `EMPTY_CONTENTS` |
 | 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
+| 컵에 부착된 빨대 | `REMOVE_STRAW` |
+| 컵에 부착된 종이 컵홀더 | `REMOVE_CUP_HOLDER` |
 | 다른 재질의 부착물·혼합 이물질 | `FOREIGN_MATERIAL` |
 | 플라스틱(PET 포함) 라벨 미제거 | `REMOVE_LABEL` |
 | PET병·캔 또는 손으로 안전하게 압착 가능한 얇은 플라스틱 병·용기의 미압착 | `COMPRESS` |
 | 유리·건전지·형광등·스티로폼 | `GLASS`·`BATTERY`·`FLUORESCENT`·`STYROFOAM` rejection code |
 
 단독 빨대는 재질과 관계없이 `GENERAL_WASTE`입니다. 컵에 꽂힌 빨대는 컵과 같은 플라스틱이어도
-제거 후 다시 투입해야 하는 `FOREIGN_MATERIAL`입니다.
+`REMOVE_STRAW`, 컵에 붙은 종이 컵홀더는 `REMOVE_CUP_HOLDER`입니다.
 카페 테이크아웃 컵, 일반 컵, 뚜껑, 트레이, 두꺼운 밀폐용기 및 단단하거나 깨질 수 있는
 플라스틱은 압착 대상이 아닙니다. 내부 LLM의 `compression_required`가 참인 품목에만
 `conditions.is_dented`와 `COMPRESS` 규칙을 적용하며, 이 내부 필드는 Spring 응답에 추가하지 않습니다.
 
 여러 재처리 조건이 동시에 감지되면 하나만 고르지 않고 `guidance[]`에 모두 보냅니다. 배열은
-`EMPTY_CONTENTS`/`WEIGHT_ANOMALY` → `FOREIGN_MATERIAL` → `REMOVE_LABEL` → `COMPRESS`
+`EMPTY_CONTENTS`/`WEIGHT_ANOMALY` → `REMOVE_STRAW` → `REMOVE_CUP_HOLDER` →
+`FOREIGN_MATERIAL` → `REMOVE_LABEL` → `COMPRESS`
 순으로 고정하며, Spring은 첫 항목을 대표 코드와 안내 영상으로 사용하고 전체 메시지는 모두 표시합니다.
 
 ## 실행

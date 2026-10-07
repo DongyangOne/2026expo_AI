@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     LOCAL_LLM_KEEP_ALIVE: str = "24h"
     # Vision 모델의 숨은 추론/장문 생성을 막아 shadow 요청이 장시간 점유하지 않게 한다.
     # 현재 JSON 계약은 일반적으로 96 토큰 이내에 완결된다.
-    LOCAL_LLM_MAX_TOKENS: int = 96
+    LOCAL_LLM_MAX_TOKENS: int = 128
     LOCAL_LLM_MIN_CONFIDENCE: float = 0.80
     # primary에서는 LLM이 실패·저신뢰·복수 물체라면 기존 YOLO 품목을 답으로 쓰지 않는다.
     # true는 과도기 호환용이며, 기본값 false는 fail-closed GENERAL_WASTE를 반환한다.

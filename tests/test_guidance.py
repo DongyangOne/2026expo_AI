@@ -48,6 +48,8 @@ class TestConditionsUnmet:
         assert guidance.GUIDANCE_PRIORITY == (
             GuidanceCode.EMPTY_CONTENTS,
             GuidanceCode.WEIGHT_ANOMALY,
+            GuidanceCode.REMOVE_STRAW,
+            GuidanceCode.REMOVE_CUP_HOLDER,
             GuidanceCode.FOREIGN_MATERIAL,
             GuidanceCode.REMOVE_LABEL,
             GuidanceCode.COMPRESS,
@@ -112,6 +114,37 @@ class TestConditionsUnmet:
             has_foreign_material=True,
         )
         assert _codes(g) == [GuidanceCode.FOREIGN_MATERIAL]
+
+    def test_빨대와_컵홀더를_각각_구분한다(self):
+        g = guidance.build_guidance(
+            WasteClass.PLASTIC,
+            Conditions(has_label=False, is_dented=None),
+            False,
+            has_straw=True,
+            has_cup_holder=True,
+        )
+        assert _codes(g) == [
+            GuidanceCode.REMOVE_STRAW,
+            GuidanceCode.REMOVE_CUP_HOLDER,
+        ]
+
+    def test_부착물_코드는_일반_이물질보다_앞선다(self):
+        g = guidance.build_guidance(
+            WasteClass.PLASTIC,
+            Conditions(has_label=True, is_dented=False),
+            True,
+            has_foreign_material=True,
+            has_straw=True,
+            has_cup_holder=True,
+        )
+        assert _codes(g) == [
+            GuidanceCode.EMPTY_CONTENTS,
+            GuidanceCode.REMOVE_STRAW,
+            GuidanceCode.REMOVE_CUP_HOLDER,
+            GuidanceCode.FOREIGN_MATERIAL,
+            GuidanceCode.REMOVE_LABEL,
+            GuidanceCode.COMPRESS,
+        ]
 
 
 # ── 품목별 헤드 비대상은 검사 안 함 (None 무시) ─────────────────────────────────

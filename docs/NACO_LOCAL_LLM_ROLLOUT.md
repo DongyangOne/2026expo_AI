@@ -67,6 +67,8 @@ LLM이 일반 폐기물로 확정하면 `general.code=GENERAL_WASTE`로 일반�
 |---|---|
 | 플라스틱(PET 포함)·캔 무게 이상 또는 내용물 존재 추정 | `EMPTY_CONTENTS` |
 | 종이·비닐 무게 이상 | `WEIGHT_ANOMALY` |
+| 컵에 부착된 빨대 | `REMOVE_STRAW` |
+| 컵에 부착된 종이 컵홀더 | `REMOVE_CUP_HOLDER` |
 | 다른 재질의 부착물·혼합 이물질 | `FOREIGN_MATERIAL` |
 | 플라스틱(PET 포함) 라벨 미제거 | `REMOVE_LABEL` |
 | PET병·캔 또는 손으로 안전하게 압착 가능한 얇은 플라스틱 병·용기의 미압착 | `COMPRESS` |
@@ -75,8 +77,9 @@ LLM이 일반 폐기물로 확정하면 `general.code=GENERAL_WASTE`로 일반�
 단단하거나 깨질 수 있는 플라스틱에는 압착을 요구하지 않는다.
 
 단독 빨대는 재질과 관계없이 `GENERAL_WASTE`다. 컵에 꽂힌 빨대는 컵과 같은 플라스틱이어도
-제거 후 다시 투입해야 하는 `FOREIGN_MATERIAL`이다. 테이크아웃 컵 종이 슬리브 같은 부착물도
-동일하게 이물질로 처리한다. 여러 위반이면 guidance 배열에 함께 넣는다.
+`REMOVE_STRAW`, 테이크아웃 컵의 종이 슬리브·컵홀더는 `REMOVE_CUP_HOLDER`로 구분한다.
+`FOREIGN_MATERIAL`은 이 둘을 제외한 다른 부착물·혼합 이물질에 사용한다. 여러 위반이면
+guidance 배열에 함께 넣는다.
 
 유리·건전지·형광등·스티로폼은 재처리 안내가 아니라 `REJECTED`와 각각
 `GLASS`·`BATTERY`·`FLUORESCENT`·`STYROFOAM` rejection code로 반환한다.

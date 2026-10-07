@@ -444,7 +444,11 @@ async def run(
                 ):
                     llm_prediction = conflict_prediction
                     rejection_conflict_resolved = True
-            if llm_prediction.has_foreign_material:
+            if (
+                llm_prediction.has_foreign_material
+                or llm_prediction.has_straw
+                or llm_prediction.has_cup_holder
+            ):
                 foreign_started_at = perf_counter()
                 foreign_recheck = await loop.run_in_executor(
                     _executor,
@@ -470,6 +474,8 @@ async def run(
                     llm_prediction = replace(
                         llm_prediction,
                         has_foreign_material=foreign_recheck.has_foreign_material,
+                        has_straw=foreign_recheck.has_straw,
+                        has_cup_holder=foreign_recheck.has_cup_holder,
                     )
             if llm_prediction.class_name == "general_waste":
                 local_llm.record_primary(
@@ -676,6 +682,8 @@ async def run(
             conditions,
             weight_info.anomaly,
             (llm_prediction.has_foreign_material if llm_prediction else state_prediction.has_foreign_material),
+            has_straw=(llm_prediction.has_straw if llm_prediction else None),
+            has_cup_holder=(llm_prediction.has_cup_holder if llm_prediction else None),
         )
         if guide:
             return DetectResponse(
@@ -714,6 +722,8 @@ async def run(
         conditions,
         weight_info.anomaly,
         (llm_prediction.has_foreign_material if llm_prediction else state_prediction.has_foreign_material),
+        has_straw=(llm_prediction.has_straw if llm_prediction else None),
+        has_cup_holder=(llm_prediction.has_cup_holder if llm_prediction else None),
     )
     # 안내가 있으면 조건 불충족 → 재처리 거부, 없으면 충족 → 수거 허용
     status = DetectionStatus.REJECTED if guide else DetectionStatus.ALLOWED

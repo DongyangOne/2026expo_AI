@@ -39,6 +39,8 @@ VINYL_CLASSES: set[WasteClass] = {
 _GUIDANCE_TEXT: dict[GuidanceCode, str] = {
     GuidanceCode.EMPTY_CONTENTS:  "내용물이 남아 있거나 무게가 정상 범위를 벗어났어요. 내용물을 비우고 다시 넣어 주세요.",
     GuidanceCode.WEIGHT_ANOMALY:  "무게가 정상 범위를 벗어났어요. 확인하고 다시 넣어 주세요.",
+    GuidanceCode.REMOVE_STRAW:    "빨대를 제거하고 다시 넣어 주세요.",
+    GuidanceCode.REMOVE_CUP_HOLDER: "종이 컵홀더를 제거하고 다시 넣어 주세요.",
     GuidanceCode.FOREIGN_MATERIAL: "외부 이물질을 제거하고 다시 넣어 주세요.",
     GuidanceCode.REMOVE_LABEL:    "라벨을 제거하고 다시 넣어 주세요.",
     GuidanceCode.COMPRESS:        "압착이 필요한 플라스틱 병·캔은 납작하게 눌러 다시 넣어 주세요.",
@@ -49,6 +51,8 @@ _GUIDANCE_TEXT: dict[GuidanceCode, str] = {
 GUIDANCE_PRIORITY: tuple[GuidanceCode, ...] = (
     GuidanceCode.EMPTY_CONTENTS,
     GuidanceCode.WEIGHT_ANOMALY,
+    GuidanceCode.REMOVE_STRAW,
+    GuidanceCode.REMOVE_CUP_HOLDER,
     GuidanceCode.FOREIGN_MATERIAL,
     GuidanceCode.REMOVE_LABEL,
     GuidanceCode.COMPRESS,
@@ -96,13 +100,15 @@ def build_guidance(
     conditions: Conditions,
     weight_anomaly: bool,
     has_foreign_material: bool | None = None,
+    has_straw: bool | None = None,
+    has_cup_holder: bool | None = None,
 ) -> list[Guidance]:
     """
     허용 품목의 조건 불충족 항목을 재처리 안내로 생성.
     빈 리스트  → 모든 조건 충족 → ALLOWED
     비어있지않음 → 조건 불충족   → REJECTED (재처리 후 재투입)
     헤드 미대상/미탑재(None)은 검사하지 않음.
-    우선순위: 무게 → 외부 이물질 → 라벨 → 압착.
+    우선순위: 무게 → 빨대 → 컵홀더 → 기타 외부 이물질 → 라벨 → 압착.
     """
     codes: list[GuidanceCode] = []
 
@@ -110,6 +116,10 @@ def build_guidance(
         codes.append(GuidanceCode.EMPTY_CONTENTS)
     elif weight_anomaly and cls in _WEIGHT_ANOMALY_CLASSES:
         codes.append(GuidanceCode.WEIGHT_ANOMALY)
+    if has_straw is True:
+        codes.append(GuidanceCode.REMOVE_STRAW)
+    if has_cup_holder is True:
+        codes.append(GuidanceCode.REMOVE_CUP_HOLDER)
     if has_foreign_material is True:
         codes.append(GuidanceCode.FOREIGN_MATERIAL)
     if conditions.has_label is True:                          # 페트·플라스틱 라벨 부착

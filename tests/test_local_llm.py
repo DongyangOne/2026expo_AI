@@ -15,6 +15,7 @@ def test_parse_accepts_exact_vision_contract():
     answer = json.dumps({
         "material": "vinyl", "confidence": 0.91, "has_label": False,
         "compression_required": False, "is_dented": False,
+        "has_straw": True, "has_cup_holder": False,
         "has_foreign_material": False,
         "is_single_primary_item": True,
     })
@@ -22,11 +23,14 @@ def test_parse_accepts_exact_vision_contract():
     assert result.class_id == 5
     assert result.class_name == "vinyl"
     assert result.compression_required is False
+    assert result.has_straw is True
+    assert result.has_cup_holder is False
 
 
 def test_parse_requires_compression_required_decision():
     answer = json.dumps({
         "material": "plastic", "confidence": 0.91, "has_label": False,
+        "has_straw": False, "has_cup_holder": False,
         "is_dented": False, "has_foreign_material": False,
         "is_single_primary_item": True,
     })
@@ -38,6 +42,7 @@ def test_parse_accepts_llm_only_general_waste_class():
     answer = json.dumps({
         "material": "general_waste", "confidence": 0.91, "has_label": False,
         "compression_required": False, "is_dented": False,
+        "has_straw": False, "has_cup_holder": False,
         "has_foreign_material": False,
         "is_single_primary_item": True,
     })
@@ -50,6 +55,7 @@ def test_parse_rejects_extra_or_invalid_fields():
     invalid = json.dumps({
         "material": "vinyl", "confidence": 0.91, "has_label": False,
         "compression_required": False, "is_dented": False,
+        "has_straw": False, "has_cup_holder": False,
         "has_foreign_material": False,
         "is_single_primary_item": True, "explanation": "extra",
     })
@@ -69,7 +75,7 @@ def test_local_llm_mode_rejects_unknown_value():
 def test_local_llm_defaults_bound_json_generation():
     settings = Settings(API_KEY="test-key")
     assert settings.LOCAL_LLM_MODEL == "minicpm-v4.5:8b"
-    assert settings.LOCAL_LLM_MAX_TOKENS == 96
+    assert settings.LOCAL_LLM_MAX_TOKENS == 128
     assert settings.LOCAL_LLM_FULL_IMAGE_SIDE == 768
     assert settings.LOCAL_LLM_MAX_IMAGE_SIDE == 640
     assert settings.LOCAL_LLM_PLASTIC_RECHECK_IMAGE_SIDE == 896

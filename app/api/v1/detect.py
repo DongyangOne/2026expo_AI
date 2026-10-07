@@ -122,15 +122,17 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | 14 | 종이: 무게 이상 | `REJECTED` | `2 / paper` | `guidance=WEIGHT_ANOMALY` |
 | 15 | 비닐: 무게 정상·외부 이물질 없음 | `ALLOWED` | `5 / vinyl` | 정상 비닐도 `ALLOWED` |
 | 16 | 비닐: 무게 이상 | `REJECTED` | `5 / vinyl` | `guidance=WEIGHT_ANOMALY` |
-| 17 | 허용 대상에서 제거해야 하는 빨대·슬리브 또는 다른 재질 이물질/혼합 부착물 감지 | `REJECTED` | 최종 품목 유지 | `guidance=FOREIGN_MATERIAL` |
-| 18 | 유리 | `REJECTED` | `6 / glass` | `rejection.code=GLASS` |
-| 19 | 건전지 | `REJECTED` | `7 / battery` | `rejection.code=BATTERY` |
-| 20 | 형광등 | `REJECTED` | `8 / fluorescent` | `rejection.code=FLUORESCENT` |
-| 21 | 스티로폼 | `REJECTED` | `4 / styrofoam` | `rejection.code=STYROFOAM` |
+| 17 | 컵에 빨대가 부착됨 | `REJECTED` | 최종 품목 유지 | `guidance=REMOVE_STRAW` |
+| 18 | 컵에 종이 컵홀더가 부착됨 | `REJECTED` | 최종 품목 유지 | `guidance=REMOVE_CUP_HOLDER` |
+| 19 | 허용 대상에서 그 밖의 재질 이물질/혼합 부착물 감지 | `REJECTED` | 최종 품목 유지 | `guidance=FOREIGN_MATERIAL` |
+| 20 | 유리 | `REJECTED` | `6 / glass` | `rejection.code=GLASS` |
+| 21 | 건전지 | `REJECTED` | `7 / battery` | `rejection.code=BATTERY` |
+| 22 | 형광등 | `REJECTED` | `8 / fluorescent` | `rejection.code=FLUORESCENT` |
+| 23 | 스티로폼 | `REJECTED` | `4 / styrofoam` | `rejection.code=STYROFOAM` |
 
-`FOREIGN_MATERIAL`은 재활용 주 품목에 붙은 제거 대상 빨대·슬리브 또는 다른 재질의 부착물·혼합
-이물질에 적용합니다. 단독 빨대는 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리하며, 컵에 붙은
-빨대는 컵과 같은 플라스틱이어도 컵 분류를 유지한 `FOREIGN_MATERIAL`입니다.
+컵에 붙은 빨대는 `REMOVE_STRAW`, 종이 컵홀더는 `REMOVE_CUP_HOLDER`로 각각 구분합니다.
+`FOREIGN_MATERIAL`은 이 둘을 제외한 다른 재질의 부착물·혼합 이물질에 적용합니다. 단독 빨대는
+`GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다.
 카페 음료컵은 빨대·컵홀더 제거 후 `plastic`으로, 단독 컵홀더는 `paper`로 판정합니다. 그 밖의 재활용
 9종에 명확히 속하지 않는 단독 생활폐기물도 `GENERAL_WASTE / GENERAL_WASTE`로 일반함 처리합니다.
 표의 6~16은 한 항목에 둘 이상 적용되면 하나의 `REJECTED` 응답에 guidance 배열로 합쳐집니다.
@@ -157,9 +159,11 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 |---|---|
 | `EMPTY_CONTENTS` | 내부 PET·플라스틱·캔의 무게 이상 또는 내용물 존재 추정 |
 | `WEIGHT_ANOMALY` | 종이·비닐의 무게 이상 |
+| `REMOVE_STRAW` | 컵에 제거 가능한 빨대가 붙어 있음 |
+| `REMOVE_CUP_HOLDER` | 컵에 제거 가능한 종이 컵홀더가 붙어 있음 |
 | `REMOVE_LABEL` | 내부 PET·플라스틱에 라벨이 있음 |
 | `COMPRESS` | 내부 PET·캔 또는 손으로 안전하게 압착 가능한 얇은 플라스틱 병·용기가 미압착 상태 |
-| `FOREIGN_MATERIAL` | 로컬 Vision LLM이 제거 대상 빨대·슬리브 또는 다른 재질의 부착물·혼합 이물질을 감지함. 컵에 꽂힌 플라스틱 빨대도 포함 |
+| `FOREIGN_MATERIAL` | 로컬 Vision LLM이 빨대·컵홀더 외의 다른 재질 부착물·혼합 이물질을 감지함 |
 
 ## 완전거부 및 일반분류 코드
 
@@ -185,8 +189,9 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 Spring 콜백 실패는 하드웨어에 이미 반환한 HTTP 응답을 바꾸지 않습니다.
 
 여러 조건이 동시에 불충족이면 `guidance`에 모두 포함하며 배열 순서는
-무게·내용물(`EMPTY_CONTENTS` 또는 `WEIGHT_ANOMALY`) → 외부 이물질
-(`FOREIGN_MATERIAL`) → 라벨(`REMOVE_LABEL`) → 압착(`COMPRESS`)입니다.
+무게·내용물(`EMPTY_CONTENTS` 또는 `WEIGHT_ANOMALY`) → 빨대(`REMOVE_STRAW`) →
+컵홀더(`REMOVE_CUP_HOLDER`) → 기타 외부 이물질(`FOREIGN_MATERIAL`) →
+라벨(`REMOVE_LABEL`) → 압착(`COMPRESS`)입니다.
 Spring은 첫 번째 항목을 대표 코드·안내 영상으로 사용하고 전체 메시지를 표시합니다.
 """.strip()
 

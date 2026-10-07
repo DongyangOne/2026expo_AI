@@ -22,7 +22,8 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 3. bbox가 있으면 전체 프레임과 10% 여백을 둔 crop을 NAS Vision LLM에 전달한다.
 4. bbox가 없으면 원본 전체 프레임을 Vision LLM에 전달한다.
 5. Vision LLM이 품목과 내부 압착 대상 여부 `compression_required`, `has_label`,
-   `is_dented`, `has_foreign_material`, `is_single_primary_item`을 JSON으로 반환한다.
+   `is_dented`, `has_straw`, `has_cup_holder`, `has_foreign_material`,
+   `is_single_primary_item`을 JSON으로 반환한다.
 6. 필요한 경우에만 비닐/플라스틱 또는 재질 충돌 2차 판정을 실행한다.
 7. 무게와 상태 규칙을 적용해 `ALLOWED`, `REJECTED`, `GENERAL_WASTE`,
    `NOT_DETECTED` 중 하나를 결정한다.
@@ -45,10 +46,10 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 - bbox crop: 10% 여백, 최대 640px
 - 플라스틱 상세 재판정 crop: 최대 896px
 - 최소 인정 신뢰도: `0.80`
-- `temperature=0`, `think=false`, 최대 출력 96 tokens
+- `temperature=0`, `think=false`, 최대 출력 128 tokens
 - 모델 상주 시간: 24시간
-- 출력 형식: 품목, 신뢰도, 내부 압착 대상 여부, 라벨, 압착, 외부 이물질,
-  단일 주 물체 여부를 포함한 JSON
+- 출력 형식: 품목, 신뢰도, 내부 압착 대상 여부, 라벨, 압착, 빨대, 컵홀더,
+  기타 외부 이물질, 단일 주 물체 여부를 포함한 JSON
 
 ## 선택적 2차 판정
 
@@ -60,7 +61,7 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 | YOLO `vinyl` 신뢰도 0.50 이상, 무게 5g 이하 | 첫 호출부터 vinyl/plastic 전용 판정 사용 |
 | 고신뢰 YOLO와 LLM이 지정 재질 쌍에서 충돌 | 두 후보만 비교하는 재질 판정 |
 | YOLO `plastic` 신뢰도 0.95 이상, LLM이 `paper` 또는 `styrofoam` | 896px crop을 포함한 플라스틱 재질 판정 |
-| LLM이 외부 이물질을 감지 | 배경과 고정 장치를 제외하기 위한 crop 전용 재확인 |
+| LLM이 빨대·컵홀더·기타 외부 이물질을 감지 | 배경과 고정 장치를 제외하기 위한 crop 전용 재확인 |
 
 재질 충돌 판정 대상은 캔/플라스틱, 플라스틱/종이, 플라스틱/스티로폼,
 비닐/종이, PET/유리, 유리/플라스틱, 형광등/유리, 형광등/플라스틱이다.
@@ -79,7 +80,8 @@ YOLO는 물체 위치와 재판정 경로 선택에 사용된다. LLM 장애·�
 | 형광등·전구 | `REJECTED` | `rejection.code=FLUORESCENT` |
 | 스티로폼 | `REJECTED` | `rejection.code=STYROFOAM` |
 
-허용 품목에 다른 재질이 붙거나 섞여 있으면 `FOREIGN_MATERIAL`을 반환한다.
+컵에 빨대가 붙으면 `REMOVE_STRAW`, 종이 컵홀더가 붙으면 `REMOVE_CUP_HOLDER`를 반환한다.
+그 밖의 다른 재질이 붙거나 섞여 있으면 `FOREIGN_MATERIAL`을 반환한다.
 여러 조건이 동시에 발생하면 `guidance` 배열에 함께 포함한다.
 
 일반 플라스틱은 손으로 안전하게 부피를 줄일 수 있는 얇고 속이 빈 병·용기에만 압착을
@@ -89,7 +91,7 @@ LLM 계약에만 있고 Spring에는 보내지 않으며, 비대상 품목은 `c
 
 카페 컵은 빨대와 컵홀더를 제거한 상태에서 재질에 따라 분류한다. 단독 빨대는
 `GENERAL_WASTE`, 단독 컵홀더는 `paper`다. 컵에 빨대나 컵홀더가 붙어 있으면
-컵 품목을 유지하고 `FOREIGN_MATERIAL`을 반환한다.
+컵 품목을 유지하고 각각 `REMOVE_STRAW`, `REMOVE_CUP_HOLDER`를 반환한다.
 
 ## 무게 판정
 

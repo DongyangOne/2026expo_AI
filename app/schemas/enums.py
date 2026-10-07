@@ -39,6 +39,8 @@ class GuidanceCode(str, Enum):
     """AI 서버가 반환하는 재처리 안내 코드."""
     EMPTY_CONTENTS  = "EMPTY_CONTENTS"   # 플라스틱·PET·캔 무게 이상/내용물 비우기
     WEIGHT_ANOMALY  = "WEIGHT_ANOMALY"   # 종이·비닐 무게 이상
+    REMOVE_STRAW    = "REMOVE_STRAW"      # 컵에 부착된 빨대 제거
+    REMOVE_CUP_HOLDER = "REMOVE_CUP_HOLDER" # 컵에 부착된 종이 홀더 제거
     FOREIGN_MATERIAL = "FOREIGN_MATERIAL" # 외부 이물질 제거
     REMOVE_LABEL    = "REMOVE_LABEL"     # 라벨 제거 (PET·플라스틱)
     COMPRESS        = "COMPRESS"         # 압착 대상 플라스틱·PET·캔 미압착
