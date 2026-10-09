@@ -99,6 +99,7 @@ def test_monitor_page_and_data_are_public(tmp_path, monkeypatch):
     page = client.get("/monitor")
     assert page.status_code == 200
     assert "EXPO AI 관제" in page.text
+    assert "카메라가 무엇을 보고" not in page.text
     assert "X-API-Key" not in page.text
     assert "blobs: new Map()" in page.text
 
