@@ -4,11 +4,10 @@ import asyncio
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import FileResponse, HTMLResponse
 
 from app.core.config import settings
-from app.core.security import verify_api_key
 from app.services.monitoring import build_monitor_snapshot, find_capture_image
 
 
@@ -24,7 +23,6 @@ async def monitor_page() -> HTMLResponse:
 @router.get(
     "/api/v1/monitor/summary",
     include_in_schema=False,
-    dependencies=[Depends(verify_api_key)],
 )
 async def monitor_summary(limit: Annotated[int, Query(ge=1, le=500)] = 100) -> dict:
     # Image metadata and audit JSONL parsing are disk-bound. Keep them away from
@@ -40,7 +38,6 @@ async def monitor_summary(limit: Annotated[int, Query(ge=1, le=500)] = 100) -> d
 @router.get(
     "/api/v1/monitor/captures/{capture_id}/image",
     include_in_schema=False,
-    dependencies=[Depends(verify_api_key)],
 )
 async def monitor_capture_image(capture_id: str) -> FileResponse:
     path = find_capture_image(Path(settings.CAPTURE_DIR), capture_id)

@@ -9,7 +9,6 @@ from PIL import Image
 os.environ.setdefault("API_KEY", "test-key")
 
 from app.api import monitor
-from app.core import security
 from app.services.monitoring import build_monitor_snapshot
 
 
@@ -82,7 +81,7 @@ def test_snapshot_reports_detection_latency_and_suspicious_bbox(tmp_path):
     assert snapshot["captures"][1]["bbox_quality"]["suspicious"] is True
 
 
-def test_monitor_page_is_public_but_data_requires_api_key(tmp_path, monkeypatch):
+def test_monitor_page_and_data_are_public(tmp_path, monkeypatch):
     _write_capture(
         tmp_path,
         capture_id="sample",
@@ -93,8 +92,6 @@ def test_monitor_page_is_public_but_data_requires_api_key(tmp_path, monkeypatch)
         process_ms=3000.0,
     )
     monkeypatch.setattr(monitor.settings, "CAPTURE_DIR", str(tmp_path))
-    monkeypatch.setattr(security.settings, "API_KEY", "test-key")
-
     test_app = FastAPI()
     test_app.include_router(monitor.router)
     client = TestClient(test_app)
@@ -102,22 +99,15 @@ def test_monitor_page_is_public_but_data_requires_api_key(tmp_path, monkeypatch)
     page = client.get("/monitor")
     assert page.status_code == 200
     assert "EXPO AI 관제" in page.text
-    assert "X-API-Key" in page.text
+    assert "X-API-Key" not in page.text
     assert "blobs: new Map()" in page.text
 
-    denied = client.get(
-        "/api/v1/monitor/summary", headers={"X-API-Key": "wrong"}
-    )
-    assert denied.status_code == 401
-
-    allowed = client.get(
-        "/api/v1/monitor/summary", headers={"X-API-Key": "test-key"}
-    )
+    allowed = client.get("/api/v1/monitor/summary")
     assert allowed.status_code == 200
     assert allowed.json()["summary"]["total_requests"] == 1
 
 
-def test_monitor_image_is_authenticated_and_resolved_from_capture_index(
+def test_monitor_image_is_public_and_resolved_from_capture_index(
     tmp_path, monkeypatch
 ):
     _write_capture(
@@ -130,21 +120,13 @@ def test_monitor_image_is_authenticated_and_resolved_from_capture_index(
         process_ms=3000.0,
     )
     monkeypatch.setattr(monitor.settings, "CAPTURE_DIR", str(tmp_path))
-    monkeypatch.setattr(security.settings, "API_KEY", "test-key")
-
     test_app = FastAPI()
     test_app.include_router(monitor.router)
     client = TestClient(test_app)
 
-    response = client.get(
-        "/api/v1/monitor/captures/sample/image",
-        headers={"X-API-Key": "test-key"},
-    )
+    response = client.get("/api/v1/monitor/captures/sample/image")
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/jpeg"
 
-    missing = client.get(
-        "/api/v1/monitor/captures/not-present/image",
-        headers={"X-API-Key": "test-key"},
-    )
+    missing = client.get("/api/v1/monitor/captures/not-present/image")
     assert missing.status_code == 404

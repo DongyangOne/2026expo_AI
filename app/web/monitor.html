@@ -55,17 +55,7 @@
     .signal.ok { background: var(--green); box-shadow: 0 0 0 5px var(--green-soft); }
     .signal.bad { background: var(--red); box-shadow: 0 0 0 5px var(--red-soft); }
 
-    .auth {
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) auto;
-      gap: 10px;
-      margin: 22px 0;
-      padding: 15px;
-      border: 1px solid var(--line);
-      background: rgba(251,252,249,.88);
-      box-shadow: var(--shadow);
-    }
-    .auth input, select, .search {
+    select, .search {
       min-height: 42px;
       padding: 0 12px;
       color: var(--ink);
@@ -140,7 +130,6 @@
     @media (max-width: 680px) {
       .shell { width: min(100% - 24px, 1480px); padding-top: 12px; }
       header { grid-template-columns: 1fr; align-items: start; }
-      .auth { grid-template-columns: 1fr; }
       .status-grid, .health-row, .stream, .controls { grid-template-columns: 1fr; }
       .metric { min-height: 104px; }
       .section-head { align-items: start; flex-direction: column; gap: 4px; }
@@ -158,13 +147,8 @@
         <h1>EXPO AI 관제</h1>
         <p class="lede">카메라가 무엇을 보고, YOLO가 어디를 잡고, 최종 판정이 어디로 향했는지 확인합니다.</p>
       </div>
-      <div class="connection"><span class="signal" id="signal"></span><b id="connectionText">인증 대기</b></div>
+      <div class="connection"><span class="signal" id="signal"></span><b id="connectionText">불러오는 중</b></div>
     </header>
-
-    <section class="auth" aria-label="모니터 인증">
-      <input id="apiKey" type="password" autocomplete="off" placeholder="X-API-Key 입력" aria-label="X-API-Key">
-      <button class="button" id="connectButton" type="button">현황 불러오기</button>
-    </section>
     <div class="error" id="errorBox" role="alert"></div>
 
     <section class="status-grid" aria-label="최근 요청 요약">
@@ -189,7 +173,7 @@
       <select id="statusFilter" aria-label="상태 필터"><option value="">모든 상태</option></select>
       <select id="qualityFilter" aria-label="bbox 필터"><option value="">모든 bbox</option><option value="warning">검토 필요만</option><option value="normal">정상 범위만</option></select>
     </section>
-    <section class="stream" id="stream"><div class="empty">API 키를 입력하면 최근 촬영 결과를 표시합니다.</div></section>
+    <section class="stream" id="stream"><div class="empty">최근 촬영 결과를 불러오고 있습니다.</div></section>
     <p class="footnote">운영 사진은 정답 라벨이 없으므로 이 화면의 감지 성공률을 정확도로 해석하지 않습니다. 기준 정확도 95.93%는 2026-09-30 AIHub 270장 평가 결과이며 현재 카메라 정확도와 별도입니다.</p>
   </main>
 
@@ -210,9 +194,8 @@
       $("errorBox").classList.toggle("visible", Boolean(message));
     }
 
-    async function authFetch(url) {
-      const key = $("apiKey").value.trim();
-      return fetch(url, { headers: { "X-API-Key": key }, cache: "no-store" });
+    async function dataFetch(url) {
+      return fetch(url, { cache: "no-store" });
     }
 
     function fillSelect(element, values) {
@@ -288,7 +271,7 @@
         const cached = state.blobs.get(item.capture_id);
         if (cached) { node.src = cached; return; }
         try {
-          const response = await authFetch(item.image.url);
+          const response = await dataFetch(item.image.url);
           if (!response.ok) return;
           const url = URL.createObjectURL(await response.blob());
           state.blobs.set(item.capture_id, url);
@@ -317,20 +300,16 @@
     }
 
     async function refresh() {
-      const key = $("apiKey").value.trim();
-      if (!key) { showError("API 키를 입력해 주세요."); return; }
       showError();
       setConnection("", "불러오는 중");
       try {
         const [summaryResponse, healthResponse] = await Promise.all([
-          authFetch("/api/v1/monitor/summary?limit=50"),
+          dataFetch("/api/v1/monitor/summary?limit=50"),
           fetch("/health", { cache: "no-store" })
         ]);
-        if (summaryResponse.status === 401 || summaryResponse.status === 422) throw new Error("API 키가 올바르지 않습니다.");
         if (!summaryResponse.ok) throw new Error(`현황 API 오류 (${summaryResponse.status})`);
         state.data = await summaryResponse.json();
         const health = healthResponse.ok ? await healthResponse.json() : null;
-        sessionStorage.setItem("expo-monitor-key", key);
         renderSummary(state.data, health);
         renderCaptures();
         const healthy = health?.status === "ok";
@@ -343,11 +322,8 @@
       }
     }
 
-    $("connectButton").addEventListener("click", refresh);
-    $("apiKey").addEventListener("keydown", event => { if (event.key === "Enter") refresh(); });
     ["search", "classFilter", "statusFilter", "qualityFilter"].forEach(id => $(id).addEventListener("input", renderCaptures));
-    const saved = sessionStorage.getItem("expo-monitor-key");
-    if (saved) { $("apiKey").value = saved; refresh(); }
+    refresh();
     window.addEventListener("beforeunload", () => {
       state.blobs.forEach(URL.revokeObjectURL);
     });
