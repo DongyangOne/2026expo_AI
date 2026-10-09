@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException, RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.api import monitor
 from app.api.v1 import detect
 from app.core.config import settings
 from app.models.registry import ModelRegistry
@@ -50,6 +51,7 @@ app = FastAPI(
 )
 
 app.include_router(detect.router, prefix="/api/v1", tags=["detect"])
+app.include_router(monitor.router, tags=["monitor"])
 
 
 # ── 예외 핸들러 ──────────────────────────────────────────────────────────────────

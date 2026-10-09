@@ -29,6 +29,7 @@ def test_save_capture_writes_paired_image_and_result_json(tmp_path, monkeypatch)
         client_id="hardware/user-001",
         weight_g=28.0,
         result=result,
+        process_ms=3210.5,
     )
 
     images = list(capture_dir.rglob("*.jpg"))
@@ -43,6 +44,7 @@ def test_save_capture_writes_paired_image_and_result_json(tmp_path, monkeypatch)
         "client_id": "hardware/user-001",
         "weight_g": 28.0,
     }
+    assert metadata["metrics"] == {"process_ms": 3210.5}
     assert metadata["result"]["client_id"] == "hardware/user-001"
     assert metadata["result"]["status"] == "NOT_DETECTED"
     assert metadata["image"]["original_filename"] == "sample.jpg"

@@ -266,6 +266,7 @@ async def detect(
                 client_id=form.client_id,
                 weight_g=form.weight_g,
                 result=result,
+                process_ms=elapsed_ms,
             )
         except Exception:
             # 캡처는 보조 기능이므로 실패해도 추론 응답은 정상 반환한다.

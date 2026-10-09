@@ -115,6 +115,7 @@ def save_capture(
     client_id: str,
     weight_g: float | None,
     result: DetectResponse,
+    process_ms: float | None = None,
 ) -> None:
     """원본 이미지와 판정 JSON을 같은 capture_id로 저장한다.
 
@@ -157,6 +158,7 @@ def save_capture(
                 "weight_g": weight_g,
             },
             "result": result.model_dump(mode="json"),
+            "metrics": {"process_ms": process_ms} if process_ms is not None else {},
             "review": {
                 "is_correct": None,
                 "expected_class": None,
