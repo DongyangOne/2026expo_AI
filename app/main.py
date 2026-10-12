@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.critical("모델 로드 실패", exc_info=True)
         app.state.registry = None
+    local_llm.startup()
     yield
     pipeline.shutdown()
     logger.info("=== 서버 종료 ===")
@@ -97,7 +98,8 @@ async def health_check(request: Request) -> HealthResponse:
     }
     llm_status = await asyncio.to_thread(local_llm.health_status)
     healthy = bool(model_status.get("main")) and (
-        not llm_status["required"] or llm_status["status"] == "ok"
+        not llm_status["required"]
+        or llm_status["status"] in {"ok", "scheduled_idle"}
     )
     return HealthResponse(
         status="ok" if healthy else "degraded",

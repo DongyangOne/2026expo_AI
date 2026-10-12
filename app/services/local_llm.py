@@ -23,6 +23,7 @@ import httpx
 import numpy as np
 
 from app.core.config import settings
+from app.services import openrouter_client
 
 logger = logging.getLogger(__name__)
 _shadow_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-llm-shadow")
@@ -231,19 +232,35 @@ class LocalLLMPrediction:
     has_cup_holder: bool = False
 
 
-def enabled() -> bool:
+def _ollama_enabled() -> bool:
     return (
         settings.LOCAL_LLM_MODE in {"shadow", "primary"}
         and bool(settings.LOCAL_LLM_BASE_URL)
     )
 
 
+def enabled() -> bool:
+    return openrouter_client.enabled() or _ollama_enabled()
+
+
 def primary_enabled() -> bool:
-    return enabled() and settings.LOCAL_LLM_MODE == "primary"
+    return (
+        openrouter_client.enabled()
+        or (_ollama_enabled() and settings.LOCAL_LLM_MODE == "primary")
+    )
+
+
+def startup() -> None:
+    """Start optional upstream warmup workers with the API process."""
+    openrouter_client.start_keepalive()
 
 
 def health_status() -> dict[str, Any]:
     """Check the NAS gateway without exposing its URL or credentials."""
+    if openrouter_client.enabled():
+        status = openrouter_client.health_status()
+        status["required"] = True
+        return status
     base = {
         "enabled": enabled(),
         "required": primary_enabled(),
@@ -408,21 +425,9 @@ def _get_http_client() -> httpx.Client:
     return _http_client
 
 
-def _classify_with_prompt(
-    img: np.ndarray,
-    bbox: list[float],
-    prompt: str,
-    *,
-    crop_only: bool = False,
-    crop_max_side: int | None = None,
-) -> LocalLLMPrediction | None:
-    """Synchronously query local Ollama; callers run this outside the event loop."""
-    if not enabled():
-        return None
-    images = _images_as_jpeg(
-        img, bbox, crop_only=crop_only, crop_max_side=crop_max_side,
-    )
-    if not images:
+def _query_ollama(images: list[str], prompt: str) -> LocalLLMPrediction | None:
+    """Query the existing MiniCPM/Ollama path used as the safe fallback."""
+    if not _ollama_enabled():
         return None
     headers = {"Content-Type": "application/json"}
     if settings.LOCAL_LLM_API_KEY:
@@ -448,6 +453,35 @@ def _classify_with_prompt(
     except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("NAS local LLM classification skipped: %s", exc)
         return None
+
+
+def _classify_with_prompt(
+    img: np.ndarray,
+    bbox: list[float],
+    prompt: str,
+    *,
+    crop_only: bool = False,
+    crop_max_side: int | None = None,
+) -> LocalLLMPrediction | None:
+    """Query OpenRouter first, then use the existing local fallback."""
+    if not enabled():
+        return None
+    images = _images_as_jpeg(
+        img, bbox, crop_only=crop_only, crop_max_side=crop_max_side,
+    )
+    if not images:
+        return None
+    if openrouter_client.enabled():
+        content = openrouter_client.generate(prompt, images)
+        if content is not None:
+            try:
+                return _parse(content)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    "OpenRouter JSON contract failed (%s); using MiniCPM",
+                    type(exc).__name__,
+                )
+    return _query_ollama(images, prompt)
 
 
 def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
@@ -633,3 +667,4 @@ def shutdown() -> None:
         if _http_client is not None:
             _http_client.close()
             _http_client = None
+    openrouter_client.shutdown()

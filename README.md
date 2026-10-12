@@ -3,7 +3,8 @@
 카메라 이미지와 무게 센서값으로 단일 투입 쓰레기를 판정하는 FastAPI 서버입니다.
 
 - YOLO: 원형 투입 받침대 위 객체의 bbox와 `NOT_DETECTED` 판정
-- NAS 로컬 Vision LLM: bbox crop의 품목·라벨·압착·외부 이물질 최종 판정
+- OpenRouter Qwen3.8 Vision: bbox crop의 품목·라벨·압착·외부 이물질 우선 판정
+- NAS MiniCPM: OpenRouter timeout·한도·응답 오류 시 자동 대체 판정
 - 규칙 엔진: 무게·상태 조건을 조합해 `ALLOWED`·`REJECTED`·`GENERAL_WASTE` 결정
 - Spring 콜백: 하드웨어 즉시 응답과 같은 JSON을 백그라운드 전송
 
@@ -12,7 +13,9 @@
 | 위치 | 모델 | 역할 |
 |---|---|---|
 | Pi5 | `yolo26m_best_ncnn_model` | bbox, 9종 후보, 신뢰도 생성 |
-| NAS Ollama | `minicpm-v4.5:8b` | 최종 품목·라벨·압착·외부 이물질 판정 |
+| OpenRouter / DeepInfra | `qwen/qwen3.8-27b` | 최종 품목·라벨·압착·외부 이물질 우선 판정 |
+| OpenRouter / DekaLLM·Parasail | `qwen/qwen3.8-27b` | 같은 모델의 제공자 장애 대체 |
+| NAS Ollama | `minicpm-v4.5:8b` | OpenRouter 전체 실패 시 자동 대체 판정 |
 | Pi5 | `multihead.onnx` | 라벨·압착 상태 기본값 |
 | Pi5 | `verifier_qwen35_mnv3_v1.onnx` | crop 보조 판정과 비교 로그 |
 
@@ -101,12 +104,25 @@ LOCAL_LLM_BASE_URL=https://llm.naco.kro.kr
 LOCAL_LLM_API_KEY=replace-me
 LOCAL_LLM_MODEL=minicpm-v4.5:8b
 LOCAL_LLM_PRIMARY_FALLBACK_TO_YOLO=false
+OPENROUTER_ENABLED=true
+OPENROUTER_API_KEY=replace-with-openrouter-key
+OPENROUTER_MODEL=qwen/qwen3.8-27b
+OPENROUTER_PRIMARY_PROVIDER=deepinfra
+OPENROUTER_FALLBACK_PROVIDERS=dekallm,parasail
+OPENROUTER_KEEPALIVE_INTERVAL_SEC=240
+OPENROUTER_KEEPALIVE_START_HOUR=8
+OPENROUTER_KEEPALIVE_END_HOUR=19
 SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result
 ```
 
 YOLO는 대상 위치를 찾고, Vision LLM은 영문 분류 기준과 함께 전체 프레임(형태·장면) 및
 패딩된 crop(재질·세부)을 입력받아 최종 품목과 상태를 판정합니다. YOLO 미감지 시에는
 전체 프레임으로 판정합니다.
+
+OpenRouter 요청의 제공자·input/output/total token·비용·처리 시간은
+`logs/openrouter_usage.jsonl`에 기록합니다. DeepInfra 요청이 실패하면 같은 Qwen3.8 모델을
+DekaLLM, Parasail 순서로 시도하고, 모두 실패하면 기존 MiniCPM으로 자동 재처리합니다.
+DeepInfra 상주 요청은 서울 시간 08:00 이상 19:00 미만에만 4분 간격으로 실행합니다.
 
 전체 설정 예시는 [.env.example](.env.example)에 있습니다. 실제 API key와 gateway 인증값은
 Git에 넣지 않습니다.

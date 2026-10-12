@@ -347,6 +347,60 @@ def test_http_client_is_reused(monkeypatch):
     assert created == [{"timeout": local_llm.settings.LOCAL_LLM_TIMEOUT_SEC}]
 
 
+def test_openrouter_valid_json_is_used_without_calling_ollama(monkeypatch):
+    answer = json.dumps({
+        "material": "paper", "confidence": 0.96, "has_label": False,
+        "compression_required": False, "is_dented": False, "has_straw": False,
+        "has_cup_holder": False, "has_foreign_material": False,
+        "is_single_primary_item": True,
+    })
+    monkeypatch.setattr(local_llm, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm.openrouter_client, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm.openrouter_client, "generate", lambda *_args: answer)
+    monkeypatch.setattr(
+        local_llm, "_query_ollama",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Ollama called")),
+    )
+
+    result = local_llm._classify_with_prompt(
+        np.zeros((32, 32, 3), dtype=np.uint8), [0, 0, 32, 32], "prompt"
+    )
+
+    assert result is not None
+    assert result.class_name == "paper"
+
+
+def test_openrouter_failure_falls_back_to_existing_ollama(monkeypatch):
+    fallback = local_llm.LocalLLMPrediction(
+        class_id=5, class_name="vinyl", confidence=0.91, has_label=False,
+        compression_required=False, is_dented=False, has_straw=False,
+        has_cup_holder=False, has_foreign_material=False, is_single_primary_item=True,
+    )
+    monkeypatch.setattr(local_llm, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm.openrouter_client, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm.openrouter_client, "generate", lambda *_args: None)
+    monkeypatch.setattr(local_llm, "_query_ollama", lambda *_args, **_kwargs: fallback)
+
+    result = local_llm._classify_with_prompt(
+        np.zeros((32, 32, 3), dtype=np.uint8), [0, 0, 32, 32], "prompt"
+    )
+
+    assert result == fallback
+
+
+def test_openrouter_failure_without_local_backend_returns_none(monkeypatch):
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MODE", "disabled")
+    monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_BASE_URL", None)
+    monkeypatch.setattr(local_llm.openrouter_client, "enabled", lambda: True)
+    monkeypatch.setattr(local_llm.openrouter_client, "generate", lambda *_args: None)
+
+    result = local_llm._classify_with_prompt(
+        np.zeros((32, 32, 3), dtype=np.uint8), [0, 0, 32, 32], "prompt"
+    )
+
+    assert result is None
+
+
 class _HealthResponse:
     def __init__(self, payload):
         self._payload = payload

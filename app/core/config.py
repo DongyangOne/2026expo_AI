@@ -94,6 +94,22 @@ class Settings(BaseSettings):
     LOCAL_LLM_VINYL_SPECIALIST_MAX_WEIGHT_G: float = 5.0
     LOCAL_LLM_VINYL_SPECIALIST_MIN_YOLO_CONFIDENCE: float = 0.50
 
+    # ── OpenRouter Vision 우선 판정 ───────────────────────────────────────────
+    OPENROUTER_ENABLED: bool = False
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_API_KEY: str | None = None
+    OPENROUTER_MODEL: str = "qwen/qwen3.8-27b"
+    OPENROUTER_PRIMARY_PROVIDER: str = "deepinfra"
+    OPENROUTER_FALLBACK_PROVIDERS: str = "dekallm,parasail"
+    OPENROUTER_SESSION_ID: str = "expo-production"
+    OPENROUTER_TOTAL_TIMEOUT_SEC: float = 5.0
+    OPENROUTER_ATTEMPT_TIMEOUT_SEC: float = 3.2
+    OPENROUTER_KEEPALIVE_INTERVAL_SEC: float = 240.0
+    OPENROUTER_KEEPALIVE_START_HOUR: int = 8
+    OPENROUTER_KEEPALIVE_END_HOUR: int = 19
+    OPENROUTER_MAX_TOKENS: int = 120
+    OPENROUTER_USAGE_LOG_PATH: str = "logs/openrouter_usage.jsonl"
+
     @field_validator("LOCAL_LLM_MODE")
     @classmethod
     def validate_local_llm_mode(cls, value: str) -> str:

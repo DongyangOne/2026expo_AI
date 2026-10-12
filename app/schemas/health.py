@@ -14,7 +14,7 @@ class LLMHealth(BaseModel):
     required: bool = Field(..., description="현재 분류에서 LLM이 필수(primary)인지 여부")
     status: Literal[
         "ok", "disabled", "unavailable", "model_missing",
-        "model_not_loaded", "cpu_fallback",
+        "model_not_loaded", "cpu_fallback", "scheduled_idle",
     ] = Field(
         ..., description="NAS LLM gateway와 운영 모델 상태"
     )
@@ -28,6 +28,16 @@ class LLMHealth(BaseModel):
         None, description="Ollama가 보고한 운영 모델의 VRAM 적재량(byte)"
     )
     latency_ms: float | None = Field(None, description="NAS 상태 확인 왕복 시간(ms)")
+    keepalive_window_active: bool | None = Field(
+        None, description="OpenRouter 상주 시간대(08:00~19:00 KST) 여부"
+    )
+    last_keepalive_at: str | None = Field(None, description="마지막 상주 요청 시각(UTC)")
+    last_keepalive_ok: bool | None = Field(None, description="마지막 상주 요청 성공 여부")
+    last_keepalive_latency_ms: float | None = Field(
+        None, description="마지막 상주 요청 응답 시간(ms)"
+    )
+    last_provider: str | None = Field(None, description="마지막 응답 제공자")
+    last_error: str | None = Field(None, description="마지막 OpenRouter 오류 유형")
 
 
 class HealthResponse(BaseModel):
