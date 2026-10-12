@@ -308,12 +308,15 @@ async def run(
         (perf_counter() - yolo_started_at) * 1000,
     )
 
-    # ── 미감지 → primary LLM 원본 전체 fallback ─────────────────────────────────
-    # YOLO가 정상적으로 bbox를 제공할 때의 crop 우선 경로는 바꾸지 않는다. 다만
-    # 투명·단색 비닐처럼 bbox 자체가 없는 경우에만 원본 프레임을 LLM에 보낸다.
-    full_frame_llm_fallback = detection is None
+    # ── 받침대 bbox 없음 → primary LLM 받침대 관찰영역 fallback ────────────────
+    # YOLO가 bbox를 놓치거나 주변 장비만 잡아도 바로 거부하지 않는다. 원형 받침대와
+    # 그 위에 물체가 세워질 공간만 잘라 LLM이 한 번 더 판정한다.
+    roi_llm_fallback = detection is None
+    if detection is inference.PLATFORM_ROI_REJECTED:
+        logger.info("받침대 밖 YOLO bbox 무시 후 ROI fallback: client_id=%s", client_id)
+        roi_llm_fallback = True
     llm_prediction = None
-    if full_frame_llm_fallback:
+    if roi_llm_fallback:
         if not local_llm.primary_enabled():
             return DetectResponse(
                 client_id=client_id,
@@ -324,10 +327,15 @@ async def run(
         bbox = [0.0, 0.0, float(width), float(height)]
         yolo_class_id = None
         yolo_confidence = None
+        llm_img = inference.platform_observation_crop(img)
+        llm_height, llm_width = llm_img.shape[:2]
+        llm_bbox = [0.0, 0.0, float(llm_width), float(llm_height)]
         llm_started_at = perf_counter()
-        llm_prediction = await loop.run_in_executor(_executor, local_llm.classify, img, bbox)
+        llm_prediction = await loop.run_in_executor(
+            _executor, local_llm.classify, llm_img, llm_bbox,
+        )
         logger.info(
-            "NAS LLM 전체프레임 fallback 시간: client_id=%s llm_ms=%.1f available=%s",
+            "NAS LLM 받침대 ROI fallback 시간: client_id=%s llm_ms=%.1f available=%s",
             client_id,
             (perf_counter() - llm_started_at) * 1000,
             llm_prediction is not None,
@@ -372,7 +380,7 @@ async def run(
         yolo_class_id = class_id
         yolo_confidence = confidence
 
-    if local_llm.primary_enabled() and not full_frame_llm_fallback:
+    if local_llm.primary_enabled() and not roi_llm_fallback:
         vinyl_specialist_used = _use_vinyl_specialist(
             yolo_class_id, yolo_confidence, weight_g,
         )
@@ -527,9 +535,9 @@ async def run(
                     bbox=[round(v, 1) for v in bbox],
                 )
             llm_prediction = None
-    elif not full_frame_llm_fallback:
+    elif not roi_llm_fallback:
         local_llm.submit_shadow(img, bbox, yolo_class_id, yolo_confidence, client_id)
-    verifier_session = None if full_frame_llm_fallback else (
+    verifier_session = None if roi_llm_fallback else (
         registry.verifier() if hasattr(registry, "verifier") else None
     )
     vinyl_candidate = _find_vinyl_candidate(
@@ -623,7 +631,7 @@ async def run(
                 client_id,
             )
 
-    if not full_frame_llm_fallback:
+    if not roi_llm_fallback:
         if verifier_prediction is None:
             verifier_shadow.submit(
                 verifier_session, img, bbox, yolo_class_id, yolo_confidence, client_id

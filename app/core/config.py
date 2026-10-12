@@ -122,6 +122,16 @@ class Settings(BaseSettings):
     SUB_IMG_SIZE: int = 224
     DEVICE: str = "cpu"              # Pi5 CPU, GPU 환경이면 "0"
 
+    # 최종 하드웨어 화각의 원형 투입 받침대. bbox의 아래쪽 중심점을 이 타원에
+    # 투영해 받침대 위 물체만 인정한다. 값은 이미지 크기에 대한 0~1 비율이다.
+    PLATFORM_ROI_ENABLED: bool = True
+    PLATFORM_ROI_CENTER_X: float = 0.447
+    PLATFORM_ROI_CENTER_Y: float = 0.590
+    PLATFORM_ROI_RADIUS_X: float = 0.175
+    PLATFORM_ROI_RADIUS_Y: float = 0.160
+    PLATFORM_ROI_ANCHOR_Y_RATIO: float = 0.85
+    PLATFORM_ROI_FALLBACK_X_MULTIPLIER: float = 1.5
+
     # ── 무게 이상 감지 ────────────────────────────────────────────────────────────
     WEIGHT_ANOMALY_ENABLED: bool = True
 

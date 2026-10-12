@@ -18,9 +18,10 @@ router = APIRouter()
 
 _DETECT_DESCRIPTION = """
 이미지와 무게 값으로 단일 투입 재활용품을 판정합니다. 운영 `primary` 모드에서는
-YOLO가 객체 위치를 검출하고 해당 crop을 NAS 로컬 Vision LLM이 품목·라벨·압착·외부
-이물질까지 최종 판정합니다. YOLO가 bbox를 찾지 못하면 LLM이 원본 전체 프레임을 한 번만
-판정합니다. 무게 및 안내 코드는 기존 규칙으로
+YOLO가 객체 위치를 검출하고, bbox의 아래쪽 중심점이 고정 원형 받침대 ROI 안에 있는
+물체만 NAS 로컬 Vision LLM이 품목·라벨·압착·외부 이물질까지 최종 판정합니다. 신뢰도
+기준을 넘은 bbox가 받침대 밖에만 있거나 YOLO가 bbox를 찾지 못하면, 주변을 제외한 받침대와
+그 위쪽 관찰 영역만 잘라 LLM이 한 번 더 판정합니다. 무게 및 안내 코드는 기존 규칙으로
 결정합니다. LLM이 단독 일반폐기물(예: 빨대)을 확정하면 `GENERAL_WASTE / GENERAL_WASTE`로
 일반함 처리합니다. LLM이 응답하지 않거나, 저신뢰이거나, 단일 주 물체가 아니면 YOLO 품목으로
 대체하지 않고 `GENERAL_WASTE / LOW_CONFIDENCE`로 보류합니다.
@@ -97,7 +98,7 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | `REJECTED` + guidance | 조건 불충족, 재처리 후 재투입 | `classification`, `conditions`, `weight`, 1개 이상의 `guidance`, `bbox` |
 | `REJECTED` + rejection | 기기 수거 불가 | `classification`, `rejection`, 빈 `guidance`, `bbox` |
 | `GENERAL_WASTE` | 단독 일반폐기물 확정 또는 LLM 장애·저신뢰·복수 물체 보류 | `general`, 빈 `guidance`, `bbox`; `classification`은 생략 |
-| `NOT_DETECTED` | YOLO와 전체프레임 LLM 모두 품목을 확정하지 못함 | `client_id`, `status`, 빈 `conditions`, `weight.anomaly=false`, 빈 `guidance` |
+| `NOT_DETECTED` | YOLO 후속 받침대 ROI LLM도 품목을 확정하지 못함 | `client_id`, `status`, 빈 `conditions`, `weight.anomaly=false`, 빈 `guidance` |
 
 ## 전체 분기표
 
@@ -107,8 +108,8 @@ PET는 외부 분류가 `plastic/3`이어도 내부 PET 상태 기준으로 라�
 | 우선순위 | 판정 조건 | status | class_id / class_name | 추가 필드·코드 |
 |---:|---|---|---|---|
 | 1 | Vision LLM 비활성 경로에서 `weight_g`가 설정된 하한 미만(기본 1g) | `NOT_DETECTED` | 생략 | 빈 물체 오탐 방지. primary 모드의 얇은 종이·비닐은 이미지 판정 계속 |
-| 2 | YOLO bbox 미감지 + 전체프레임 LLM 단일 품목 확정 | 최종 품목 기준 | LLM 결과 | bbox=원본 전체 범위. LLM이 일반폐기물을 확정하면 `GENERAL_WASTE` |
-| 3 | YOLO bbox 미감지 + LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `NOT_DETECTED` | 생략 | `weight.anomaly=false` |
+| 2 | YOLO bbox가 받침대 ROI 밖에만 있거나 bbox 미감지 + 받침대 ROI LLM 단일 품목 확정 | 최종 품목 기준 | LLM 결과 | 주변을 제외한 받침대 관찰 영역으로 재판정. LLM이 일반폐기물을 확정하면 `GENERAL_WASTE` |
+| 3 | YOLO 유효 bbox 없음 + 받침대 ROI LLM 장애·JSON 오류·저신뢰·복수 주 물체 | `NOT_DETECTED` | 생략 | `weight.anomaly=false` |
 | 4 | LLM이 단독 일반폐기물로 확정 (예: 빨대) | `GENERAL_WASTE` | 생략 | `general.code=GENERAL_WASTE`, bbox 유지, 일반함 처리 |
 | 5 | LLM 장애·JSON 오류·저신뢰·복수 주 물체 (YOLO bbox 있음) | `GENERAL_WASTE` | 생략 | `general.code=LOW_CONFIDENCE`, bbox 유지, YOLO 품목 fallback 없음 |
 | 6 | 캔: 무게 정상·외부 이물질 없음·압착됨 | `ALLOWED` | `0 / can` | `conditions.is_dented=true` |

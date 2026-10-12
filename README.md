@@ -2,7 +2,7 @@
 
 카메라 이미지와 무게 센서값으로 단일 투입 쓰레기를 판정하는 FastAPI 서버입니다.
 
-- YOLO: 객체 bbox와 `NOT_DETECTED` 판정
+- YOLO: 원형 투입 받침대 위 객체의 bbox와 `NOT_DETECTED` 판정
 - NAS 로컬 Vision LLM: bbox crop의 품목·라벨·압착·외부 이물질 최종 판정
 - 규칙 엔진: 무게·상태 조건을 조합해 `ALLOWED`·`REJECTED`·`GENERAL_WASTE` 결정
 - Spring 콜백: 하드웨어 즉시 응답과 같은 JSON을 백그라운드 전송
@@ -16,8 +16,10 @@
 | Pi5 | `multihead.onnx` | 라벨·압착 상태 기본값 |
 | Pi5 | `verifier_qwen35_mnv3_v1.onnx` | crop 보조 판정과 비교 로그 |
 
-일반 요청은 전체 프레임과 YOLO crop을 Vision LLM에 함께 전달합니다. YOLO 미감지 시에는
-전체 프레임으로 다시 판정하고, 비닐/플라스틱 또는 고신뢰 재질 충돌에만 제한적으로 2차 판정을
+일반 요청은 전체 프레임과 YOLO crop을 Vision LLM에 함께 전달합니다. YOLO bbox의 아래쪽
+중심점이 고정 원형 받침대 ROI 안에 있을 때만 투입 물체로 인정합니다. 신뢰도 기준을 넘은
+bbox가 받침대 밖에만 있거나 YOLO가 bbox를 만들지 못하면, 주변을 제외한 받침대와 그 위쪽
+공간만 잘라 Vision LLM이 다시 판정합니다. 비닐/플라스틱 또는 고신뢰 재질 충돌에만 제한적으로 2차 판정을
 실행합니다. 세부 흐름과 평가 수치는 [EXPO AI 구성 및 평가 결과](docs/ACCURACY_AND_ARCHITECTURE.md)에
 정리돼 있습니다.
 

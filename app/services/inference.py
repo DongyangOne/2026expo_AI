@@ -29,6 +29,11 @@ VERIFIER_CLASS_NAMES = (
     "vinyl", "glass", "battery", "fluorescent",
 )
 
+# YOLO가 충분히 확신한 박스는 있었지만 최종 투입 받침대 밖에만 있었음을
+# pipeline에 전달한다. 단순 미감지(None)와 구분하되 두 경우 모두 주변을 제외한
+# 받침대 관찰영역 LLM fallback으로 복구한다.
+PLATFORM_ROI_REJECTED = object()
+
 
 @dataclass(frozen=True)
 class StatePrediction:
@@ -40,6 +45,45 @@ class StatePrediction:
 
     conditions: Conditions
     has_foreign_material: bool | None = None
+
+
+def _bbox_anchor_on_platform(bbox: list[float], img: np.ndarray) -> bool:
+    """Return whether the lower-center object anchor lies on the platform ROI."""
+    if not settings.PLATFORM_ROI_ENABLED:
+        return True
+    height, width = img.shape[:2]
+    if width <= 0 or height <= 0:
+        return False
+    x1, y1, x2, y2 = (float(value) for value in bbox)
+    if x2 <= x1 or y2 <= y1:
+        return False
+    anchor_x = ((x1 + x2) / 2.0) / width
+    anchor_y = (y1 + (y2 - y1) * settings.PLATFORM_ROI_ANCHOR_Y_RATIO) / height
+    dx = (anchor_x - settings.PLATFORM_ROI_CENTER_X) / settings.PLATFORM_ROI_RADIUS_X
+    dy = (anchor_y - settings.PLATFORM_ROI_CENTER_Y) / settings.PLATFORM_ROI_RADIUS_Y
+    return dx * dx + dy * dy <= 1.0
+
+
+def platform_observation_crop(img: np.ndarray) -> np.ndarray:
+    """Crop the platform and the vertical space where an item can stand."""
+    if not settings.PLATFORM_ROI_ENABLED:
+        return img
+    height, width = img.shape[:2]
+    center_x = settings.PLATFORM_ROI_CENTER_X * width
+    radius_x = (
+        settings.PLATFORM_ROI_RADIUS_X
+        * settings.PLATFORM_ROI_FALLBACK_X_MULTIPLIER
+        * width
+    )
+    x1 = max(0, int(center_x - radius_x))
+    x2 = min(width, int(center_x + radius_x))
+    y2 = min(
+        height,
+        int((settings.PLATFORM_ROI_CENTER_Y + settings.PLATFORM_ROI_RADIUS_Y) * height),
+    )
+    if x2 <= x1 or y2 <= 0:
+        return img
+    return img[:y2, x1:x2]
 
 
 def run_main(registry: ModelRegistry, img: np.ndarray):
@@ -71,11 +115,17 @@ def run_main(registry: ModelRegistry, img: np.ndarray):
         (int(boxes.cls[index]), float(boxes.conf[index]), boxes.xyxy[index].tolist())
         for index in range(len(boxes))
     ]
-    eligible = [
+    confidence_eligible = [
         index for index, (_, confidence, _) in enumerate(candidates)
         if confidence >= settings.DETECT_CONF
     ]
+    eligible = [
+        index for index in confidence_eligible
+        if _bbox_anchor_on_platform(candidates[index][2], img)
+    ]
     if not eligible:
+        if confidence_eligible and settings.PLATFORM_ROI_ENABLED:
+            return PLATFORM_ROI_REJECTED
         return None
     best = max(eligible, key=lambda index: candidates[index][1])
     class_id, confidence, bbox = candidates[best]
