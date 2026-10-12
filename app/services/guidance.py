@@ -118,7 +118,9 @@ def build_guidance(
         codes.append(GuidanceCode.WEIGHT_ANOMALY)
     if has_straw is True:
         codes.append(GuidanceCode.REMOVE_STRAW)
-    if has_cup_holder is True:
+    # 컵홀더 제거 안내는 플라스틱/PET 컵에 부착된 종이 슬리브에만 적용한다.
+    # 종이 가방의 손잡이·끈 등을 LLM이 컵홀더로 오인하더라도 종이 자체를 거절하지 않는다.
+    if has_cup_holder is True and cls in (WasteClass.PET, WasteClass.PLASTIC):
         codes.append(GuidanceCode.REMOVE_CUP_HOLDER)
     if has_foreign_material is True:
         codes.append(GuidanceCode.FOREIGN_MATERIAL)

@@ -128,6 +128,15 @@ class TestConditionsUnmet:
             GuidanceCode.REMOVE_CUP_HOLDER,
         ]
 
+    def test_종이_가방_손잡이는_컵홀더_안내로_거절하지_않는다(self):
+        g = guidance.build_guidance(
+            WasteClass.PAPER,
+            Conditions(),
+            False,
+            has_cup_holder=True,
+        )
+        assert g == []
+
     def test_부착물_코드는_일반_이물질보다_앞선다(self):
         g = guidance.build_guidance(
             WasteClass.PLASTIC,

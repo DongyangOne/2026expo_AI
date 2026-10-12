@@ -81,7 +81,7 @@ State rules:
 - A cafe cup is plastic only after its loose straw and paper sleeve/holder are removed. A loose straw is general_waste; a loose sleeve/holder is paper.
 - For the cup itself, distinguish material: an opaque matte cup with a rolled paper rim or paper seam is paper; a clearly translucent, glossy, injection-molded cup is plastic.
 - has_straw=true only when a removable drinking straw is physically attached to or inserted into the primary item. A loose straw is general_waste instead.
-- has_cup_holder=true only when a removable paper cup sleeve/holder is physically attached around the primary item. A loose sleeve/holder is paper instead.
+- has_cup_holder=true only when a short removable paper sleeve is wrapped around a cylindrical drinking cup. Bag handles, straps, ropes, folded paper, boxes, and loose sleeves are not cup holders.
 - has_foreign_material=true only for another removable material physically attached to, inside, or mixed with the primary item. Do not set it merely because has_straw or has_cup_holder is true. Background objects are not foreign material.
 - has_label=true whenever a removable printed sleeve or wrap around a PET or plastic bottle body is still attached. Count it as a label whether it is transparent, translucent, colored, or opaque, and whether it covers all or only part of the body. Bottle branding printed on that separate sleeve/wrap is strong label evidence.
 - compression_required=true for every can and PET beverage bottle. For ordinary plastic, use true only for a thin-walled hollow plastic bottle or container that a person can safely flatten by hand.
