@@ -328,8 +328,7 @@ async def run(
         yolo_class_id = None
         yolo_confidence = None
         llm_img = inference.platform_observation_crop(img)
-        llm_height, llm_width = llm_img.shape[:2]
-        llm_bbox = [0.0, 0.0, float(llm_width), float(llm_height)]
+        llm_bbox = inference.platform_detail_bbox(llm_img)
         llm_started_at = perf_counter()
         llm_prediction = await loop.run_in_executor(
             _executor, local_llm.classify, llm_img, llm_bbox,

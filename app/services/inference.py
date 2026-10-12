@@ -86,6 +86,24 @@ def platform_observation_crop(img: np.ndarray) -> np.ndarray:
     return img[:y2, x1:x2]
 
 
+def platform_detail_bbox(img: np.ndarray) -> list[float]:
+    """Return a fixed detail box around the platform item zone.
+
+    The full platform observation remains available as scene context.  This
+    tighter box gives the vision model enough pixels for short or flattened
+    items when YOLO has no usable detection.
+    """
+    height, width = img.shape[:2]
+    x_margin = int(width * 0.15)
+    y_top = int(height * 0.21)
+    return [
+        float(x_margin),
+        float(y_top),
+        float(width - x_margin),
+        float(height),
+    ]
+
+
 def run_main(registry: ModelRegistry, img: np.ndarray):
     """
     주 9-class YOLO.

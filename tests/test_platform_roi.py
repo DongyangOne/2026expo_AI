@@ -75,11 +75,20 @@ def test_platform_observation_crop_keeps_platform_and_removes_side_background() 
     assert cropped.shape == (360, 336, 3)
 
 
+def test_platform_detail_bbox_focuses_the_item_zone_inside_observation_crop() -> None:
+    cropped = np.zeros((360, 336, 3), dtype=np.uint8)
+
+    bbox = inference.platform_detail_bbox(cropped)
+
+    assert bbox == [50.0, 75.0, 286.0, 360.0]
+
+
 def test_pipeline_uses_platform_crop_llm_when_yolo_only_finds_off_platform_box(
     monkeypatch,
 ) -> None:
     marker = getattr(inference, "PLATFORM_ROI_REJECTED", object())
     received_shape = None
+    received_bbox = None
     prediction = pipeline.local_llm.LocalLLMPrediction(
         class_id=5,
         class_name="vinyl",
@@ -93,9 +102,10 @@ def test_pipeline_uses_platform_crop_llm_when_yolo_only_finds_off_platform_box(
     async def fake_read_image(_upload):
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
-    def classify_platform(image, _bbox):
-        nonlocal received_shape
+    def classify_platform(image, bbox):
+        nonlocal received_shape, received_bbox
         received_shape = image.shape
+        received_bbox = bbox
         return prediction
 
     monkeypatch.setattr(pipeline, "_read_image", fake_read_image)
@@ -124,3 +134,4 @@ def test_pipeline_uses_platform_crop_llm_when_yolo_only_finds_off_platform_box(
     assert result.classification is not None
     assert result.classification.class_name.value == "vinyl"
     assert received_shape == (360, 336, 3)
+    assert received_bbox == [50.0, 75.0, 286.0, 360.0]

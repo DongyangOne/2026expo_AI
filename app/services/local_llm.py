@@ -68,7 +68,7 @@ Image usage:
 Choose exactly one material:
 - can: metal beverage or food can.
 - pet: a lightweight molded plastic bottle with a bottle neck, including transparent, colored, tinted, or opaque PET-style bottles. Do not use for rigid cups, lids, trays, or non-bottle containers. A dark or amber bottle is not glass merely because its color hides transparency; require clear glass cues such as a thick rigid wall/base and glass-like reflections before choosing glass.
-- paper: paper, cardboard, carton, paper cup, or a loose paper cup sleeve/holder. A matte opaque disposable drink cup with a rolled paper rim or side seam is paper unless there is clear rigid-polymer evidence.
+- paper: paper, cardboard, carton, paper cup, or a loose paper cup sleeve/holder. A matte opaque disposable drink cup with a rolled paper rim or side seam is paper unless there is clear rigid-polymer evidence. A folded box, envelope, gift bag, or cardboard package remains paper when glossy, laminated, coated, or heavily printed; folded flaps, scored creases, glued seams, layered edges, or a shape made from a folded sheet are stronger evidence than surface shine.
 - plastic: rigid molded polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, squeeze tube, or container. Printed paper or film wrapped around a rigid molded cup/container is a label or contaminant; it does not make the primary item paper. A printed flexible squeeze tube is plastic, not paper.
 - styrofoam: expanded-polystyrene foam, including white or black lightweight molded foam food trays and packaging. The surface may look smooth and the foam beads may be subtle, especially on dark trays; an embossed material mark and molded ribs can be stronger evidence than visible beads.
 - vinyl: thin flexible film, bag, wrapper, or pouch that bends, folds, wrinkles, crumples, or has heat-sealed edges. Printed snack, food, or candy packaging remains vinyl when its body is a flexible film pouch or wrapper; printing does not make it paper.
@@ -86,7 +86,8 @@ State rules:
 - has_label=true only when a removable recycling label remains attached to a plastic/PET container.
 - compression_required=true for every can and PET beverage bottle. For ordinary plastic, use true only for a thin-walled hollow plastic bottle or container that a person can safely flatten by hand.
 - compression_required=false for cafe takeaway cups, disposable drink cups, rigid cups, lids, trays, tubs, thick storage containers, small plastic parts, and hard or brittle plastic that is difficult or unsafe to flatten by hand.
-- is_dented=true only when compression_required=true and the item is visibly flattened or crushed enough to reduce its volume. Otherwise set it to false.
+- For a can, set is_dented=true when its cylindrical wall is visibly buckled, folded, shortened, collapsed, wrinkled, or flattened into a puck-like or irregular compact shape. It does not need to be completely flat; visible height or volume reduction counts. Use false only for a smooth, full-height cylinder with no meaningful crushing.
+- For PET or hand-compressible plastic, set is_dented=true only when compression_required=true and the item is visibly flattened or crushed enough to reduce its volume. Otherwise set it to false.
 - is_single_primary_item=false when multiple separate disposal items are presented together.
 - If visual evidence is genuinely ambiguous, lower confidence instead of defaulting to plastic or paper.
 

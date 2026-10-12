@@ -103,6 +103,18 @@ def test_prompt_defines_material_by_physical_form():
     assert "Decision order:" in local_llm._FORM_REASONING_PROMPT
 
 
+def test_prompt_accepts_visibly_crushed_can_as_compressed():
+    assert "buckled, folded, shortened, collapsed, wrinkled" in local_llm._PROMPT
+    assert "flattened into a puck-like or irregular compact shape" in local_llm._PROMPT
+    assert "smooth, full-height cylinder" in local_llm._PROMPT
+
+
+def test_prompt_keeps_glossy_folded_boxes_in_paper_class():
+    assert "folded box, envelope, gift bag, or cardboard package" in local_llm._PROMPT
+    assert "glossy, laminated, coated, or heavily printed" in local_llm._PROMPT
+    assert "folded flaps, scored creases, glued seams" in local_llm._PROMPT
+
+
 def test_runtime_context_marks_weight_and_yolo_as_non_authoritative():
     prompt = local_llm._with_runtime_context(
         "base prompt", weight_g=12.5, yolo_material="paper", yolo_confidence=0.9732,
