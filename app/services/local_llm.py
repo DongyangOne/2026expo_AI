@@ -83,11 +83,11 @@ State rules:
 - has_straw=true only when a removable drinking straw is physically attached to or inserted into the primary item. A loose straw is general_waste instead.
 - has_cup_holder=true only when a removable paper cup sleeve/holder is physically attached around the primary item. A loose sleeve/holder is paper instead.
 - has_foreign_material=true only for another removable material physically attached to, inside, or mixed with the primary item. Do not set it merely because has_straw or has_cup_holder is true. Background objects are not foreign material.
-- has_label=true only when a removable recycling label remains attached to a plastic/PET container.
+- has_label=true whenever a removable printed sleeve or wrap around a PET or plastic bottle body is still attached. Count it as a label whether it is transparent, translucent, colored, or opaque, and whether it covers all or only part of the body. Bottle branding printed on that separate sleeve/wrap is strong label evidence.
 - compression_required=true for every can and PET beverage bottle. For ordinary plastic, use true only for a thin-walled hollow plastic bottle or container that a person can safely flatten by hand.
 - compression_required=false for cafe takeaway cups, disposable drink cups, rigid cups, lids, trays, tubs, thick storage containers, small plastic parts, and hard or brittle plastic that is difficult or unsafe to flatten by hand.
 - For a can, set is_dented=true when its cylindrical wall is visibly buckled, folded, shortened, collapsed, wrinkled, or flattened into a puck-like or irregular compact shape. It does not need to be completely flat; visible height or volume reduction counts. Use false only for a smooth, full-height cylinder with no meaningful crushing.
-- For PET or hand-compressible plastic, set is_dented=true only when compression_required=true and the item is visibly flattened or crushed enough to reduce its volume. Otherwise set it to false.
+- For PET or hand-compressible plastic, set is_dented=true when a sidewall is visibly folded inward or remains pressed in and the overall silhouette, height, or width is visibly reduced. It does not need to be completely flat or collapsed across most of the body. However, shallow wrinkles or small local dimples that do not change the overall bottle shape are not enough; in that case set is_dented=false.
 - is_single_primary_item=false when multiple separate disposal items are presented together.
 - If visual evidence is genuinely ambiguous, lower confidence instead of defaulting to plastic or paper.
 

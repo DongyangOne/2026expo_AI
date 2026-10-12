@@ -115,6 +115,14 @@ def test_prompt_keeps_glossy_folded_boxes_in_paper_class():
     assert "folded flaps, scored creases, glued seams" in local_llm._PROMPT
 
 
+def test_prompt_requires_pet_sleeve_removal_and_substantial_compression():
+    assert "printed sleeve or wrap around a PET or plastic bottle body" in local_llm._PROMPT
+    assert "transparent, translucent, colored, or opaque" in local_llm._PROMPT
+    assert "sidewall is visibly folded inward or remains pressed in" in local_llm._PROMPT
+    assert "silhouette, height, or width is visibly reduced" in local_llm._PROMPT
+    assert "shallow wrinkles or small local dimples" in local_llm._PROMPT
+
+
 def test_runtime_context_marks_weight_and_yolo_as_non_authoritative():
     prompt = local_llm._with_runtime_context(
         "base prompt", weight_g=12.5, yolo_material="paper", yolo_confidence=0.9732,
