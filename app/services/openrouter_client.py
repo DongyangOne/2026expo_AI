@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -20,6 +21,7 @@ _client_lock = Lock()
 _write_lock = Lock()
 _state_lock = Lock()
 _thread_lock = Lock()
+_provider_state_lock = Lock()
 _http_client: httpx.Client | None = None
 _keepalive_thread: Thread | None = None
 _stop_event = Event()
@@ -30,6 +32,7 @@ _state: dict[str, Any] = {
     "last_provider": None,
     "last_error": None,
 }
+_provider_open_until: dict[str, float] = {}
 
 
 def enabled() -> bool:
@@ -58,6 +61,30 @@ def _providers() -> list[str]:
         if normalized and normalized not in result:
             result.append(normalized)
     return result
+
+
+def _available_providers() -> list[str]:
+    now = time.monotonic()
+    with _provider_state_lock:
+        expired = [
+            provider for provider, open_until in _provider_open_until.items()
+            if open_until <= now
+        ]
+        for provider in expired:
+            _provider_open_until.pop(provider, None)
+        blocked = set(_provider_open_until)
+    return [provider for provider in _providers() if provider not in blocked]
+
+
+def _mark_provider_success(provider: str) -> None:
+    with _provider_state_lock:
+        _provider_open_until.pop(provider, None)
+
+
+def _mark_provider_failure(provider: str) -> None:
+    cooldown = max(0.0, settings.OPENROUTER_PROVIDER_COOLDOWN_SEC)
+    with _provider_state_lock:
+        _provider_open_until[provider] = time.monotonic() + cooldown
 
 
 def _headers() -> dict[str, str]:
@@ -151,6 +178,7 @@ def _request(
         with _state_lock:
             _state["last_provider"] = returned or provider
             _state["last_error"] = None
+        _mark_provider_success(provider)
         return answer
     except httpx.HTTPStatusError as exc:
         reason = f"http_{exc.response.status_code}"
@@ -166,12 +194,13 @@ def _request(
     )
     with _state_lock:
         _state["last_error"] = reason
+    _mark_provider_failure(provider)
     logger.warning("OpenRouter %s failed via %s (%s)", kind, provider, reason)
     return None
 
 
 def generate(prompt: str, images: list[str]) -> str | None:
-    """Return schema-constrained Vision JSON, trying only configured providers."""
+    """Return the first valid provider response without imposing a total deadline."""
     if not enabled() or not images:
         return None
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -179,21 +208,64 @@ def generate(prompt: str, images: list[str]) -> str | None:
         "type": "image_url",
         "image_url": {"url": f"data:image/jpeg;base64,{image}", "detail": "high"},
     } for image in images)
-    deadline = time.perf_counter() + settings.OPENROUTER_TOTAL_TIMEOUT_SEC
-    for provider in _providers():
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0:
-            break
-        answer = _request(
+    providers = _available_providers()
+    if not providers:
+        return None
+
+    executor = ThreadPoolExecutor(
+        max_workers=len(providers), thread_name_prefix="openrouter-hedge",
+    )
+    pending: dict[Future[str | None], str] = {}
+    next_provider = 0
+
+    def submit_next() -> None:
+        nonlocal next_provider
+        provider = providers[next_provider]
+        next_provider += 1
+        future = executor.submit(
+            _request,
             provider=provider,
             content=content,
             max_tokens=settings.OPENROUTER_MAX_TOKENS,
-            timeout=min(settings.OPENROUTER_ATTEMPT_TIMEOUT_SEC, remaining),
+            timeout=settings.OPENROUTER_ATTEMPT_TIMEOUT_SEC,
             kind="classification",
         )
-        if answer is not None:
-            return answer
-    return None
+        pending[future] = provider
+
+    submit_next()
+    try:
+        while pending:
+            timeout = (
+                max(0.0, settings.OPENROUTER_HEDGE_DELAY_SEC)
+                if next_provider < len(providers)
+                else None
+            )
+            done, _ = wait(
+                set(pending), timeout=timeout, return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                submit_next()
+                continue
+
+            for future in done:
+                pending.pop(future, None)
+                try:
+                    answer = future.result()
+                except Exception:
+                    logger.exception("OpenRouter provider worker failed")
+                    answer = None
+                if answer is not None:
+                    for unfinished in pending:
+                        unfinished.cancel()
+                    return answer
+
+            # A provider failed before the hedge delay. Start the next one
+            # immediately instead of waiting through another empty interval.
+            if next_provider < len(providers):
+                submit_next()
+        return None
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _within_keepalive_window(now: datetime | None = None) -> bool:

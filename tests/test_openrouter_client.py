@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -38,6 +40,19 @@ class _Client:
         return response
 
 
+class _ProviderClient:
+    def __init__(self, handlers):
+        self.handlers = handlers
+        self.calls = []
+        self._lock = threading.Lock()
+
+    def post(self, *args, **kwargs):
+        provider = kwargs["json"]["provider"]["only"][0]
+        with self._lock:
+            self.calls.append((provider, args, kwargs))
+        return self.handlers[provider]()
+
+
 def _configure(monkeypatch, tmp_path):
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_ENABLED", True)
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -48,10 +63,19 @@ def _configure(monkeypatch, tmp_path):
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_SESSION_ID", "expo-production")
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_TOTAL_TIMEOUT_SEC", 5.0)
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_ATTEMPT_TIMEOUT_SEC", 3.2)
+    monkeypatch.setattr(
+        openrouter_client.settings, "OPENROUTER_HEDGE_DELAY_SEC", 0.01, raising=False,
+    )
+    monkeypatch.setattr(
+        openrouter_client.settings, "OPENROUTER_PROVIDER_COOLDOWN_SEC", 300.0, raising=False,
+    )
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_KEEPALIVE_START_HOUR", 8)
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_KEEPALIVE_END_HOUR", 19)
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_MAX_TOKENS", 120)
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_USAGE_LOG_PATH", str(tmp_path / "usage.jsonl"))
+    provider_cooldowns = getattr(openrouter_client, "_provider_open_until", None)
+    if provider_cooldowns is not None:
+        provider_cooldowns.clear()
 
 
 def test_generate_pins_deepinfra_and_bypasses_openrouter_response_cache(monkeypatch, tmp_path):
@@ -101,6 +125,81 @@ def test_generate_falls_back_to_same_model_provider_after_primary_error(monkeypa
     assert providers == [["deepinfra"], ["dekallm"]]
     records = [json.loads(line) for line in (tmp_path / "usage.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [record["status"] for record in records] == ["fallback", "ok"]
+
+
+def test_generate_hedges_slow_primary_without_waiting_for_its_timeout(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+
+    def slow_primary():
+        time.sleep(0.2)
+        raise httpx.ReadTimeout("slow", request=request)
+
+    client = _ProviderClient({
+        "deepinfra": slow_primary,
+        "dekallm": lambda: _Response({
+            "provider": "DekaLLM",
+            "choices": [{"message": {"content": '{"material":"paper"}'}}],
+        }),
+        "parasail": lambda: _Response({
+            "provider": "Parasail",
+            "choices": [{"message": {"content": '{"material":"paper"}'}}],
+        }),
+    })
+    monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
+
+    started = time.perf_counter()
+    result = openrouter_client.generate("Return JSON", ["YWJj"])
+    elapsed = time.perf_counter() - started
+
+    assert result == '{"material":"paper"}'
+    assert elapsed < 0.15
+    assert [call[0] for call in client.calls[:2]] == ["deepinfra", "dekallm"]
+
+
+def test_generate_does_not_apply_an_overall_deadline(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_TOTAL_TIMEOUT_SEC", 0.001)
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+
+    client = _ProviderClient({
+        "deepinfra": lambda: (_ for _ in ()).throw(httpx.ReadTimeout("slow", request=request)),
+        "dekallm": lambda: _Response({
+            "provider": "DekaLLM",
+            "choices": [{"message": {"content": '{"material":"vinyl"}'}}],
+        }),
+        "parasail": lambda: _Response({
+            "provider": "Parasail",
+            "choices": [{"message": {"content": '{"material":"vinyl"}'}}],
+        }),
+    })
+    monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
+
+    assert openrouter_client.generate("Return JSON", ["YWJj"]) == '{"material":"vinyl"}'
+
+
+def test_generate_skips_provider_during_failure_cooldown(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+
+    client = _ProviderClient({
+        "deepinfra": lambda: (_ for _ in ()).throw(httpx.ReadTimeout("slow", request=request)),
+        "dekallm": lambda: _Response({
+            "provider": "DekaLLM",
+            "choices": [{"message": {"content": '{"material":"can"}'}}],
+        }),
+        "parasail": lambda: _Response({
+            "provider": "Parasail",
+            "choices": [{"message": {"content": '{"material":"can"}'}}],
+        }),
+    })
+    monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
+
+    assert openrouter_client.generate("Return JSON", ["YWJj"]) == '{"material":"can"}'
+    assert openrouter_client.generate("Return JSON", ["YWJj"]) == '{"material":"can"}'
+
+    providers = [call[0] for call in client.calls]
+    assert providers.count("deepinfra") == 1
 
 
 def test_keepalive_uses_primary_provider_and_one_output_token(monkeypatch, tmp_path):
