@@ -326,10 +326,13 @@ def _within_keepalive_window(now: datetime | None = None) -> bool:
         current = current.replace(tzinfo=ZoneInfo("Asia/Seoul"))
     else:
         current = current.astimezone(ZoneInfo("Asia/Seoul"))
+    # 이전 Pi .env에 19시가 남아 있어도 시연 운영 정책상 17시 이후에는
+    # 유료 상주 요청을 보내지 않는다. 더 이른 종료값은 그대로 존중한다.
+    end_hour = min(settings.OPENROUTER_KEEPALIVE_END_HOUR, 17)
     return (
         settings.OPENROUTER_KEEPALIVE_START_HOUR
         <= current.hour
-        < settings.OPENROUTER_KEEPALIVE_END_HOUR
+        < end_hour
     )
 
 

@@ -289,6 +289,8 @@ def test_disabled_client_does_not_start_keepalive_thread(monkeypatch):
 
 def test_keepalive_skips_before_08_and_from_17_kst(monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path)
+    # 배포 서버의 오래된 .env가 19시를 지정해도 17시 상한을 적용한다.
+    monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_KEEPALIVE_END_HOUR", 19)
     client = _Client([])
     monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
 
