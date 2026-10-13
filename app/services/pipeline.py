@@ -339,6 +339,21 @@ async def run(
             (perf_counter() - llm_started_at) * 1000,
             llm_prediction is not None,
         )
+        if llm_prediction is not None and llm_prediction.class_name == "empty_scene":
+            local_llm.record_primary(
+                bbox=bbox,
+                yolo_class_id=None,
+                yolo_confidence=None,
+                prediction=llm_prediction,
+                selected=False,
+                reason="empty_scene",
+                client_id=client_id,
+            )
+            return DetectResponse(
+                client_id=client_id,
+                status=DetectionStatus.NOT_DETECTED,
+                weight=WeightInfo(value_g=weight_g),
+            )
         if (
             llm_prediction is None
             or not llm_prediction.is_single_primary_item
@@ -397,6 +412,21 @@ async def run(
             llm_prediction is not None,
             vinyl_specialist_used,
         )
+        if llm_prediction is not None and llm_prediction.class_name == "empty_scene":
+            local_llm.record_primary(
+                bbox=bbox,
+                yolo_class_id=yolo_class_id,
+                yolo_confidence=yolo_confidence,
+                prediction=llm_prediction,
+                selected=False,
+                reason="empty_scene",
+                client_id=client_id,
+            )
+            return DetectResponse(
+                client_id=client_id,
+                status=DetectionStatus.NOT_DETECTED,
+                weight=WeightInfo(value_g=weight_g),
+            )
         if (
             llm_prediction is not None
             and llm_prediction.is_single_primary_item
