@@ -6,6 +6,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
 
 os.environ.setdefault("API_KEY", "test-key")
 
@@ -62,7 +63,7 @@ def _configure(monkeypatch, tmp_path):
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_FALLBACK_PROVIDERS", "dekallm,parasail")
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_SESSION_ID", "expo-production")
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_TOTAL_TIMEOUT_SEC", 5.0)
-    monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_ATTEMPT_TIMEOUT_SEC", 3.2)
+    monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_ATTEMPT_TIMEOUT_SEC", 8.0)
     monkeypatch.setattr(
         openrouter_client.settings, "OPENROUTER_HEDGE_DELAY_SEC", 0.01, raising=False,
     )
@@ -99,6 +100,7 @@ def test_generate_pins_deepinfra_and_bypasses_openrouter_response_cache(monkeypa
     assert kwargs["json"]["model"] == "qwen/qwen3.8-27b"
     assert kwargs["json"]["reasoning"] == {"effort": "none"}
     assert kwargs["json"]["max_completion_tokens"] == 120
+    assert kwargs["timeout"] == 8.0
     record = json.loads((tmp_path / "usage.jsonl").read_text(encoding="utf-8"))
     assert record["provider_requested"] == "deepinfra"
     assert record["provider_returned"] == "DeepInfra"
@@ -206,12 +208,38 @@ def test_generate_does_not_apply_an_overall_deadline(monkeypatch, tmp_path):
     assert openrouter_client.generate("Return JSON", ["YWJj"]) == '{"material":"vinyl"}'
 
 
-def test_generate_skips_provider_during_failure_cooldown(monkeypatch, tmp_path):
+def test_generate_retries_provider_after_read_timeout_without_cooldown(monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path)
     request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
 
     client = _ProviderClient({
         "deepinfra": lambda: (_ for _ in ()).throw(httpx.ReadTimeout("slow", request=request)),
+        "dekallm": lambda: _Response({
+            "provider": "DekaLLM",
+            "choices": [{"message": {"content": '{"material":"can"}'}}],
+        }),
+        "parasail": lambda: _Response({
+            "provider": "Parasail",
+            "choices": [{"message": {"content": '{"material":"can"}'}}],
+        }),
+    })
+    monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
+
+    assert openrouter_client.generate("Return JSON", ["YWJj"]) == '{"material":"can"}'
+    assert openrouter_client.generate("Return JSON", ["YWJj"]) == '{"material":"can"}'
+
+    providers = [call[0] for call in client.calls]
+    assert providers.count("deepinfra") == 2
+
+
+@pytest.mark.parametrize("status_code", [429, 503])
+def test_generate_skips_provider_during_explicit_unavailable_cooldown(
+    monkeypatch, tmp_path, status_code,
+):
+    _configure(monkeypatch, tmp_path)
+
+    client = _ProviderClient({
+        "deepinfra": lambda: _Response({}, status_code=status_code),
         "dekallm": lambda: _Response({
             "provider": "DekaLLM",
             "choices": [{"message": {"content": '{"material":"can"}'}}],

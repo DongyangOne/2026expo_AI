@@ -114,6 +114,11 @@ def _mark_provider_failure(provider: str) -> None:
         _provider_open_until[provider] = time.monotonic() + cooldown
 
 
+def _should_cooldown(reason: str) -> bool:
+    """Only quarantine providers that explicitly report temporary unavailability."""
+    return reason in {"http_429", "http_503"}
+
+
 def _headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
@@ -232,7 +237,8 @@ def _request(
     )
     with _state_lock:
         _state["last_error"] = reason
-    _mark_provider_failure(provider)
+    if _should_cooldown(reason):
+        _mark_provider_failure(provider)
     logger.warning("OpenRouter %s failed via %s (%s)", kind, provider, reason)
     return None
 

@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     OPENROUTER_SESSION_ID: str = "expo-production"
     # 이전 배포의 .env 호환용이다. 실제 분류에는 전체 마감을 적용하지 않는다.
     OPENROUTER_TOTAL_TIMEOUT_SEC: float = 5.0
-    OPENROUTER_ATTEMPT_TIMEOUT_SEC: float = 3.2
+    OPENROUTER_ATTEMPT_TIMEOUT_SEC: float = 8.0
     # 1순위가 이 시간 안에 끝나지 않으면 다음 공급자를 겹쳐 호출한다.
     OPENROUTER_HEDGE_DELAY_SEC: float = 0.7
     # 실패한 공급자는 다음 요청에서 즉시 건너뛰고, 시간이 지나면 다시 시도한다.
