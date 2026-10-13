@@ -71,7 +71,7 @@ def _configure(monkeypatch, tmp_path):
         openrouter_client.settings, "OPENROUTER_PROVIDER_COOLDOWN_SEC", 300.0, raising=False,
     )
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_KEEPALIVE_START_HOUR", 8)
-    monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_KEEPALIVE_END_HOUR", 19)
+    monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_KEEPALIVE_END_HOUR", 17)
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_MAX_TOKENS", 120)
     monkeypatch.setattr(openrouter_client.settings, "OPENROUTER_USAGE_LOG_PATH", str(tmp_path / "usage.jsonl"))
     provider_cooldowns = getattr(openrouter_client, "_provider_open_until", None)
@@ -287,20 +287,20 @@ def test_disabled_client_does_not_start_keepalive_thread(monkeypatch):
     assert openrouter_client.start_keepalive() is False
 
 
-def test_keepalive_skips_before_08_and_from_19_kst(monkeypatch, tmp_path):
+def test_keepalive_skips_before_08_and_from_17_kst(monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path)
     client = _Client([])
     monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
 
     before = datetime(2026, 10, 13, 7, 59, tzinfo=ZoneInfo("Asia/Seoul"))
-    at_end = datetime(2026, 10, 13, 19, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    at_end = datetime(2026, 10, 13, 17, 0, tzinfo=ZoneInfo("Asia/Seoul"))
 
     assert openrouter_client.keepalive_once(now=before) is None
     assert openrouter_client.keepalive_once(now=at_end) is None
     assert client.calls == []
 
 
-def test_keepalive_runs_from_08_until_before_19_kst(monkeypatch, tmp_path):
+def test_keepalive_runs_from_08_until_before_17_kst(monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path)
     client = _Client([
         _Response({"provider": "DeepInfra", "choices": [{"message": {"content": "OK"}}]}),
@@ -309,7 +309,7 @@ def test_keepalive_runs_from_08_until_before_19_kst(monkeypatch, tmp_path):
     monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
 
     at_start = datetime(2026, 10, 13, 8, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-    before_end = datetime(2026, 10, 13, 18, 59, 59, tzinfo=ZoneInfo("Asia/Seoul"))
+    before_end = datetime(2026, 10, 13, 16, 59, 59, tzinfo=ZoneInfo("Asia/Seoul"))
 
     assert openrouter_client.keepalive_once(now=at_start) is True
     assert openrouter_client.keepalive_once(now=before_end) is True

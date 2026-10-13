@@ -29,7 +29,7 @@ class LLMHealth(BaseModel):
     )
     latency_ms: float | None = Field(None, description="NAS 상태 확인 왕복 시간(ms)")
     keepalive_window_active: bool | None = Field(
-        None, description="OpenRouter 상주 시간대(08:00~19:00 KST) 여부"
+        None, description="OpenRouter 상주 시간대(08:00~17:00 KST) 여부"
     )
     last_keepalive_at: str | None = Field(None, description="마지막 상주 요청 시각(UTC)")
     last_keepalive_ok: bool | None = Field(None, description="마지막 상주 요청 성공 여부")

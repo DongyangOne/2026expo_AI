@@ -111,7 +111,7 @@ OPENROUTER_PRIMARY_PROVIDER=deepinfra
 OPENROUTER_FALLBACK_PROVIDERS=dekallm,parasail
 OPENROUTER_KEEPALIVE_INTERVAL_SEC=240
 OPENROUTER_KEEPALIVE_START_HOUR=8
-OPENROUTER_KEEPALIVE_END_HOUR=19
+OPENROUTER_KEEPALIVE_END_HOUR=17
 SPRING_CALLBACK_URL=https://oneexpo.kro.kr/api/v1/feedback-detail/result
 ```
 
@@ -122,7 +122,7 @@ YOLO는 대상 위치를 찾고, Vision LLM은 영문 분류 기준과 함께 �
 OpenRouter 요청의 제공자·input/output/total token·비용·처리 시간은
 `logs/openrouter_usage.jsonl`에 기록합니다. DeepInfra 요청이 실패하면 같은 Qwen3.8 모델을
 DekaLLM, Parasail 순서로 시도하고, 모두 실패하면 기존 MiniCPM으로 자동 재처리합니다.
-DeepInfra 상주 요청은 서울 시간 08:00 이상 19:00 미만에만 4분 간격으로 실행합니다.
+DeepInfra 상주 요청은 서울 시간 08:00 이상 17:00 미만에만 4분 간격으로 실행합니다.
 
 전체 설정 예시는 [.env.example](.env.example)에 있습니다. 실제 API key와 gateway 인증값은
 Git에 넣지 않습니다.
