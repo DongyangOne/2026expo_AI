@@ -7,7 +7,7 @@ import math
 import re
 import statistics
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +118,61 @@ def _nearest_audit(
     return nearest
 
 
+def _load_cloud_usage_24h(
+    path: Path | None, *, now: datetime,
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    cutoff = now.astimezone(timezone.utc) - timedelta(hours=24)
+    if path is not None and path.is_file():
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            timestamp = _parse_timestamp(value.get("timestamp"))
+            if timestamp is None:
+                continue
+            if timestamp.astimezone(timezone.utc) >= cutoff:
+                rows.append(value)
+
+    provider_counts = Counter(
+        row.get("provider_requested") for row in rows
+        if isinstance(row.get("provider_requested"), str)
+    )
+    model_counts = Counter(
+        row.get("model") for row in rows if isinstance(row.get("model"), str)
+    )
+    kind_counts = Counter(
+        row.get("kind") for row in rows if isinstance(row.get("kind"), str)
+    )
+    latencies = [
+        float(row["duration_ms"]) for row in rows
+        if isinstance(row.get("duration_ms"), (int, float))
+    ]
+    return {
+        "attempts": len(rows),
+        "successful_attempts": sum(row.get("status") == "ok" for row in rows),
+        "fallback_attempts": sum(row.get("status") != "ok" for row in rows),
+        "input_tokens": sum(int(row.get("input_tokens", 0) or 0) for row in rows),
+        "output_tokens": sum(int(row.get("output_tokens", 0) or 0) for row in rows),
+        "total_tokens": sum(int(row.get("total_tokens", 0) or 0) for row in rows),
+        "cost_usd": round(sum(float(row.get("cost_usd", 0) or 0) for row in rows), 8),
+        "latency_ms": {
+            "median": round(statistics.median(latencies), 1) if latencies else None,
+            "p95": _percentile_nearest_rank(latencies, 0.95),
+        },
+        "providers": dict(provider_counts),
+        "models": dict(model_counts),
+        "kinds": dict(kind_counts),
+    }
+
+
 def _percentile_nearest_rank(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -131,10 +186,13 @@ def build_monitor_snapshot(
     *,
     limit: int = 100,
     audit_log_path: Path | None = None,
+    usage_log_path: Path | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Aggregate recent captures without changing inference or review files."""
     root = capture_root.resolve()
     audit = _load_audit(audit_log_path)
+    current = now or datetime.now(timezone.utc)
     captures: list[dict[str, Any]] = []
 
     if root.is_dir():
@@ -249,6 +307,7 @@ def build_monitor_snapshot(
             "class": dict(class_counts),
             "guidance": dict(guidance_counts),
         },
+        "cloud_usage_24h": _load_cloud_usage_24h(usage_log_path, now=current),
         "captures": captures,
     }
 

@@ -32,6 +32,7 @@ async def monitor_summary(limit: Annotated[int, Query(ge=1, le=500)] = 100) -> d
         Path(settings.CAPTURE_DIR),
         limit=limit,
         audit_log_path=Path(settings.LOCAL_LLM_SHADOW_LOG_PATH),
+        usage_log_path=Path(settings.OPENROUTER_USAGE_LOG_PATH),
     )
 
 

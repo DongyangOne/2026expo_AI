@@ -74,7 +74,7 @@
     }
     .button:hover { background: var(--green); }
 
-    .status-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+    .status-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
     .metric { min-height: 126px; padding: 18px; background: var(--surface); }
     .metric .label { color: var(--muted); font-size: .82rem; }
     .metric strong { display: block; margin-top: 10px; font-size: clamp(1.55rem, 3vw, 2.5rem); letter-spacing: -.05em; }
@@ -124,7 +124,8 @@
     .footnote { margin-top: 26px; color: var(--muted); font-size: .78rem; }
 
     @media (max-width: 1050px) {
-      .status-grid, .stream { grid-template-columns: repeat(2, 1fr); }
+      .status-grid { grid-template-columns: repeat(3, 1fr); }
+      .stream { grid-template-columns: repeat(2, 1fr); }
       .controls { grid-template-columns: 1fr 1fr; }
     }
     @media (max-width: 680px) {
@@ -155,6 +156,8 @@
       <article class="metric"><span class="label">bbox 감지 성공률</span><strong id="detectRate">—</strong><small>정답 정확도가 아닌 객체 감지 비율</small></article>
       <article class="metric warning"><span class="label">의심 bbox</span><strong id="bboxWarning">—</strong><small>화면 절반 이상 또는 가장자리 2면 접촉</small></article>
       <article class="metric"><span class="label">처리시간</span><strong id="latency">—</strong><small id="latencyNote">신규 요청부터 수집</small></article>
+      <article class="metric"><span class="label">24시간 LLM 비용</span><strong id="cloudCost">—</strong><small id="cloudTokens">OpenRouter 사용량</small></article>
+      <article class="metric"><span class="label">24시간 LLM 호출</span><strong id="cloudCalls">—</strong><small id="cloudProviders">provider 기록 없음</small></article>
     </section>
     <section class="health-row" aria-label="서버 상태">
       <div class="health-cell"><span>AI 서버</span><b id="serverHealth">—</b></div>
@@ -181,6 +184,7 @@
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value ?? "—").replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
     const percent = (value) => value == null ? "—" : `${Number(value).toFixed(1)}%`;
+    const usd = (value) => value == null ? "—" : `$${Number(value).toFixed(6)}`;
     const fmtTime = (value) => value ? new Intl.DateTimeFormat("ko-KR", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false }).format(new Date(value)) : "—";
 
     function setConnection(kind, text) {
@@ -213,6 +217,11 @@
       const latency = summary.latency_ms;
       $("latency").textContent = latency.median == null ? "수집 전" : `${(latency.median / 1000).toFixed(2)}초`;
       $("latencyNote").textContent = latency.samples ? `p95 ${(latency.p95 / 1000).toFixed(2)}초 · ${latency.samples}건` : "신규 요청부터 수집";
+      const cloud = data.cloud_usage_24h ?? {};
+      $("cloudCost").textContent = usd(cloud.cost_usd);
+      $("cloudTokens").textContent = `${Number(cloud.total_tokens ?? 0).toLocaleString()} tokens`;
+      $("cloudCalls").textContent = `${cloud.successful_attempts ?? 0}/${cloud.attempts ?? 0}`;
+      $("cloudProviders").textContent = Object.entries(cloud.providers ?? {}).map(([name, count]) => `${name} ${count}`).join(" · ") || "provider 기록 없음";
       $("serverHealth").textContent = health?.status ?? "확인 실패";
       $("llmHealth").textContent = health?.llm?.status ?? "확인 실패";
       $("accelerator").textContent = health?.llm?.accelerator?.toUpperCase() ?? "—";
@@ -239,6 +248,9 @@
       const warning = Boolean(item.bbox_quality?.suspicious);
       const yolo = item.audit?.yolo;
       const llm = item.audit?.local_llm;
+      const runtime = llm?.runtime;
+      const provider = runtime?.provider_returned ?? runtime?.provider_requested;
+      const output = [item.status, cls, ...item.guidance.map(g => g.code)].filter(Boolean).join(" · ");
       const codes = item.guidance.map(g => `<span class="code">${escapeHtml(g.code)}</span>`).join("");
       return `<article class="capture ${warning ? "is-warning" : ""}" data-id="${escapeHtml(item.capture_id)}">
         <div class="photo">
@@ -253,6 +265,13 @@
             <dt>최종 신뢰도</dt><dd>${confidence == null ? "—" : `${(confidence * 100).toFixed(1)}%`}</dd>
             <dt>YOLO</dt><dd>${yolo ? `${escapeHtml(yolo.class_id)} · ${(Number(yolo.confidence) * 100).toFixed(1)}%` : "기록 없음"}</dd>
             <dt>LLM</dt><dd>${llm ? escapeHtml(llm.class_name) : "기록 없음"}</dd>
+            <dt>판정 backend</dt><dd>${runtime ? escapeHtml(runtime.backend) : "기록 없음"}</dd>
+            <dt>모델</dt><dd>${runtime ? escapeHtml(runtime.model) : "기록 없음"}</dd>
+            <dt>provider</dt><dd>${provider ? escapeHtml(provider) : "기록 없음"}</dd>
+            <dt>LLM 호출시간</dt><dd>${runtime?.duration_ms == null ? "기록 없음" : `${(runtime.duration_ms / 1000).toFixed(2)}초`}</dd>
+            <dt>토큰</dt><dd>${runtime?.total_tokens == null ? "기록 없음" : `${runtime.input_tokens} + ${runtime.output_tokens} = ${runtime.total_tokens}`}</dd>
+            <dt>선택 호출 비용</dt><dd>${runtime?.cost_usd == null ? "기록 없음" : usd(runtime.cost_usd)}</dd>
+            <dt>최종 반환</dt><dd>${escapeHtml(output)}</dd>
             <dt>bbox 면적</dt><dd>${item.bbox_quality ? percent(item.bbox_quality.area_ratio * 100) : "없음"}</dd>
             <dt>처리시간</dt><dd>${item.process_ms == null ? "기록 없음" : `${(item.process_ms / 1000).toFixed(2)}초`}</dd>
             <dt>무게</dt><dd>${item.weight_g == null ? "미입력" : `${escapeHtml(item.weight_g)} g`}</dd>

@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -33,6 +34,32 @@ _state: dict[str, Any] = {
     "last_error": None,
 }
 _provider_open_until: dict[str, float] = {}
+
+
+@dataclass(frozen=True)
+class OpenRouterGeneration:
+    content: str
+    model: str
+    provider_requested: str
+    provider_returned: str | None
+    duration_ms: float
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float
+
+    def runtime(self) -> dict[str, Any]:
+        return {
+            "backend": "openrouter",
+            "model": self.model,
+            "provider_requested": self.provider_requested,
+            "provider_returned": self.provider_returned,
+            "duration_ms": self.duration_ms,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "cost_usd": self.cost_usd,
+        }
 
 
 def enabled() -> bool:
@@ -140,7 +167,7 @@ def _request(
     max_tokens: int,
     timeout: float,
     kind: str,
-) -> str | None:
+) -> OpenRouterGeneration | None:
     body = {
         "model": settings.OPENROUTER_MODEL,
         "provider": {"only": [provider], "allow_fallbacks": False},
@@ -167,19 +194,30 @@ def _request(
             raise ValueError("empty OpenRouter content")
         duration_ms = (time.perf_counter() - started) * 1000
         returned = payload.get("provider")
+        usage = payload.get("usage") or {}
         _record(
             kind=kind,
             status="ok",
             provider_requested=provider,
             provider_returned=returned,
             duration_ms=duration_ms,
-            usage=payload.get("usage"),
+            usage=usage,
         )
         with _state_lock:
             _state["last_provider"] = returned or provider
             _state["last_error"] = None
         _mark_provider_success(provider)
-        return answer
+        return OpenRouterGeneration(
+            content=answer,
+            model=settings.OPENROUTER_MODEL,
+            provider_requested=provider,
+            provider_returned=returned,
+            duration_ms=round(duration_ms, 1),
+            input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            output_tokens=int(usage.get("completion_tokens", 0) or 0),
+            total_tokens=int(usage.get("total_tokens", 0) or 0),
+            cost_usd=float(usage.get("cost", 0) or 0),
+        )
     except httpx.HTTPStatusError as exc:
         reason = f"http_{exc.response.status_code}"
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -199,8 +237,10 @@ def _request(
     return None
 
 
-def generate(prompt: str, images: list[str]) -> str | None:
-    """Return the first valid provider response without imposing a total deadline."""
+def generate_with_metadata(
+    prompt: str, images: list[str],
+) -> OpenRouterGeneration | None:
+    """Return the first provider response and its billable runtime metadata."""
     if not enabled() or not images:
         return None
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -215,7 +255,7 @@ def generate(prompt: str, images: list[str]) -> str | None:
     executor = ThreadPoolExecutor(
         max_workers=len(providers), thread_name_prefix="openrouter-hedge",
     )
-    pending: dict[Future[str | None], str] = {}
+    pending: dict[Future[OpenRouterGeneration | None], str] = {}
     next_provider = 0
 
     def submit_next() -> None:
@@ -266,6 +306,12 @@ def generate(prompt: str, images: list[str]) -> str | None:
         return None
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+def generate(prompt: str, images: list[str]) -> str | None:
+    """Return the first valid provider response without imposing a total deadline."""
+    result = generate_with_metadata(prompt, images)
+    return result.content if result is not None else None
 
 
 def _within_keepalive_window(now: datetime | None = None) -> bool:

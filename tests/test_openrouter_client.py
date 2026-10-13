@@ -105,6 +105,34 @@ def test_generate_pins_deepinfra_and_bypasses_openrouter_response_cache(monkeypa
     assert record["status"] == "ok"
 
 
+def test_generate_with_metadata_reports_selected_provider_tokens_and_cost(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    client = _Client([_Response({
+        "provider": "DeepInfra",
+        "choices": [{"message": {"content": '{"material":"paper"}'}}],
+        "usage": {
+            "prompt_tokens": 125,
+            "completion_tokens": 19,
+            "total_tokens": 144,
+            "cost": 0.00042,
+        },
+    })])
+    monkeypatch.setattr(openrouter_client, "_get_http_client", lambda: client)
+
+    result = openrouter_client.generate_with_metadata("Return JSON", ["YWJj"])
+
+    assert result is not None
+    assert result.content == '{"material":"paper"}'
+    assert result.model == "qwen/qwen3.8-27b"
+    assert result.provider_requested == "deepinfra"
+    assert result.provider_returned == "DeepInfra"
+    assert result.input_tokens == 125
+    assert result.output_tokens == 19
+    assert result.total_tokens == 144
+    assert result.cost_usd == 0.00042
+    assert result.duration_ms >= 0
+
+
 def test_generate_falls_back_to_same_model_provider_after_primary_error(monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path)
     request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")

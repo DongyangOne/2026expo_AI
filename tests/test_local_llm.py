@@ -356,7 +356,15 @@ def test_openrouter_valid_json_is_used_without_calling_ollama(monkeypatch):
     })
     monkeypatch.setattr(local_llm, "enabled", lambda: True)
     monkeypatch.setattr(local_llm.openrouter_client, "enabled", lambda: True)
-    monkeypatch.setattr(local_llm.openrouter_client, "generate", lambda *_args: answer)
+    generation = local_llm.openrouter_client.OpenRouterGeneration(
+        content=answer, model="qwen/qwen3.8-27b",
+        provider_requested="deepinfra", provider_returned="DeepInfra",
+        duration_ms=850.0, input_tokens=120, output_tokens=20,
+        total_tokens=140, cost_usd=0.0004,
+    )
+    monkeypatch.setattr(
+        local_llm.openrouter_client, "generate_with_metadata", lambda *_args: generation,
+    )
     monkeypatch.setattr(
         local_llm, "_query_ollama",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Ollama called")),
@@ -368,6 +376,12 @@ def test_openrouter_valid_json_is_used_without_calling_ollama(monkeypatch):
 
     assert result is not None
     assert result.class_name == "paper"
+    assert result.runtime == {
+        "backend": "openrouter", "model": "qwen/qwen3.8-27b",
+        "provider_requested": "deepinfra", "provider_returned": "DeepInfra",
+        "duration_ms": 850.0, "input_tokens": 120, "output_tokens": 20,
+        "total_tokens": 140, "cost_usd": 0.0004,
+    }
 
 
 def test_openrouter_failure_falls_back_to_existing_ollama(monkeypatch):
@@ -378,7 +392,9 @@ def test_openrouter_failure_falls_back_to_existing_ollama(monkeypatch):
     )
     monkeypatch.setattr(local_llm, "enabled", lambda: True)
     monkeypatch.setattr(local_llm.openrouter_client, "enabled", lambda: True)
-    monkeypatch.setattr(local_llm.openrouter_client, "generate", lambda *_args: None)
+    monkeypatch.setattr(
+        local_llm.openrouter_client, "generate_with_metadata", lambda *_args: None,
+    )
     monkeypatch.setattr(local_llm, "_query_ollama", lambda *_args, **_kwargs: fallback)
 
     result = local_llm._classify_with_prompt(
@@ -392,7 +408,9 @@ def test_openrouter_failure_without_local_backend_returns_none(monkeypatch):
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MODE", "disabled")
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_BASE_URL", None)
     monkeypatch.setattr(local_llm.openrouter_client, "enabled", lambda: True)
-    monkeypatch.setattr(local_llm.openrouter_client, "generate", lambda *_args: None)
+    monkeypatch.setattr(
+        local_llm.openrouter_client, "generate_with_metadata", lambda *_args: None,
+    )
 
     result = local_llm._classify_with_prompt(
         np.zeros((32, 32, 3), dtype=np.uint8), [0, 0, 32, 32], "prompt"

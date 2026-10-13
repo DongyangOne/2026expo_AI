@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -230,6 +230,7 @@ class LocalLLMPrediction:
     compression_required: bool = False
     has_straw: bool = False
     has_cup_holder: bool = False
+    runtime: dict[str, Any] | None = None
 
 
 def _ollama_enabled() -> bool:
@@ -445,11 +446,24 @@ def _query_ollama(images: list[str], prompt: str) -> LocalLLMPrediction | None:
         "messages": [{"role": "user", "content": prompt, "images": images}],
     }
     url = settings.LOCAL_LLM_BASE_URL.rstrip("/") + "/api/chat"
+    started = time.perf_counter()
     try:
         response = _get_http_client().post(url, headers=headers, json=body)
         response.raise_for_status()
         payload = response.json()
-        return _parse(payload["message"]["content"])
+        prediction = _parse(payload["message"]["content"])
+        return replace(prediction, runtime={
+            "backend": "nas_ollama",
+            "model": settings.LOCAL_LLM_MODEL,
+            "provider_requested": "nas",
+            "provider_returned": "nas",
+            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            "input_tokens": int(payload.get("prompt_eval_count", 0) or 0),
+            "output_tokens": int(payload.get("eval_count", 0) or 0),
+            "total_tokens": int(payload.get("prompt_eval_count", 0) or 0)
+                            + int(payload.get("eval_count", 0) or 0),
+            "cost_usd": 0.0,
+        })
     except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("NAS local LLM classification skipped: %s", exc)
         return None
@@ -472,10 +486,10 @@ def _classify_with_prompt(
     if not images:
         return None
     if openrouter_client.enabled():
-        content = openrouter_client.generate(prompt, images)
-        if content is not None:
+        generation = openrouter_client.generate_with_metadata(prompt, images)
+        if generation is not None:
             try:
-                return _parse(content)
+                return replace(_parse(generation.content), runtime=generation.runtime())
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 logger.warning(
                     "OpenRouter JSON contract failed (%s); using MiniCPM",

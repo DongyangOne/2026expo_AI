@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -81,6 +82,74 @@ def test_snapshot_reports_detection_latency_and_suspicious_bbox(tmp_path):
     assert snapshot["captures"][1]["bbox_quality"]["suspicious"] is True
 
 
+def test_snapshot_exposes_selected_llm_runtime_and_recent_cloud_usage(tmp_path):
+    _write_capture(
+        tmp_path,
+        capture_id="runtime-sample",
+        timestamp="2026-10-13T01:00:05+00:00",
+        status="ALLOWED",
+        bbox=[20, 20, 80, 80],
+        class_name="paper",
+        process_ms=1450.0,
+    )
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text(json.dumps({
+        "timestamp": "2026-10-13T01:00:04+00:00",
+        "client_id": "runtime-sample",
+        "mode": "primary",
+        "selected": True,
+        "reason": "llm_primary",
+        "yolo": None,
+        "local_llm": {
+            "class_id": 2,
+            "class_name": "paper",
+            "runtime": {
+                "backend": "openrouter",
+                "model": "qwen/qwen3.8-27b",
+                "provider_requested": "deepinfra",
+                "provider_returned": "DeepInfra",
+                "duration_ms": 910.5,
+                "input_tokens": 120,
+                "output_tokens": 20,
+                "total_tokens": 140,
+                "cost_usd": 0.0004,
+            },
+        },
+    }) + "\n", encoding="utf-8")
+    usage_path = tmp_path / "usage.jsonl"
+    usage_path.write_text("\n".join([
+        json.dumps({
+            "timestamp": "2026-10-13T01:00:04+00:00", "kind": "classification",
+            "model": "qwen/qwen3.8-27b", "provider_requested": "deepinfra",
+            "provider_returned": "DeepInfra", "status": "ok", "duration_ms": 910.5,
+            "input_tokens": 120, "output_tokens": 20, "total_tokens": 140,
+            "cost_usd": 0.0004,
+        }),
+        json.dumps({
+            "timestamp": "2026-10-13T01:00:05+00:00", "kind": "classification",
+            "model": "qwen/qwen3.8-27b", "provider_requested": "dekallm",
+            "provider_returned": None, "status": "fallback", "duration_ms": 3200,
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "cost_usd": 0,
+        }),
+    ]) + "\n", encoding="utf-8")
+
+    snapshot = build_monitor_snapshot(
+        tmp_path, limit=20, audit_log_path=audit_path, usage_log_path=usage_path,
+        now=datetime.fromisoformat("2026-10-13T01:30:00+00:00"),
+    )
+
+    runtime = snapshot["captures"][0]["audit"]["local_llm"]["runtime"]
+    assert runtime["provider_returned"] == "DeepInfra"
+    usage = snapshot["cloud_usage_24h"]
+    assert usage["attempts"] == 2
+    assert usage["successful_attempts"] == 1
+    assert usage["fallback_attempts"] == 1
+    assert usage["total_tokens"] == 140
+    assert usage["cost_usd"] == 0.0004
+    assert usage["providers"] == {"deepinfra": 1, "dekallm": 1}
+
+
 def test_monitor_page_and_data_are_public(tmp_path, monkeypatch):
     _write_capture(
         tmp_path,
@@ -102,6 +171,9 @@ def test_monitor_page_and_data_are_public(tmp_path, monkeypatch):
     assert "카메라가 무엇을 보고" not in page.text
     assert "X-API-Key" not in page.text
     assert "blobs: new Map()" in page.text
+    assert "24시간 LLM 비용" in page.text
+    assert "판정 backend" in page.text
+    assert "선택 호출 비용" in page.text
 
     allowed = client.get("/api/v1/monitor/summary")
     assert allowed.status_code == 200
