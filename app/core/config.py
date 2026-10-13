@@ -93,6 +93,10 @@ class Settings(BaseSettings):
     # LLM authority while avoiding a redundant generic pass on thin bags.
     LOCAL_LLM_VINYL_SPECIALIST_MAX_WEIGHT_G: float = 5.0
     LOCAL_LLM_VINYL_SPECIALIST_MIN_YOLO_CONFIDENCE: float = 0.50
+    # Weak or tiny YOLO boxes are useful audit hints, but are not safe LLM targets
+    # in the crowded exhibition camera view. Use the fixed platform ROI instead.
+    LOCAL_LLM_YOLO_CROP_MIN_CONFIDENCE: float = 0.55
+    LOCAL_LLM_YOLO_CROP_MIN_AREA_RATIO: float = 0.10
 
     # ── OpenRouter Vision 우선 판정 ───────────────────────────────────────────
     OPENROUTER_ENABLED: bool = False

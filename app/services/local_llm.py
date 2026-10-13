@@ -62,9 +62,9 @@ _PROMPT = """Act as the final visual inspector for a Korean smart waste-sorting 
 Classify the ONE primary disposal item by its physical material and form, not by the product printed on it.
 
 Image usage:
-- Image 1 is the complete camera frame and provides overall shape and scene context.
-- Image 2, when present, is the padded YOLO crop and provides surface and material detail.
-- The crop is authoritative for which item to inspect. Use the full frame only to recover its complete shape and context.
+- Image 1 is the authoritative scene view. Inspect the ONE disposal item placed on the black circular platform near the lower center.
+- Image 2, when present, is only a non-authoritative detail view. It may come from an inaccurate detector box.
+- If Image 2 conflicts with Image 1, contains a person/background object, cuts off the item, or misses the platform item, ignore Image 2 and judge Image 1.
 - Ignore the bin tray, floor, background, shadows, hands, fixtures, cables, and objects that are not attached to the primary item.
 - When no disposal item is present on the platform, choose empty_scene and set is_single_primary_item=false. Never classify the bare platform, black sheet, reflections, or background as an item.
 
@@ -115,7 +115,7 @@ _FORM_REASONING_PROMPT = _PROMPT.replace(
 )
 
 _VINYL_PLASTIC_PROMPT = """Re-evaluate only the primary disposal item as either vinyl or plastic.
-Image 1 is the complete camera frame. Image 2, when present, is the padded YOLO crop and identifies the target item.
+Image 1 is authoritative: inspect the item on the black circular platform near the lower center. Image 2 is non-authoritative detail and may be an inaccurate detector crop; ignore it when it conflicts with or misses the platform item.
 Choose vinyl for thin flexible film, a bag, wrapper, or pouch that bends, folds, wrinkles, or crumples and has no molded cup rim or formed base.
 Choose plastic for a molded bottle, cup, lid, tray, tub, or container. A thermoformed or injection-molded cup remains plastic even when crushed, folded, or flattened. A continuous molded circular rim, cup lip, formed base, tapered one-piece wall, or lid-fitting flange must outrank wrinkles caused by crushing.
 Judge physical flexibility and three-dimensional form, not color, transparency, printed branding, or the fact that both materials are polymers.

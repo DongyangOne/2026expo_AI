@@ -83,6 +83,23 @@ def _use_vinyl_specialist(
     )
 
 
+def _prefer_platform_roi_for_llm(
+    img: np.ndarray,
+    bbox: list[float],
+    yolo_confidence: float,
+) -> bool:
+    """Do not let a weak or tiny detector box define the LLM target."""
+    height, width = img.shape[:2]
+    x1, y1, x2, y2 = bbox
+    bbox_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    image_area = float(width * height)
+    area_ratio = bbox_area / image_area if image_area > 0 else 0.0
+    return (
+        yolo_confidence < settings.LOCAL_LLM_YOLO_CROP_MIN_CONFIDENCE
+        or area_ratio < settings.LOCAL_LLM_YOLO_CROP_MIN_AREA_RATIO
+    )
+
+
 def _needs_material_conflict_recheck(
     yolo_class_id: int,
     yolo_confidence: float,
@@ -316,6 +333,7 @@ async def run(
         logger.info("받침대 밖 YOLO bbox 무시 후 ROI fallback: client_id=%s", client_id)
         roi_llm_fallback = True
     llm_prediction = None
+    weak_yolo_roi_mode = False
     if roi_llm_fallback:
         if not local_llm.primary_enabled():
             return DetectResponse(
@@ -393,9 +411,26 @@ async def run(
             class_id, confidence, bbox, candidates = detection
         yolo_class_id = class_id
         yolo_confidence = confidence
+        weak_yolo_roi_mode = local_llm.primary_enabled() and _prefer_platform_roi_for_llm(
+            img, bbox, yolo_confidence,
+        )
+        if weak_yolo_roi_mode:
+            llm_img = inference.platform_observation_crop(img)
+            llm_bbox = inference.platform_detail_bbox(llm_img)
+            logger.info(
+                "약한 YOLO bbox 대신 받침대 ROI 사용: client_id=%s "
+                "yolo_class=%s confidence=%.4f bbox=%s",
+                client_id,
+                yolo_class_id,
+                yolo_confidence,
+                [round(value, 1) for value in bbox],
+            )
+        else:
+            llm_img = img
+            llm_bbox = bbox
 
     if local_llm.primary_enabled() and not roi_llm_fallback:
-        vinyl_specialist_used = _use_vinyl_specialist(
+        vinyl_specialist_used = not weak_yolo_roi_mode and _use_vinyl_specialist(
             yolo_class_id, yolo_confidence, weight_g,
         )
         llm_started_at = perf_counter()
@@ -404,7 +439,9 @@ async def run(
             if vinyl_specialist_used else local_llm.classify
         )
         yolo_material = _CLASS_BY_ID[yolo_class_id].value
-        llm_prediction = await loop.run_in_executor(_executor, llm_classifier, img, bbox)
+        llm_prediction = await loop.run_in_executor(
+            _executor, llm_classifier, llm_img, llm_bbox,
+        )
         logger.info(
             "NAS LLM 분류 시간: client_id=%s llm_ms=%.1f available=%s specialist=%s",
             client_id,
@@ -435,6 +472,7 @@ async def run(
             rejection_conflict_resolved = False
             if (
                 not vinyl_specialist_used
+                and not weak_yolo_roi_mode
                 and yolo_class_id == _VINYL_MODEL_CLASS_ID
                 and llm_prediction.class_name == "plastic"
             ):
@@ -454,15 +492,15 @@ async def run(
                     and recheck_prediction.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
                 ):
                     llm_prediction = recheck_prediction
-            if _needs_material_conflict_recheck(
+            if not weak_yolo_roi_mode and _needs_material_conflict_recheck(
                 yolo_class_id, yolo_confidence, llm_prediction.class_id,
             ):
                 conflict_started_at = perf_counter()
                 conflict_prediction = await loop.run_in_executor(
                     _executor,
                     local_llm.reclassify_rejection_conflict,
-                    img,
-                    bbox,
+                    llm_img,
+                    llm_bbox,
                     yolo_material,
                     llm_prediction.class_name,
                     weight_g,
@@ -490,8 +528,8 @@ async def run(
                 foreign_recheck = await loop.run_in_executor(
                     _executor,
                     local_llm.recheck_foreign_material,
-                    img,
-                    bbox,
+                    llm_img,
+                    llm_bbox,
                     llm_prediction.class_name,
                 )
                 logger.info(
@@ -532,15 +570,19 @@ async def run(
                 bbox=bbox, yolo_class_id=yolo_class_id, yolo_confidence=yolo_confidence,
                 prediction=llm_prediction, selected=True,
                 reason=(
-                    "rejection_conflict_recheck"
-                    if rejection_conflict_resolved
+                    "weak_yolo_platform_roi"
+                    if weak_yolo_roi_mode
                     else (
-                        "vinyl_plastic_specialist"
-                        if vinyl_specialist_used
+                        "rejection_conflict_recheck"
+                        if rejection_conflict_resolved
                         else (
-                            "vinyl_plastic_recheck"
-                            if yolo_class_id == _VINYL_MODEL_CLASS_ID
-                            else "accepted"
+                            "vinyl_plastic_specialist"
+                            if vinyl_specialist_used
+                            else (
+                                "vinyl_plastic_recheck"
+                                if yolo_class_id == _VINYL_MODEL_CLASS_ID
+                                else "accepted"
+                            )
                         )
                     )
                 ),
@@ -566,7 +608,7 @@ async def run(
             llm_prediction = None
     elif not roi_llm_fallback:
         local_llm.submit_shadow(img, bbox, yolo_class_id, yolo_confidence, client_id)
-    verifier_session = None if roi_llm_fallback else (
+    verifier_session = None if roi_llm_fallback or weak_yolo_roi_mode else (
         registry.verifier() if hasattr(registry, "verifier") else None
     )
     vinyl_candidate = _find_vinyl_candidate(
@@ -660,7 +702,7 @@ async def run(
                 client_id,
             )
 
-    if not roi_llm_fallback:
+    if not roi_llm_fallback and not weak_yolo_roi_mode:
         if verifier_prediction is None:
             verifier_shadow.submit(
                 verifier_session, img, bbox, yolo_class_id, yolo_confidence, client_id
@@ -712,7 +754,12 @@ async def run(
         weight_info.anomaly = (
             settings.WEIGHT_ANOMALY_ENABLED
             and weight_g is not None
-            and is_anomaly(cls.value, weight_g, bbox=bbox, img_area=float(img.shape[0] * img.shape[1]))
+            and is_anomaly(
+                cls.value,
+                weight_g,
+                bbox=(None if weak_yolo_roi_mode else bbox),
+                img_area=float(img.shape[0] * img.shape[1]),
+            )
         )
         guide = guidance.build_guidance(
             cls,
@@ -751,7 +798,12 @@ async def run(
     weight_info.anomaly = (
         settings.WEIGHT_ANOMALY_ENABLED
         and weight_g is not None
-        and is_anomaly(cls.value, weight_g, bbox=bbox, img_area=float(img.shape[0] * img.shape[1]))
+        and is_anomaly(
+            cls.value,
+            weight_g,
+            bbox=(None if weak_yolo_roi_mode else bbox),
+            img_area=float(img.shape[0] * img.shape[1]),
+        )
     )
 
     guide = guidance.build_guidance(

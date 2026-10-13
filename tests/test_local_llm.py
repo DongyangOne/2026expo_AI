@@ -104,7 +104,9 @@ def test_prompt_limits_foreign_material_to_the_primary_item():
 def test_prompt_defines_material_by_physical_form():
     assert "thin flexible film" in local_llm._PROMPT
     assert "rigid molded polymer" in local_llm._PROMPT
-    assert "Image 1 is the complete camera frame" in local_llm._PROMPT
+    assert "Image 1 is the authoritative scene view" in local_llm._PROMPT
+    assert "non-authoritative detail view" in local_llm._PROMPT
+    assert "ignore Image 2" in local_llm._PROMPT
     assert "black lightweight molded foam food trays" in local_llm._PROMPT
     assert "groups bulb-shaped lamps together" in local_llm._PROMPT
     assert "does not make the primary item paper" in local_llm._PROMPT

@@ -161,3 +161,69 @@ def test_pipeline_uses_platform_crop_llm_when_yolo_only_finds_off_platform_box(
     assert result.classification.class_name.value == "vinyl"
     assert received_shape == (360, 336, 3)
     assert received_bbox == [50.0, 75.0, 286.0, 360.0]
+
+
+def test_pipeline_uses_platform_roi_instead_of_weak_small_yolo_crop(
+    monkeypatch,
+) -> None:
+    """약한 작은 bbox는 품목 힌트로만 기록하고 LLM 표적에는 사용하지 않는다."""
+    received_shape = None
+    received_bbox = None
+    recorded = {}
+    weak_bbox = [244.0, 165.0, 395.0, 318.0]
+    prediction = pipeline.local_llm.LocalLLMPrediction(
+        class_id=3,
+        class_name="plastic",
+        confidence=0.95,
+        has_label=False,
+        compression_required=False,
+        is_dented=False,
+        has_foreign_material=False,
+        is_single_primary_item=True,
+    )
+
+    async def fake_read_image(_upload):
+        return np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def classify_platform(image, bbox):
+        nonlocal received_shape, received_bbox
+        received_shape = image.shape
+        received_bbox = bbox
+        return prediction
+
+    def unexpected_recheck(*_args, **_kwargs):
+        raise AssertionError("weak YOLO must not trigger a crop-based second LLM call")
+
+    monkeypatch.setattr(pipeline, "_read_image", fake_read_image)
+    monkeypatch.setattr(
+        inference,
+        "run_main",
+        lambda *_args: (5, 0.327, weak_bbox, [(5, 0.327, weak_bbox)]),
+    )
+    monkeypatch.setattr(
+        inference,
+        "run_state",
+        lambda *_args: inference.StatePrediction(conditions=Conditions()),
+    )
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(pipeline.local_llm, "classify", classify_platform)
+    monkeypatch.setattr(
+        pipeline.local_llm, "reclassify_vinyl_plastic", unexpected_recheck,
+    )
+    monkeypatch.setattr(
+        pipeline.local_llm, "record_primary", lambda **kwargs: recorded.update(kwargs),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(
+            pipeline.run(None, 20.6, "weak-small-yolo", _Registry([]))
+        )
+
+    assert result.status is DetectionStatus.ALLOWED
+    assert result.classification is not None
+    assert result.classification.class_name.value == "plastic"
+    assert received_shape == (360, 336, 3)
+    assert received_bbox == [50.0, 75.0, 286.0, 360.0]
+    assert recorded["reason"] == "weak_yolo_platform_roi"
