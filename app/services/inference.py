@@ -65,6 +65,16 @@ def _bbox_anchor_on_platform(bbox: list[float], img: np.ndarray) -> bool:
         return False
     anchor_x = ((x1 + x2) / 2.0) / width
     anchor_y = (y1 + (y2 - y1) * settings.PLATFORM_ROI_ANCHOR_Y_RATIO) / height
+    # The outer ellipse is intentionally generous for tall or oversized items,
+    # but that also let a peripheral person box barely enter at its far edge.
+    # A real item resting on the platform must still have its lower-center base
+    # inside the wider platform observation strip used by the LLM fallback.
+    observation_radius_x = (
+        settings.PLATFORM_ROI_RADIUS_X
+        * settings.PLATFORM_ROI_FALLBACK_X_MULTIPLIER
+    )
+    if abs(anchor_x - settings.PLATFORM_ROI_CENTER_X) > observation_radius_x:
+        return False
     radius_x = (
         settings.PLATFORM_ROI_RADIUS_X
         * settings.PLATFORM_ROI_DETECTION_X_MULTIPLIER

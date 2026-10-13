@@ -68,6 +68,17 @@ def test_run_main_marks_only_off_platform_detection_as_rejected() -> None:
     assert detected is marker
 
 
+def test_run_main_rejects_peripheral_person_box_that_barely_touches_loose_roi() -> None:
+    """받침대 왼쪽 사람 bbox를 물체 bbox로 채택하지 않는다."""
+    registry = _Registry([(5, 0.457031, [0.0, 75.1, 134.1, 355.9])])
+
+    detected = inference.run_main(
+        registry, np.zeros((480, 640, 3), dtype=np.uint8)
+    )
+
+    assert detected is inference.PLATFORM_ROI_REJECTED
+
+
 def test_run_main_accepts_large_paper_folder_extending_below_platform_roi() -> None:
     """실제 파란 종이폴더처럼 받침대를 덮는 큰 물체는 ROI에서 버리지 않는다."""
     registry = _Registry([(2, 0.8198, [106.5, 179.5, 550.5, 480.0])])
