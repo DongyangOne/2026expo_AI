@@ -51,6 +51,20 @@ def test_parse_accepts_llm_only_general_waste_class():
     assert result.class_name == "general_waste"
 
 
+def test_parse_normalizes_empty_scene_to_non_item_sentinel():
+    answer = json.dumps({
+        "material": "empty_scene", "confidence": 0.98, "has_label": False,
+        "compression_required": False, "is_dented": False,
+        "has_straw": False, "has_cup_holder": False,
+        "has_foreign_material": False,
+        "is_single_primary_item": True,
+    })
+    result = local_llm._parse(answer)
+    assert result.class_id == -1
+    assert result.class_name == "empty_scene"
+    assert result.is_single_primary_item is False
+
+
 def test_parse_rejects_extra_or_invalid_fields():
     invalid = json.dumps({
         "material": "vinyl", "confidence": 0.91, "has_label": False,
@@ -101,6 +115,25 @@ def test_prompt_defines_material_by_physical_form():
     assert "film sheet draped over any support" in local_llm._VINYL_PLASTIC_PROMPT
     assert "Decision order:" not in local_llm._PROMPT
     assert "Decision order:" in local_llm._FORM_REASONING_PROMPT
+
+
+def test_prompt_keeps_crushed_molded_cups_out_of_vinyl():
+    assert "remains plastic even when crushed" in local_llm._PROMPT
+    assert "continuous molded circular rim" in local_llm._PROMPT
+    assert "outrank wrinkles caused by crushing" in local_llm._PROMPT
+    assert "has no molded cup rim or formed base" in local_llm._PROMPT
+
+
+def test_prompt_can_explicitly_reject_an_empty_platform():
+    assert "empty_scene" in local_llm._SCHEMA["properties"]["material"]["enum"]
+    assert "When no disposal item is present on the platform" in local_llm._PROMPT
+    assert "is_single_primary_item=false" in local_llm._PROMPT
+
+
+def test_prompt_spells_out_the_json_contract_for_json_object_mode():
+    assert "Return exactly these keys" in local_llm._PROMPT
+    for field in local_llm._SCHEMA["required"]:
+        assert field in local_llm._PROMPT
 
 
 def test_prompt_accepts_visibly_crushed_can_as_compressed():

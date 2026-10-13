@@ -174,6 +174,10 @@ def test_monitor_page_and_data_are_public(tmp_path, monkeypatch):
     assert "24시간 LLM 비용" in page.text
     assert "판정 backend" in page.text
     assert "선택 호출 비용" in page.text
+    assert 'can: "캔"' in page.text
+    assert 'plastic: "플라스틱"' in page.text
+    assert 'vinyl: "비닐"' in page.text
+    assert 'empty_scene: "빈 장면"' in page.text
 
     allowed = client.get("/api/v1/monitor/summary")
     assert allowed.status_code == 200

@@ -181,11 +181,26 @@
 
   <script>
     const state = { data: null, blobs: new Map(), timer: null };
+    const CLASS_LABELS = {
+      can: "캔",
+      pet: "플라스틱(PET)",
+      paper: "종이",
+      plastic: "플라스틱",
+      styrofoam: "스티로폼",
+      vinyl: "비닐",
+      glass: "유리병",
+      battery: "건전지",
+      fluorescent: "형광등",
+      general_waste: "일반쓰레기",
+      GENERAL_WASTE: "일반쓰레기",
+      empty_scene: "빈 장면"
+    };
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value ?? "—").replace(/[&<>'"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
     const percent = (value) => value == null ? "—" : `${Number(value).toFixed(1)}%`;
     const usd = (value) => value == null ? "—" : `$${Number(value).toFixed(6)}`;
     const fmtTime = (value) => value ? new Intl.DateTimeFormat("ko-KR", { month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false }).format(new Date(value)) : "—";
+    const classLabel = (value) => CLASS_LABELS[value] ?? value ?? "미분류";
 
     function setConnection(kind, text) {
       $("signal").className = `signal ${kind}`;
@@ -201,10 +216,10 @@
       return fetch(url, { cache: "no-store" });
     }
 
-    function fillSelect(element, values) {
+    function fillSelect(element, values, label = value => value) {
       const current = element.value;
       const first = element.options[0].outerHTML;
-      element.innerHTML = first + values.sort().map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");
+      element.innerHTML = first + values.sort().map(v => `<option value="${escapeHtml(v)}">${escapeHtml(label(v))}</option>`).join("");
       element.value = values.includes(current) ? current : "";
     }
 
@@ -226,7 +241,7 @@
       $("llmHealth").textContent = health?.llm?.status ?? "확인 실패";
       $("accelerator").textContent = health?.llm?.accelerator?.toUpperCase() ?? "—";
       $("updatedAt").textContent = `갱신 ${fmtTime(data.generated_at)}`;
-      fillSelect($("classFilter"), Object.keys(data.distributions.class));
+      fillSelect($("classFilter"), Object.keys(data.distributions.class), classLabel);
       fillSelect($("statusFilter"), Object.keys(data.distributions.status));
     }
 
@@ -244,27 +259,28 @@
 
     function card(item) {
       const cls = item.classification?.class_name ?? item.general?.code ?? "미분류";
+      const clsLabel = classLabel(cls);
       const confidence = item.classification?.confidence;
       const warning = Boolean(item.bbox_quality?.suspicious);
       const yolo = item.audit?.yolo;
       const llm = item.audit?.local_llm;
       const runtime = llm?.runtime;
       const provider = runtime?.provider_returned ?? runtime?.provider_requested;
-      const output = [item.status, cls, ...item.guidance.map(g => g.code)].filter(Boolean).join(" · ");
+      const output = [item.status, clsLabel, ...item.guidance.map(g => g.code)].filter(Boolean).join(" · ");
       const codes = item.guidance.map(g => `<span class="code">${escapeHtml(g.code)}</span>`).join("");
       return `<article class="capture ${warning ? "is-warning" : ""}" data-id="${escapeHtml(item.capture_id)}">
         <div class="photo">
           <span class="badge ${warning ? "warning" : ""}">${warning ? "bbox 검토 필요" : escapeHtml(item.status)}</span>
-          <img alt="${escapeHtml(cls)} 촬영 이미지" loading="lazy">
+          <img alt="${escapeHtml(clsLabel)} 촬영 이미지" loading="lazy">
           <span class="bbox" style="${bboxStyle(item)}"></span>
         </div>
         <div class="capture-body">
-          <div class="capture-title"><strong>${escapeHtml(cls)}</strong><time>${fmtTime(item.timestamp)}</time></div>
+          <div class="capture-title"><strong>${escapeHtml(clsLabel)}</strong><time>${fmtTime(item.timestamp)}</time></div>
           <dl class="details">
             <dt>최종 상태</dt><dd>${escapeHtml(item.status)}</dd>
             <dt>최종 신뢰도</dt><dd>${confidence == null ? "—" : `${(confidence * 100).toFixed(1)}%`}</dd>
             <dt>YOLO</dt><dd>${yolo ? `${escapeHtml(yolo.class_id)} · ${(Number(yolo.confidence) * 100).toFixed(1)}%` : "기록 없음"}</dd>
-            <dt>LLM</dt><dd>${llm ? escapeHtml(llm.class_name) : "기록 없음"}</dd>
+            <dt>LLM</dt><dd>${llm ? escapeHtml(classLabel(llm.class_name)) : "기록 없음"}</dd>
             <dt>판정 backend</dt><dd>${runtime ? escapeHtml(runtime.backend) : "기록 없음"}</dd>
             <dt>모델</dt><dd>${runtime ? escapeHtml(runtime.model) : "기록 없음"}</dd>
             <dt>provider</dt><dd>${provider ? escapeHtml(provider) : "기록 없음"}</dd>

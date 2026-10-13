@@ -36,6 +36,7 @@ CLASS_NAMES = (
     "vinyl", "glass", "battery", "fluorescent", "general_waste",
 )
 CLASS_ID_BY_NAME = {name: index for index, name in enumerate(CLASS_NAMES)}
+CLASS_ID_BY_NAME["empty_scene"] = -1
 
 _SCHEMA = {
     "type": "object",
@@ -45,7 +46,7 @@ _SCHEMA = {
         "has_straw", "has_cup_holder", "has_foreign_material", "is_single_primary_item",
     ],
     "properties": {
-        "material": {"type": "string", "enum": list(CLASS_NAMES)},
+        "material": {"type": "string", "enum": [*CLASS_NAMES, "empty_scene"]},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "has_label": {"type": "boolean"},
         "compression_required": {"type": "boolean"},
@@ -65,14 +66,20 @@ Image usage:
 - Image 2, when present, is the padded YOLO crop and provides surface and material detail.
 - The crop is authoritative for which item to inspect. Use the full frame only to recover its complete shape and context.
 - Ignore the bin tray, floor, background, shadows, hands, fixtures, cables, and objects that are not attached to the primary item.
+- When no disposal item is present on the platform, choose empty_scene and set is_single_primary_item=false. Never classify the bare platform, black sheet, reflections, or background as an item.
+
+Critical vinyl-versus-plastic rule:
+- Identify manufactured three-dimensional structure before surface wrinkles. If the object has any continuous molded circular or elliptical rim, cup lip, base ring, lid-fitting flange, or tapered one-piece cup wall, it is plastic even when crushed flat and transparent.
+- Choose vinyl only when the object is constructed as a film sheet, bag, wrapper, or heat-sealed pouch and has no molded rim or formed base.
+- Wrinkles, folds, transparency, and thinness alone never prove vinyl because a crushed plastic cup can show all four.
 
 Choose exactly one material:
 - can: metal beverage or food can.
 - pet: a lightweight molded plastic bottle with a bottle neck, including transparent, colored, tinted, or opaque PET-style bottles. Do not use for rigid cups, lids, trays, or non-bottle containers. A dark or amber bottle is not glass merely because its color hides transparency; require clear glass cues such as a thick rigid wall/base and glass-like reflections before choosing glass.
 - paper: paper, cardboard, carton, paper cup, or a loose paper cup sleeve/holder. A matte opaque disposable drink cup with a rolled paper rim or side seam is paper unless there is clear rigid-polymer evidence. A folded box, envelope, gift bag, or cardboard package remains paper when glossy, laminated, coated, or heavily printed; folded flaps, scored creases, glued seams, layered edges, or a shape made from a folded sheet are stronger evidence than surface shine.
-- plastic: rigid molded polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, squeeze tube, or container. Printed paper or film wrapped around a rigid molded cup/container is a label or contaminant; it does not make the primary item paper. A printed flexible squeeze tube is plastic, not paper.
+- plastic: rigid molded polymer bottle (other than PET beverage bottle), cup, lid, tray, tub, squeeze tube, or container. A thermoformed or injection-molded cup remains plastic even when crushed, folded, or flattened. A continuous molded circular rim, cup lip, formed base, tapered one-piece wall, or lid-fitting flange is strong plastic evidence and must outrank wrinkles caused by crushing. Printed paper or film wrapped around a rigid molded cup/container is a label or contaminant; it does not make the primary item paper. A printed flexible squeeze tube is plastic, not paper.
 - styrofoam: expanded-polystyrene foam, including white or black lightweight molded foam food trays and packaging. The surface may look smooth and the foam beads may be subtle, especially on dark trays; an embossed material mark and molded ribs can be stronger evidence than visible beads.
-- vinyl: thin flexible film, bag, wrapper, or pouch that bends, folds, wrinkles, crumples, or has heat-sealed edges. Printed snack, food, or candy packaging remains vinyl when its body is a flexible film pouch or wrapper; printing does not make it paper.
+- vinyl: thin flexible film, bag, wrapper, or pouch that bends, folds, wrinkles, crumples, or has heat-sealed edges. A film bag or sheet has no molded cup rim or formed base. Printed snack, food, or candy packaging remains vinyl when its body is a flexible film pouch or wrapper; printing does not make it paper.
 - glass: an item whose body is clearly glass, such as a thick rigid glass bottle, jar, or glass object. Do not choose glass for a lightweight molded plastic/PET bottle only because it is glossy, transparent, or amber-colored.
 - battery: household battery or battery pack.
 - fluorescent: any discarded electric lamp or light bulb handled by the bin's lamp-rejection route, including a fluorescent tube, compact fluorescent lamp, globe bulb, LED bulb, or incandescent-style bulb. This product taxonomy intentionally groups bulb-shaped lamps together even when the visible diffuser resembles glass.
@@ -92,7 +99,9 @@ State rules:
 - is_single_primary_item=false when multiple separate disposal items are presented together.
 - If visual evidence is genuinely ambiguous, lower confidence instead of defaulting to plastic or paper.
 
-Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+Return exactly these keys in one JSON object: material, confidence, has_label, compression_required, is_dented, has_straw, has_cup_holder, has_foreign_material, is_single_primary_item.
+material must be one of: can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent, general_waste, empty_scene. confidence must be a number from 0 to 1. Every other field must be a JSON boolean.
+Do not add Markdown, explanation, or any extra key."""
 
 _FORM_REASONING_GUIDANCE = """Decision order:
 1. Identify the complete object's form first: bottle, cup, tray, wrapper, can, battery, or lamp.
@@ -107,8 +116,8 @@ _FORM_REASONING_PROMPT = _PROMPT.replace(
 
 _VINYL_PLASTIC_PROMPT = """Re-evaluate only the primary disposal item as either vinyl or plastic.
 Image 1 is the complete camera frame. Image 2, when present, is the padded YOLO crop and identifies the target item.
-Choose vinyl for thin flexible film, a bag, wrapper, or pouch that bends, folds, wrinkles, or crumples.
-Choose plastic only for a rigid bottle, cup, lid, tray, tub, or container that keeps its shape.
+Choose vinyl for thin flexible film, a bag, wrapper, or pouch that bends, folds, wrinkles, or crumples and has no molded cup rim or formed base.
+Choose plastic for a molded bottle, cup, lid, tray, tub, or container. A thermoformed or injection-molded cup remains plastic even when crushed, folded, or flattened. A continuous molded circular rim, cup lip, formed base, tapered one-piece wall, or lid-fitting flange must outrank wrinkles caused by crushing.
 Judge physical flexibility and three-dimensional form, not color, transparency, printed branding, or the fact that both materials are polymers.
 This is form classification, not polymer chemistry: a loose translucent shopping or packaging bag, or a film sheet draped over any support, MUST be vinyl and never plastic; ignore the support underneath it.
 Ignore the bin tray, floor, background, shadows, hands, fixtures, and anything not attached to the target.
@@ -404,15 +413,17 @@ def _parse(content: str) -> LocalLLMPrediction:
     )
     if any(type(parsed[name]) is not bool for name in flags):
         raise ValueError("LLM boolean contract invalid")
+    empty_scene = material == "empty_scene"
     return LocalLLMPrediction(
         class_id=CLASS_ID_BY_NAME[material], class_name=material,
-        confidence=float(confidence), has_label=parsed["has_label"],
-        compression_required=parsed["compression_required"],
-        is_dented=parsed["is_dented"],
-        has_straw=parsed["has_straw"],
-        has_cup_holder=parsed["has_cup_holder"],
-        has_foreign_material=parsed["has_foreign_material"],
-        is_single_primary_item=parsed["is_single_primary_item"],
+        confidence=float(confidence),
+        has_label=False if empty_scene else parsed["has_label"],
+        compression_required=False if empty_scene else parsed["compression_required"],
+        is_dented=False if empty_scene else parsed["is_dented"],
+        has_straw=False if empty_scene else parsed["has_straw"],
+        has_cup_holder=False if empty_scene else parsed["has_cup_holder"],
+        has_foreign_material=False if empty_scene else parsed["has_foreign_material"],
+        is_single_primary_item=False if empty_scene else parsed["is_single_primary_item"],
     )
 
 
