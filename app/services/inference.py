@@ -48,7 +48,13 @@ class StatePrediction:
 
 
 def _bbox_anchor_on_platform(bbox: list[float], img: np.ndarray) -> bool:
-    """Return whether the lower-center object anchor lies on the platform ROI."""
+    """Return whether the lower-center object anchor lies near the platform.
+
+    Detection uses a deliberately generous ellipse.  The physical platform can
+    be hidden by a folder, flattened can, or other large item whose YOLO box
+    reaches the bottom edge.  The tight ROI remains useful for the fallback
+    crop, while this gate only removes clearly peripheral people/background.
+    """
     if not settings.PLATFORM_ROI_ENABLED:
         return True
     height, width = img.shape[:2]
@@ -59,8 +65,18 @@ def _bbox_anchor_on_platform(bbox: list[float], img: np.ndarray) -> bool:
         return False
     anchor_x = ((x1 + x2) / 2.0) / width
     anchor_y = (y1 + (y2 - y1) * settings.PLATFORM_ROI_ANCHOR_Y_RATIO) / height
-    dx = (anchor_x - settings.PLATFORM_ROI_CENTER_X) / settings.PLATFORM_ROI_RADIUS_X
-    dy = (anchor_y - settings.PLATFORM_ROI_CENTER_Y) / settings.PLATFORM_ROI_RADIUS_Y
+    radius_x = (
+        settings.PLATFORM_ROI_RADIUS_X
+        * settings.PLATFORM_ROI_DETECTION_X_MULTIPLIER
+    )
+    radius_y = (
+        settings.PLATFORM_ROI_RADIUS_Y
+        * settings.PLATFORM_ROI_DETECTION_Y_MULTIPLIER
+    )
+    if radius_x <= 0 or radius_y <= 0:
+        return False
+    dx = (anchor_x - settings.PLATFORM_ROI_CENTER_X) / radius_x
+    dy = (anchor_y - settings.PLATFORM_ROI_CENTER_Y) / radius_y
     return dx * dx + dy * dy <= 1.0
 
 

@@ -99,8 +99,10 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     OPENROUTER_API_KEY: str | None = None
     OPENROUTER_MODEL: str = "qwen/qwen3.8-27b"
-    OPENROUTER_PRIMARY_PROVIDER: str = "deepinfra"
-    OPENROUTER_FALLBACK_PROVIDERS: str = "dekallm,parasail"
+    # 운영 실측에서 DekaLLM은 73/73 성공했고 DeepInfra는 429/timeout이 반복됐다.
+    # 매 요청마다 실패한 provider timeout을 먼저 기다리지 않도록 안정 공급자를 우선한다.
+    OPENROUTER_PRIMARY_PROVIDER: str = "dekallm"
+    OPENROUTER_FALLBACK_PROVIDERS: str = "parasail,deepinfra"
     OPENROUTER_SESSION_ID: str = "expo-production"
     OPENROUTER_TOTAL_TIMEOUT_SEC: float = 5.0
     OPENROUTER_ATTEMPT_TIMEOUT_SEC: float = 3.2
@@ -139,13 +141,17 @@ class Settings(BaseSettings):
     DEVICE: str = "cpu"              # Pi5 CPU, GPU 환경이면 "0"
 
     # 최종 하드웨어 화각의 원형 투입 받침대. bbox의 아래쪽 중심점을 이 타원에
-    # 투영해 받침대 위 물체만 인정한다. 값은 이미지 크기에 대한 0~1 비율이다.
+    # 투영해 받침대 위 물체만 인정한다. 큰 물체가 받침대를 가리거나 화면 아래까지
+    # 이어지는 경우를 위해 검출 판정 타원만 넉넉하게 확장하고, LLM fallback crop은
+    # 기존 받침대 관찰 범위를 유지한다. 값은 이미지 크기에 대한 0~1 비율이다.
     PLATFORM_ROI_ENABLED: bool = True
     PLATFORM_ROI_CENTER_X: float = 0.447
     PLATFORM_ROI_CENTER_Y: float = 0.590
     PLATFORM_ROI_RADIUS_X: float = 0.175
     PLATFORM_ROI_RADIUS_Y: float = 0.160
     PLATFORM_ROI_ANCHOR_Y_RATIO: float = 0.85
+    PLATFORM_ROI_DETECTION_X_MULTIPLIER: float = 2.0
+    PLATFORM_ROI_DETECTION_Y_MULTIPLIER: float = 2.5
     PLATFORM_ROI_FALLBACK_X_MULTIPLIER: float = 1.5
 
     # ── 무게 이상 감지 ────────────────────────────────────────────────────────────

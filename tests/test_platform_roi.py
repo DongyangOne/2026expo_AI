@@ -40,7 +40,8 @@ class _Registry:
 def test_run_main_ignores_higher_confidence_box_outside_platform() -> None:
     registry = _Registry(
         [
-            (3, 0.95, [52.5, 205.0, 523.5, 480.0]),
+            # 화면 오른쪽 사람/배경처럼 받침대와 명확히 떨어진 박스
+            (3, 0.95, [568.0, 27.0, 640.0, 276.0]),
             (2, 0.70, [235.0, 110.0, 335.0, 350.0]),
         ]
     )
@@ -56,7 +57,7 @@ def test_run_main_ignores_higher_confidence_box_outside_platform() -> None:
 
 
 def test_run_main_marks_only_off_platform_detection_as_rejected() -> None:
-    registry = _Registry([(3, 0.95, [52.5, 205.0, 523.5, 480.0])])
+    registry = _Registry([(3, 0.95, [568.0, 27.0, 640.0, 276.0])])
 
     detected = inference.run_main(
         registry, np.zeros((480, 640, 3), dtype=np.uint8)
@@ -65,6 +66,20 @@ def test_run_main_marks_only_off_platform_detection_as_rejected() -> None:
 
     assert marker is not None
     assert detected is marker
+
+
+def test_run_main_accepts_large_paper_folder_extending_below_platform_roi() -> None:
+    """실제 파란 종이폴더처럼 받침대를 덮는 큰 물체는 ROI에서 버리지 않는다."""
+    registry = _Registry([(2, 0.8198, [106.5, 179.5, 550.5, 480.0])])
+
+    detected = inference.run_main(
+        registry, np.zeros((480, 640, 3), dtype=np.uint8)
+    )
+
+    assert detected is not None
+    assert detected is not getattr(inference, "PLATFORM_ROI_REJECTED", None)
+    assert detected[0] == 2
+    assert detected[2] == [106.5, 179.5, 550.5, 480.0]
 
 
 def test_platform_observation_crop_keeps_platform_and_removes_side_background() -> None:
