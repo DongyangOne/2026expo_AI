@@ -167,6 +167,25 @@ def test_runtime_context_marks_weight_and_yolo_as_non_authoritative():
     assert "may be wrong on a new camera domain" in prompt
 
 
+def test_primary_classification_includes_weight_as_supporting_evidence(monkeypatch):
+    captured = {}
+
+    def fake_classify_with_prompt(img, bbox, prompt, **kwargs):
+        captured["prompt"] = prompt
+        return None
+
+    monkeypatch.setattr(local_llm, "_classify_with_prompt", fake_classify_with_prompt)
+
+    local_llm.classify(
+        np.zeros((32, 32, 3), dtype=np.uint8),
+        [0.0, 0.0, 32.0, 32.0],
+        weight_g=37.2,
+    )
+
+    assert "Measured scale weight: 37.20 g" in captured["prompt"]
+    assert "supporting hints, never ground truth" in captured["prompt"]
+
+
 def test_crop_encoding_is_bounded(monkeypatch):
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_SIDE", 64)
     monkeypatch.setattr(local_llm.settings, "LOCAL_LLM_MAX_IMAGE_BYTES", 100_000)

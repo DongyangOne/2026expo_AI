@@ -509,16 +509,32 @@ def _classify_with_prompt(
     return _query_ollama(images, prompt)
 
 
-def classify(img: np.ndarray, bbox: list[float]) -> LocalLLMPrediction | None:
+def classify(
+    img: np.ndarray,
+    bbox: list[float],
+    weight_g: float | None = None,
+    yolo_material: str | None = None,
+    yolo_confidence: float | None = None,
+) -> LocalLLMPrediction | None:
     """Classify a YOLO crop or a full-frame fallback."""
-    return _classify_with_prompt(img, bbox, _PROMPT)
+    prompt = _with_runtime_context(
+        _PROMPT, weight_g, yolo_material, yolo_confidence,
+    )
+    return _classify_with_prompt(img, bbox, prompt)
 
 
 def reclassify_vinyl_plastic(
-    img: np.ndarray, bbox: list[float],
+    img: np.ndarray,
+    bbox: list[float],
+    weight_g: float | None = None,
+    yolo_material: str | None = None,
+    yolo_confidence: float | None = None,
 ) -> LocalLLMPrediction | None:
     """Resolve only the flexible-vinyl versus rigid-plastic ambiguity."""
-    prediction = _classify_with_prompt(img, bbox, _VINYL_PLASTIC_PROMPT)
+    prompt = _with_runtime_context(
+        _VINYL_PLASTIC_PROMPT, weight_g, yolo_material, yolo_confidence,
+    )
+    prediction = _classify_with_prompt(img, bbox, prompt)
     if prediction is not None and prediction.class_name in {"vinyl", "plastic"}:
         return prediction
     if prediction is not None:

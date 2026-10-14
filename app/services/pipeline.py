@@ -349,7 +349,7 @@ async def run(
         llm_bbox = inference.platform_detail_bbox(llm_img)
         llm_started_at = perf_counter()
         llm_prediction = await loop.run_in_executor(
-            _executor, local_llm.classify, llm_img, llm_bbox,
+            _executor, local_llm.classify, llm_img, llm_bbox, weight_g,
         )
         logger.info(
             "NAS LLM 받침대 ROI fallback 시간: client_id=%s llm_ms=%.1f available=%s",
@@ -440,7 +440,13 @@ async def run(
         )
         yolo_material = _CLASS_BY_ID[yolo_class_id].value
         llm_prediction = await loop.run_in_executor(
-            _executor, llm_classifier, llm_img, llm_bbox,
+            _executor,
+            llm_classifier,
+            llm_img,
+            llm_bbox,
+            weight_g,
+            yolo_material,
+            yolo_confidence,
         )
         logger.info(
             "NAS LLM 분류 시간: client_id=%s llm_ms=%.1f available=%s specialist=%s",
@@ -478,7 +484,13 @@ async def run(
             ):
                 recheck_started_at = perf_counter()
                 recheck_prediction = await loop.run_in_executor(
-                    _executor, local_llm.reclassify_vinyl_plastic, img, bbox,
+                    _executor,
+                    local_llm.reclassify_vinyl_plastic,
+                    img,
+                    bbox,
+                    weight_g,
+                    yolo_material,
+                    yolo_confidence,
                 )
                 logger.info(
                     "NAS LLM vinyl/plastic 재판정 시간: client_id=%s llm_ms=%.1f resolved=%s",
