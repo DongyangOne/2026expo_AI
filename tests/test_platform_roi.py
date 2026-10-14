@@ -128,7 +128,7 @@ def test_pipeline_uses_platform_crop_llm_when_yolo_only_finds_off_platform_box(
     async def fake_read_image(_upload):
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
-    def classify_platform(image, bbox):
+    def classify_platform(image, bbox, *_runtime_context):
         nonlocal received_shape, received_bbox
         received_shape = image.shape
         received_bbox = bbox
@@ -185,7 +185,7 @@ def test_pipeline_uses_platform_roi_instead_of_weak_small_yolo_crop(
     async def fake_read_image(_upload):
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
-    def classify_platform(image, bbox):
+    def classify_platform(image, bbox, *_runtime_context):
         nonlocal received_shape, received_bbox
         received_shape = image.shape
         received_bbox = bbox
