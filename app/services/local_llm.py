@@ -126,6 +126,19 @@ _PROMPT = _with_attachment_rule(
 )
 
 
+_SINGLE_ITEM_RULE = (
+    "- is_single_primary_item=false when multiple separate disposal items are presented together."
+)
+_SAME_MATERIAL_RULE = (
+    "- is_single_primary_item=false when separate disposal items of different materials are presented together; "
+    "several pieces of the same material, or a tag with its own cord, still count as one item."
+)
+if _PROMPT.count(_SINGLE_ITEM_RULE) != 1:
+    raise RuntimeError("single-item rule must occur exactly once in _PROMPT")
+# 메인 프롬프트는 그대로 두고, 복수 물체로 버려질 결과를 다시 볼 때만 쓰는 판본이다.
+_SAME_MATERIAL_PROMPT = _PROMPT.replace(_SINGLE_ITEM_RULE, _SAME_MATERIAL_RULE)
+
+
 _FORM_REASONING_GUIDANCE = """Decision order:
 1. Identify the complete object's form first: bottle, cup, tray, wrapper, can, battery, or lamp.
 2. Inspect observable material cues: wall thickness, molded seams, rolled or crimped rim, foam cells, paper fibers, film wrinkles, heat seals, glass refraction, and electrical base or socket.
@@ -560,6 +573,25 @@ def classify(
     """Classify a YOLO crop or a full-frame fallback."""
     prompt = _with_runtime_context(
         _PROMPT, weight_g, yolo_material, yolo_confidence,
+    )
+    return _classify_with_prompt(img, bbox, prompt)
+
+
+def reclassify_same_material(
+    img: np.ndarray,
+    bbox: list[float],
+    weight_g: float | None = None,
+    yolo_material: str | None = None,
+    yolo_confidence: float | None = None,
+) -> LocalLLMPrediction | None:
+    """Second opinion for a confident result that was about to be dropped as multi-item.
+
+    Several pieces of one material (or one crushed item that looks like two) are a
+    single disposal item for this kiosk.  Only requests that would be discarded reach
+    this call, so the main prompt and ordinary traffic are untouched.
+    """
+    prompt = _with_runtime_context(
+        _SAME_MATERIAL_PROMPT, weight_g, yolo_material, yolo_confidence,
     )
     return _classify_with_prompt(img, bbox, prompt)
 

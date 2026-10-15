@@ -291,6 +291,46 @@ async def _read_image(upload: UploadFile) -> np.ndarray:
     return img
 
 
+async def _rescue_same_material(
+    loop: asyncio.AbstractEventLoop,
+    img: np.ndarray,
+    bbox: list[float],
+    prediction: local_llm.LocalLLMPrediction | None,
+    weight_g: Optional[float],
+    yolo_material: str | None = None,
+    yolo_confidence: float | None = None,
+) -> local_llm.LocalLLMPrediction | None:
+    """신뢰도 높은 품목이 '복수 물체' 때문에 버려지기 직전에 한 번만 다시 판정한다.
+
+    같은 재질이 여러 개이거나 꺾인 캔처럼 하나가 둘로 보이는 경우는 단일 품목으로 본다.
+    메인 프롬프트는 바꾸지 않으므로 평소 요청은 영향이 없고, 버려질 요청만 한 번 더 호출된다.
+    """
+    if (
+        prediction is None
+        or prediction.is_single_primary_item
+        or prediction.class_name in {"empty_scene", "general_waste"}
+        or prediction.confidence < settings.LOCAL_LLM_MIN_CONFIDENCE
+    ):
+        return prediction
+    started_at = perf_counter()
+    recheck = await loop.run_in_executor(
+        _executor,
+        local_llm.reclassify_same_material,
+        img, bbox, weight_g, yolo_material, yolo_confidence,
+    )
+    accepted = (
+        recheck is not None
+        and recheck.is_single_primary_item
+        and recheck.class_name == prediction.class_name
+        and recheck.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
+    )
+    logger.info(
+        "NAS LLM 같은 재질 복수 재판정 시간: llm_ms=%.1f material=%s accepted=%s",
+        (perf_counter() - started_at) * 1000, prediction.class_name, accepted,
+    )
+    return recheck if accepted else prediction
+
+
 async def run(
     upload: UploadFile,
     weight_g: Optional[float],
@@ -372,6 +412,9 @@ async def run(
                 status=DetectionStatus.NOT_DETECTED,
                 weight=WeightInfo(value_g=weight_g),
             )
+        llm_prediction = await _rescue_same_material(
+            loop, llm_img, llm_bbox, llm_prediction, weight_g,
+        )
         if (
             llm_prediction is None
             or not llm_prediction.is_single_primary_item
@@ -470,6 +513,10 @@ async def run(
                 status=DetectionStatus.NOT_DETECTED,
                 weight=WeightInfo(value_g=weight_g),
             )
+        llm_prediction = await _rescue_same_material(
+            loop, llm_img, llm_bbox, llm_prediction, weight_g,
+            yolo_material, yolo_confidence,
+        )
         if (
             llm_prediction is not None
             and llm_prediction.is_single_primary_item
