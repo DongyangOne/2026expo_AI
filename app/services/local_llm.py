@@ -596,6 +596,68 @@ def reclassify_same_material(
     return _classify_with_prompt(img, bbox, prompt)
 
 
+_CAN_OR_PLASTIC_PROMPT = (
+    "The image shows ONE disposal item on the black circular platform of a recycling kiosk. "
+    "Decide whether the item is an aluminum or steel beverage CAN, even if it is heavily crushed, "
+    "folded or flattened, or whether it is made of PLASTIC or vinyl film (cup, bottle, wrapper, bag). "
+    "Use physical evidence, not color: a metal can keeps a rigid rolled rim or lid, a pull-tab opening, "
+    "a glossy printed metal skin and sharp angular creases; plastic is translucent or matte with rounded folds. "
+    'Return exactly one JSON object: {"material": "can" or "plastic" or "other", '
+    '"crushed": true or false, "confidence": a number from 0 to 1}. '
+    '"crushed" is true when a can is visibly crushed, folded or flattened and false for a smooth '
+    "full-height cylinder."
+)
+
+
+@dataclass(frozen=True)
+class CanCheck:
+    """Result of the lightweight can-versus-plastic confirmation."""
+
+    is_can: bool
+    crushed: bool
+    confidence: float
+    runtime: dict | None = None
+
+
+def confirm_crushed_can(img: np.ndarray, bbox: list[float]) -> CanCheck | None:
+    """Ask only whether the item is a metal can (possibly crushed) or plastic.
+
+    The main classification keeps misreading heavily crushed red cans as plastic cups.
+    A short binary question with explicit physical evidence separates them far better
+    than re-running the full classification, and it never touches the main prompt.
+    Returns None when the cloud provider is unavailable or answers outside the contract.
+    """
+    if not openrouter_client.enabled():
+        return None
+    images = _images_as_jpeg(img, bbox)
+    if not images:
+        return None
+    generation = openrouter_client.generate_with_metadata(_CAN_OR_PLASTIC_PROMPT, images)
+    if generation is None:
+        return None
+    try:
+        parsed = json.loads(generation.content)
+        material = parsed["material"]
+        confidence = parsed["confidence"]
+        crushed = parsed.get("crushed", False)
+        if (
+            material not in {"can", "plastic", "other"}
+            or type(confidence) not in {int, float}
+            or not 0 <= float(confidence) <= 1
+            or type(crushed) is not bool
+        ):
+            raise ValueError("can check contract mismatch")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("can check JSON contract failed (%s)", type(exc).__name__)
+        return None
+    return CanCheck(
+        is_can=material == "can",
+        crushed=crushed,
+        confidence=float(confidence),
+        runtime=generation.runtime(),
+    )
+
+
 def reclassify_vinyl_plastic(
     img: np.ndarray,
     bbox: list[float],

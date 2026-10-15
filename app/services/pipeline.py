@@ -331,6 +331,56 @@ async def _rescue_same_material(
     return recheck if accepted else prediction
 
 
+_CRUSHED_CAN_SUSPECT_CLASSES = {"plastic", "pet", "vinyl"}
+
+
+async def _recheck_crushed_can(
+    loop: asyncio.AbstractEventLoop,
+    img: np.ndarray,
+    bbox: list[float],
+    prediction: local_llm.LocalLLMPrediction | None,
+) -> local_llm.LocalLLMPrediction | None:
+    """심하게 찌그러진 캔이 plastic/vinyl로 보이는 오분류를 한 번 더 확인한다.
+
+    찌그러진 빨간 캔이 빨간 컵이나 필름처럼 보여 플라스틱함으로 통과된 사례가 있었다.
+    plastic·pet·vinyl 판정이 '찌그러짐'과 모순되거나(압착 대상이 아닌데 찌그러짐) 저신뢰로
+    버려질 때만 '금속 캔인가 플라스틱인가'를 짧게 다시 묻고, 캔으로 확인될 때만 바꾼다.
+    메인 프롬프트와 분류 스키마는 건드리지 않고, 평소 요청은 호출이 늘지 않는다.
+    """
+    if prediction is None or prediction.class_name not in _CRUSHED_CAN_SUSPECT_CLASSES:
+        return prediction
+    contradictory = prediction.is_dented and not prediction.compression_required
+    low_confidence = prediction.confidence < settings.LOCAL_LLM_MIN_CONFIDENCE
+    if not (contradictory or low_confidence):
+        return prediction
+    started_at = perf_counter()
+    check = await loop.run_in_executor(_executor, local_llm.confirm_crushed_can, img, bbox)
+    accepted = (
+        check is not None
+        and check.is_can
+        and check.confidence >= settings.LOCAL_LLM_MIN_CONFIDENCE
+    )
+    logger.info(
+        "NAS LLM 찌그러진 캔 확인 시간: llm_ms=%.1f first=%s trigger=%s accepted=%s",
+        (perf_counter() - started_at) * 1000, prediction.class_name,
+        "contradictory" if contradictory else "low_confidence", accepted,
+    )
+    if not accepted:
+        return prediction
+    return replace(
+        prediction,
+        class_id=local_llm.CLASS_ID_BY_NAME["can"],
+        class_name="can",
+        confidence=check.confidence,
+        compression_required=True,
+        # 찌그러짐이 불확실하면 통과시키지 않고 압착 안내(REJECTED)로 보낸다.
+        is_dented=check.crushed,
+        has_label=False,
+        is_single_primary_item=True,
+        runtime=check.runtime,
+    )
+
+
 async def run(
     upload: UploadFile,
     weight_g: Optional[float],
@@ -414,6 +464,9 @@ async def run(
             )
         llm_prediction = await _rescue_same_material(
             loop, llm_img, llm_bbox, llm_prediction, weight_g,
+        )
+        llm_prediction = await _recheck_crushed_can(
+            loop, llm_img, llm_bbox, llm_prediction,
         )
         if (
             llm_prediction is None
@@ -516,6 +569,9 @@ async def run(
         llm_prediction = await _rescue_same_material(
             loop, llm_img, llm_bbox, llm_prediction, weight_g,
             yolo_material, yolo_confidence,
+        )
+        llm_prediction = await _recheck_crushed_can(
+            loop, llm_img, llm_bbox, llm_prediction,
         )
         if (
             llm_prediction is not None
