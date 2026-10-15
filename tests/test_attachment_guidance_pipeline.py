@@ -3,6 +3,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import pytest
 
 os.environ.setdefault("API_KEY", "test-key")
 
@@ -58,3 +59,45 @@ def test_plastic_cup_attachment_flags_reach_guidance(monkeypatch):
         GuidanceCode.REMOVE_STRAW,
         GuidanceCode.REMOVE_CUP_HOLDER,
     ]
+
+
+@pytest.mark.parametrize("class_id,class_name", [(2, "paper"), (5, "vinyl")])
+def test_name_tag_with_lanyard_is_rejected_as_foreign_material(
+    monkeypatch, class_id, class_name,
+):
+    """끈·목걸이줄이 달린 명찰은 종이/비닐 품목은 유지하되 외부 이물질로 재투입을 안내한다."""
+    prediction = pipeline.local_llm.LocalLLMPrediction(
+        class_id=class_id,
+        class_name=class_name,
+        confidence=0.9,
+        has_label=False,
+        compression_required=False,
+        is_dented=False,
+        has_foreign_material=True,
+        has_straw=False,
+        has_cup_holder=False,
+        is_single_primary_item=True,
+    )
+    monkeypatch.setattr(pipeline, "_read_image", _fake_read_image)
+    monkeypatch.setattr(
+        inference,
+        "run_main",
+        lambda *_args: (class_id, 0.45, [10.0, 10.0, 90.0, 90.0]),
+    )
+    monkeypatch.setattr(
+        inference,
+        "run_state",
+        lambda *_args: inference.StatePrediction(Conditions()),
+    )
+    monkeypatch.setattr(pipeline, "is_anomaly", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(pipeline.local_llm, "primary_enabled", lambda: True)
+    monkeypatch.setattr(pipeline.local_llm, "classify", lambda *_args, **_kwargs: prediction)
+    monkeypatch.setattr(pipeline.local_llm, "record_primary", lambda **_kwargs: None)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        monkeypatch.setattr(pipeline, "_executor", executor)
+        result = asyncio.run(pipeline.run(None, 8.6, "name-tag", _Registry()))
+
+    assert result.status is DetectionStatus.REJECTED
+    assert result.classification.class_name.value == class_name
+    assert [item.code for item in result.guidance] == [GuidanceCode.FOREIGN_MATERIAL]

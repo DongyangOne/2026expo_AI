@@ -541,3 +541,32 @@ def test_health_status_reports_model_not_loaded(monkeypatch):
     assert status["status"] == "model_not_loaded"
     assert status["accelerator"] == "not_loaded"
     assert status["size_vram_bytes"] is None
+
+
+def test_attachment_rule_reaches_every_prompt_that_reports_foreign_material():
+    rule = local_llm._ATTACHMENT_RULE
+    for prompt in (
+        local_llm._PROMPT,
+        local_llm._FORM_REASONING_PROMPT,
+        local_llm._VINYL_PLASTIC_PROMPT,
+        local_llm._PLASTIC_MATERIAL_PROMPT,
+        local_llm._REJECTION_CONFLICT_PROMPT,
+    ):
+        # 한 곳만 빠져도 재판정 단계에서 플래그가 뒤집힐 수 있어 전부 같은 문장이어야 한다.
+        assert prompt.count(rule) == 1
+
+
+def test_attachment_rule_flags_lanyards_but_keeps_same_material_handles():
+    rule = local_llm._ATTACHMENT_RULE
+    for word in ("lanyard", "string", "name tag", "fabric", "cloth"):
+        assert word in rule
+    # 같은 재질 손잡이는 이물질이 아니라는 예외가 남아 있어야 종이 가방이 과하게 거절되지 않는다.
+    assert "paper or twisted-paper handle on a paper bag" in rule
+    assert "is not foreign material" in rule
+
+
+def test_conflict_prompt_still_formats_with_attachment_rule():
+    text = local_llm._REJECTION_CONFLICT_PROMPT.format(
+        yolo_material="can", llm_material="plastic", pair_rules="rule",
+    )
+    assert local_llm._ATTACHMENT_RULE in text

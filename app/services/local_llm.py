@@ -58,6 +58,23 @@ _SCHEMA = {
     },
 }
 
+_ATTACHMENT_RULE = (
+    "A cord, string, lanyard, ribbon, rope, metal clip or hook, plastic card holder or laminated case, "
+    "or a fabric, cloth, metal, or rigid-plastic handle or strap that is attached to the item is "
+    "foreign material: set has_foreign_material=true. A name tag, ID badge, ticket, or hanging tag "
+    "with a lanyard or string is therefore has_foreign_material=true. Only a handle or loop made of "
+    "the same material as the item (for example a paper or twisted-paper handle on a paper bag, or a "
+    "film handle on a film bag) is part of the item and is not foreign material."
+)
+
+
+def _with_attachment_rule(prompt: str, anchor: str) -> str:
+    """Insert the shared attachment rule right after ``anchor``, which must occur exactly once."""
+    if prompt.count(anchor) != 1:
+        raise RuntimeError(f"attachment rule anchor must occur exactly once: {anchor!r}")
+    return prompt.replace(anchor, f"{anchor} {_ATTACHMENT_RULE}")
+
+
 _PROMPT = """Act as the final visual inspector for a Korean smart waste-sorting bin.
 Classify the ONE primary disposal item by its physical material and form, not by the product printed on it.
 
@@ -103,6 +120,12 @@ Return exactly these keys in one JSON object: material, confidence, has_label, c
 material must be one of: can, pet, paper, plastic, styrofoam, vinyl, glass, battery, fluorescent, general_waste, empty_scene. confidence must be a number from 0 to 1. Every other field must be a JSON boolean.
 Do not add Markdown, explanation, or any extra key."""
 
+_PROMPT = _with_attachment_rule(
+    _PROMPT,
+    'Background objects are not foreign material.',
+)
+
+
 _FORM_REASONING_GUIDANCE = """Decision order:
 1. Identify the complete object's form first: bottle, cup, tray, wrapper, can, battery, or lamp.
 2. Inspect observable material cues: wall thickness, molded seams, rolled or crimped rim, foam cells, paper fibers, film wrinkles, heat seals, glass refraction, and electrical base or socket.
@@ -127,6 +150,12 @@ Set is_dented=true only when compression_required=true and the item is visibly f
 If the evidence is ambiguous, lower confidence rather than defaulting to plastic.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
 
+_VINYL_PLASTIC_PROMPT = _with_attachment_rule(
+    _VINYL_PLASTIC_PROMPT,
+    'do not duplicate a straw or cup holder in has_foreign_material.',
+)
+
+
 _PLASTIC_MATERIAL_PROMPT = """Act as a material specialist for one disposal item.
 Choose exactly one: plastic, paper, or styrofoam.
 
@@ -138,6 +167,12 @@ Use physical construction rather than color or product type:
 Image 1 is the full frame; Image 2, when present, is the target crop. Ignore the ground and background. Report an attached drinking straw with has_straw and an attached paper cup sleeve/holder with has_cup_holder. Reserve has_foreign_material for other removable material. If uncertain, lower confidence rather than guessing from color.
 Set compression_required=true only for a thin-walled hollow plastic bottle or container that can safely be flattened by hand. Cafe takeaway cups, rigid cups, lids, trays, tubs, and hard or brittle plastic are not compression-required. Set is_dented=true only when compression_required=true and the item is visibly flattened enough to reduce its volume.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
+_PLASTIC_MATERIAL_PROMPT = _with_attachment_rule(
+    _PLASTIC_MATERIAL_PROMPT,
+    'Reserve has_foreign_material for other removable material.',
+)
+
 
 _REJECTION_CONFLICT_PROMPT = """Re-evaluate the ONE primary disposal item because two visual classifiers disagree.
 Choose exactly one of these two materials: {yolo_material} or {llm_material}.
@@ -154,6 +189,12 @@ Safety-specific visual rules:
 Set compression_required=true for can and PET. For plastic, use true only for a thin-walled hollow bottle or container that can safely be flattened by hand; cafe takeaway cups, rigid cups, lids, trays, tubs, and hard or brittle plastic use false. Other materials also use false. Set is_dented=true only when compression_required=true and the item is visibly flattened enough to reduce its volume.
 Ignore hands, the bin, fixtures, cables, floor, and background. Report an attached drinking straw with has_straw and an attached paper cup sleeve/holder with has_cup_holder. Reserve has_foreign_material for other removable material. If uncertain, lower confidence.
 Return only one JSON object matching the supplied schema. Do not add Markdown or explanation."""
+
+_REJECTION_CONFLICT_PROMPT = _with_attachment_rule(
+    _REJECTION_CONFLICT_PROMPT,
+    'Reserve has_foreign_material for other removable material.',
+)
+
 
 _PAIR_RULES = {
     frozenset(("can", "plastic")): (
